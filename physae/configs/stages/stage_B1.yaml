@@ -28,3 +28,70 @@ optuna:
     type: int
     low: 1
     high: 4
+  model.encoder.width_mult:
+    type: float
+    low: 0.75
+    high: 1.5
+  model.encoder.depth_mult:
+    type: float
+    low: 0.8
+    high: 1.5
+  model.encoder.expand_ratio_scale:
+    type: float
+    low: 0.8
+    high: 1.3
+  model.encoder.se_ratio:
+    type: float
+    low: 0.15
+    high: 0.35
+  model.encoder.norm_groups:
+    type: categorical
+    choices: [4, 8, 16]
+  model.shared_head_hidden_scale:
+    type: float
+    low: 0.4
+    high: 0.8
+  model.refiner.width_mult:
+    type: float
+    low: 0.75
+    high: 1.5
+  model.refiner.depth_mult:
+    type: float
+    low: 0.8
+    high: 1.5
+  model.refiner.expand_ratio_scale:
+    type: float
+    low: 0.8
+    high: 1.3
+  model.refiner.se_ratio:
+    type: float
+    low: 0.15
+    high: 0.35
+  model.refiner.norm_groups:
+    type: categorical
+    choices: [4, 8, 16]
+  model.refiner.hidden_scale:
+    type: float
+    low: 0.4
+    high: 0.8
+  optimizer:
+    type: categorical
+    choices: [adamw, lion]
+  optimizer_weight_decay:
+    type: float
+    low: 1.0e-06
+    high: 1.0e-03
+    log: true
+  optimizer_beta1:
+    type: float
+    low: 0.85
+    high: 0.99
+  optimizer_beta2:
+    type: float
+    low: 0.9
+    high: 0.9999
+  scheduler_eta_min:
+    type: float
+    low: 1.0e-09
+    high: 1.0e-06
+    log: true

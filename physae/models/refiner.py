@@ -9,17 +9,37 @@ from .backbone import EfficientNetEncoder
 
 
 class EfficientNetRefiner(nn.Module):
-    def __init__(self, m_params: int, cond_dim: int, backbone_feat_dim: int, delta_scale: float = 0.1) -> None:
+    def __init__(
+        self,
+        m_params: int,
+        cond_dim: int,
+        backbone_feat_dim: int,
+        delta_scale: float = 0.1,
+        *,
+        encoder_width_mult: float = 1.0,
+        encoder_depth_mult: float = 1.0,
+        encoder_expand_ratio_scale: float = 1.0,
+        encoder_se_ratio: float = 0.25,
+        encoder_norm_groups: int = 8,
+        hidden_scale: float = 0.5,
+    ) -> None:
         super().__init__()
         self.delta_scale = float(delta_scale)
         self.m_params = int(m_params)
         self.cond_dim = int(cond_dim)
         self.use_film = True
 
-        self.encoder = EfficientNetEncoder(in_channels=2)
+        self.encoder = EfficientNetEncoder(
+            in_channels=2,
+            width_mult=encoder_width_mult,
+            depth_mult=encoder_depth_mult,
+            expand_ratio_scale=encoder_expand_ratio_scale,
+            se_ratio=encoder_se_ratio,
+            norm_groups=encoder_norm_groups,
+        )
         self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         dim = self.encoder.feat_dim
-        hidden = max(64, dim // 2)
+        hidden = max(64, int(round(dim * float(hidden_scale))))
 
         self.shared_head = nn.Sequential(
             nn.Linear(dim, hidden),

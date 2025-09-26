@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional
+import copy
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 import optuna
 
@@ -33,6 +34,19 @@ def _suggest_from_spec(trial: optuna.Trial, name: str, spec: Mapping[str, Any]) 
         choices = list(spec["choices"])
         return trial.suggest_categorical(name, choices)
     raise ValueError(f"Unknown Optuna parameter type '{kind}' for '{name}'.")
+
+
+def _assign_nested(target: Dict[str, Any], keys: Sequence[str], value: Any) -> None:
+    if not keys:
+        return
+    node = target
+    for key in keys[:-1]:
+        existing = node.get(key)
+        if not isinstance(existing, dict):
+            existing = {}
+            node[key] = existing
+        node = existing
+    node[keys[-1]] = value
 
 
 def optimise_stage(
@@ -69,12 +83,19 @@ def optimise_stage(
         search_space = stage_cfg.pop("optuna", {})
         params: Dict[str, Any] = {}
         params.update(stage_cfg)
+        trial_data_overrides = copy.deepcopy(data_overrides)
         for param_name, spec in search_space.items():
-            params[param_name] = _suggest_from_spec(trial, param_name, spec)
+            value = _suggest_from_spec(trial, param_name, spec)
+            if param_name.startswith("data."):
+                _assign_nested(trial_data_overrides, param_name.split(".")[1:], value)
+            elif param_name.startswith("model."):
+                _assign_nested(trial_data_overrides, ["model", *param_name.split(".")[1:]], value)
+            else:
+                params[param_name] = value
         model, train_loader, val_loader = build_data_and_model(
             config_path=data_config_path,
             config_name=data_config_name,
-            config_overrides=data_overrides,
+            config_overrides=trial_data_overrides or None,
         )
         _, metrics = train_stage_custom(
             model,

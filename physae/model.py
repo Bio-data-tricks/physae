@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,7 @@ from .losses import ReLoBRaLoLoss
 from .models import EfficientNetEncoder, EfficientNetRefiner
 from .normalization import norm_param_torch, unnorm_param_torch
 from .physics import batch_physics_forward_multimol_vgrid
+from .optimizers import Lion
 from .baseline import scale_first_window
 
 
@@ -53,6 +54,23 @@ class PhysicallyInformedAE(pl.LightningModule):
         corr_savgol_win: int = 11,
         corr_savgol_poly: int = 3,
         weight_mf: float = 1.0,
+        encoder_width_mult: float = 1.0,
+        encoder_depth_mult: float = 1.0,
+        encoder_expand_ratio_scale: float = 1.0,
+        encoder_se_ratio: float = 0.25,
+        encoder_norm_groups: int = 8,
+        shared_head_hidden_scale: float = 0.5,
+        refiner_encoder_width_mult: float = 1.0,
+        refiner_encoder_depth_mult: float = 1.0,
+        refiner_encoder_expand_ratio_scale: float = 1.0,
+        refiner_encoder_se_ratio: float = 0.25,
+        refiner_encoder_norm_groups: int = 8,
+        refiner_hidden_scale: float = 0.5,
+        optimizer_name: str = "adamw",
+        optimizer_betas: Tuple[float, float] | List[float] = (0.9, 0.999),
+        optimizer_weight_decay: float = 1e-4,
+        scheduler_eta_min: float = 1e-9,
+        scheduler_T_max: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4"])
@@ -118,10 +136,17 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.predict_idx = [self.name_to_idx[name] for name in self.predict_params]
         self.provided_idx = [self.name_to_idx[name] for name in self.provided_params]
 
-        self.backbone = EfficientNetEncoder(in_channels=1)
+        self.backbone = EfficientNetEncoder(
+            in_channels=1,
+            width_mult=encoder_width_mult,
+            depth_mult=encoder_depth_mult,
+            expand_ratio_scale=encoder_expand_ratio_scale,
+            se_ratio=encoder_se_ratio,
+            norm_groups=encoder_norm_groups,
+        )
         self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         feat_dim = self.backbone.feat_dim
-        hidden = feat_dim // 2
+        hidden = max(32, int(round(feat_dim * float(shared_head_hidden_scale))))
 
         self.shared_head = nn.Sequential(
             nn.Linear(feat_dim, hidden),
@@ -157,6 +182,12 @@ class PhysicallyInformedAE(pl.LightningModule):
             cond_dim=self.cond_dim,
             backbone_feat_dim=self.backbone.feat_dim,
             delta_scale=refine_delta_scale,
+            encoder_width_mult=refiner_encoder_width_mult,
+            encoder_depth_mult=refiner_encoder_depth_mult,
+            encoder_expand_ratio_scale=refiner_encoder_expand_ratio_scale,
+            encoder_se_ratio=refiner_encoder_se_ratio,
+            encoder_norm_groups=refiner_encoder_norm_groups,
+            hidden_scale=refiner_hidden_scale,
         )
         self.loss_names_params = [f"param_{name}" for name in self.predict_params]
         self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
@@ -167,6 +198,15 @@ class PhysicallyInformedAE(pl.LightningModule):
         self._override_refine_steps: Optional[int] = None
         self._override_delta_scale: Optional[float] = None
         self.recon_max1 = bool(recon_max1)
+
+        self.optimizer_name = str(optimizer_name).lower()
+        betas_tuple = tuple(float(b) for b in optimizer_betas)
+        if len(betas_tuple) != 2:
+            raise ValueError("optimizer_betas must contain two values (beta1, beta2).")
+        self.optimizer_betas = betas_tuple
+        self.optimizer_weight_decay = float(optimizer_weight_decay)
+        self.scheduler_eta_min = float(scheduler_eta_min)
+        self.scheduler_T_max = int(scheduler_T_max) if scheduler_T_max is not None else None
 
     def set_film_usage(self, use: bool = True) -> None:
         self.use_film = bool(use)
@@ -602,14 +642,29 @@ class PhysicallyInformedAE(pl.LightningModule):
         if self.film is not None:
             base_params += list(self.film.parameters())
         refiner_params = list(self.refiner.parameters())
-        optimizer = torch.optim.AdamW(
-            [{"params": base_params, "lr": self.base_lr}, {"params": refiner_params, "lr": self.refiner_lr}],
-            weight_decay=1e-4,
-        )
+        param_groups = [
+            {"params": base_params, "lr": self.base_lr},
+            {"params": refiner_params, "lr": self.refiner_lr},
+        ]
+        opt_name = getattr(self, "optimizer_name", "adamw").lower()
+        opt_kwargs = {
+            "lr": self.base_lr,
+            "betas": getattr(self, "optimizer_betas", (0.9, 0.999)),
+            "weight_decay": getattr(self, "optimizer_weight_decay", 1e-4),
+        }
+        if opt_name == "adamw":
+            optimizer = torch.optim.AdamW(param_groups, **opt_kwargs)
+        elif opt_name == "lion":
+            optimizer = Lion(param_groups, **opt_kwargs)
+        else:
+            raise ValueError(f"Unknown optimizer '{self.optimizer_name}'.")
+        t_max = self.scheduler_T_max
+        if t_max is None:
+            t_max = self.trainer.max_epochs if self.trainer is not None else 100
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.trainer.max_epochs if self.trainer is not None else 100,
-            eta_min=1e-9,
+            T_max=int(t_max),
+            eta_min=getattr(self, "scheduler_eta_min", 1e-9),
         )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 

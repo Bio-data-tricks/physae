@@ -95,6 +95,12 @@ def train_stage_custom(
     ckpt_in: Optional[str] = None,
     ckpt_out: Optional[str] = None,
     enable_progress_bar: bool = False,
+    optimizer: Optional[str] = None,
+    optimizer_weight_decay: Optional[float] = None,
+    optimizer_beta1: Optional[float] = None,
+    optimizer_beta2: Optional[float] = None,
+    scheduler_eta_min: Optional[float] = None,
+    scheduler_T_max: Optional[int] = None,
     return_metrics: bool = False,
 ) -> PhysicallyInformedAE | Tuple[PhysicallyInformedAE, Dict[str, float]]:
     print(f"\n===== Stage {stage_name} =====")
@@ -115,6 +121,20 @@ def train_stage_custom(
         model.set_film_subset(film_subset)
     if baseline_fix_enable is not None:
         model.baseline_fix_enable = bool(baseline_fix_enable)
+    if optimizer is not None:
+        model.optimizer_name = str(optimizer).lower()
+    if optimizer_weight_decay is not None:
+        model.optimizer_weight_decay = float(optimizer_weight_decay)
+    beta1, beta2 = model.optimizer_betas
+    if optimizer_beta1 is not None:
+        beta1 = float(optimizer_beta1)
+    if optimizer_beta2 is not None:
+        beta2 = float(optimizer_beta2)
+    model.optimizer_betas = (beta1, beta2)
+    if scheduler_eta_min is not None:
+        model.scheduler_eta_min = float(scheduler_eta_min)
+    if scheduler_T_max is not None:
+        model.scheduler_T_max = int(scheduler_T_max)
     _apply_stage_freeze(
         model,
         train_base=train_base,

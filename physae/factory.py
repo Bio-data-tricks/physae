@@ -202,6 +202,40 @@ def build_data_and_model(
     ]
     film_list = film_list or coerce_sequence(data_config.get("film_list"))
     lrs = lrs or tuple(float(v) for v in data_config.get("lrs", (1e-4, 1e-5)))
+
+    model_cfg = data_config.get("model", {}) or {}
+    encoder_cfg = model_cfg.get("encoder", {}) or {}
+    refiner_cfg = model_cfg.get("refiner", {}) or {}
+    optimizer_cfg = model_cfg.get("optimizer", {}) or {}
+    scheduler_cfg = model_cfg.get("scheduler", {}) or {}
+    shared_head_hidden_scale = float(model_cfg.get("shared_head_hidden_scale", 0.5))
+    refiner_hidden_scale = float(refiner_cfg.get("hidden_scale", 0.5))
+
+    encoder_width_mult = float(encoder_cfg.get("width_mult", 1.0))
+    encoder_depth_mult = float(encoder_cfg.get("depth_mult", 1.0))
+    encoder_expand_ratio_scale = float(encoder_cfg.get("expand_ratio_scale", 1.0))
+    encoder_se_ratio = float(encoder_cfg.get("se_ratio", 0.25))
+    encoder_norm_groups = int(encoder_cfg.get("norm_groups", 8))
+
+    refiner_width_mult = float(refiner_cfg.get("width_mult", 1.0))
+    refiner_depth_mult = float(refiner_cfg.get("depth_mult", 1.0))
+    refiner_expand_ratio_scale = float(refiner_cfg.get("expand_ratio_scale", 1.0))
+    refiner_se_ratio = float(refiner_cfg.get("se_ratio", 0.25))
+    refiner_norm_groups = int(refiner_cfg.get("norm_groups", 8))
+
+    betas_cfg = optimizer_cfg.get("betas", (0.9, 0.999))
+    if (
+        isinstance(betas_cfg, (list, tuple))
+        and len(betas_cfg) == 2
+        and all(isinstance(v, (int, float)) for v in betas_cfg)
+    ):
+        optimizer_betas = (float(betas_cfg[0]), float(betas_cfg[1]))
+    else:
+        optimizer_betas = (0.9, 0.999)
+    scheduler_t_max = scheduler_cfg.get("T_max")
+    if scheduler_t_max is not None:
+        scheduler_t_max = int(scheduler_t_max)
+
     model = PhysicallyInformedAE(
         n_points=n_points,
         param_names=config.PARAMS,
@@ -229,5 +263,22 @@ def build_data_and_model(
         corr_mode="none",
         corr_savgol_win=15,
         corr_savgol_poly=3,
+        encoder_width_mult=encoder_width_mult,
+        encoder_depth_mult=encoder_depth_mult,
+        encoder_expand_ratio_scale=encoder_expand_ratio_scale,
+        encoder_se_ratio=encoder_se_ratio,
+        encoder_norm_groups=encoder_norm_groups,
+        shared_head_hidden_scale=shared_head_hidden_scale,
+        refiner_encoder_width_mult=refiner_width_mult,
+        refiner_encoder_depth_mult=refiner_depth_mult,
+        refiner_encoder_expand_ratio_scale=refiner_expand_ratio_scale,
+        refiner_encoder_se_ratio=refiner_se_ratio,
+        refiner_encoder_norm_groups=refiner_norm_groups,
+        refiner_hidden_scale=refiner_hidden_scale,
+        optimizer_name=str(optimizer_cfg.get("name", "adamw")),
+        optimizer_betas=optimizer_betas,
+        optimizer_weight_decay=float(optimizer_cfg.get("weight_decay", 1e-4)),
+        scheduler_eta_min=float(scheduler_cfg.get("eta_min", 1e-9)),
+        scheduler_T_max=scheduler_t_max,
     )
     return model, train_loader, val_loader
