@@ -1,6 +1,8 @@
 
 import math, random, sys
-from typing import Optional, List, Dict
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Tuple, Callable, Any, Union
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -11,6 +13,11 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import Callback
 import matplotlib.pyplot as plt
 from IPython.display import display, update_display
+
+try:  # pragma: no cover - optional dependency
+    import optuna
+except ImportError:  # pragma: no cover - optuna is optional
+    optuna = None  # type: ignore
 
 # --- Matplotlib: polices compatibles emoji (Windows) ---
 import matplotlib as mpl
@@ -474,6 +481,160 @@ class SpectraDataset(Dataset):
             'scale': scale_noisy.squeeze(1).to(torch.float32)[0]
         }
 
+
+
+# ============================================================
+# 3bis) Configurations & helpers (génération, modèle, Optuna)
+# ============================================================
+
+
+def _tuple_or_none(value: Optional[Tuple[float, float]]):
+    if value is None:
+        return None
+    return tuple(value)
+
+
+@dataclass
+class NoiseConfig:
+    std_add_range: Tuple[float, float] = (0.001, 0.01)
+    std_mult_range: Tuple[float, float] = (0.002, 0.02)
+    p_drift: float = 0.7
+    drift_sigma_range: Tuple[float, float] = (8.0, 90.0)
+    drift_amp_range: Tuple[float, float] = (0.002, 0.03)
+    p_fringes: float = 0.6
+    n_fringes_range: Tuple[int, int] = (1, 3)
+    fringe_freq_range: Tuple[float, float] = (0.2, 12.0)
+    fringe_amp_range: Tuple[float, float] = (0.001, 0.01)
+    p_spikes: float = 0.4
+    spikes_count_range: Tuple[int, int] = (1, 4)
+    spike_amp_range: Tuple[float, float] = (0.002, 0.03)
+    spike_width_range: Tuple[float, float] = (1.0, 4.0)
+    clip: Optional[Tuple[float, float]] = (0.0, 1.3)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        for key, value in list(data.items()):
+            if isinstance(value, list):
+                data[key] = tuple(value)
+        data["clip"] = _tuple_or_none(data.get("clip"))
+        return data
+
+    @classmethod
+    def from_dict(cls, cfg: Dict[str, Any]) -> "NoiseConfig":
+        return cls(**cfg)
+
+
+@dataclass
+class DataModuleConfig:
+    seed: int = 42
+    n_points: int = 800
+    n_train: int = 50000
+    n_val: int = 5000
+    batch_size: int = 16
+    num_workers: Optional[int] = None
+    pin_memory: Optional[bool] = None
+    device: Optional[str] = None
+    poly_freq_CH4: Optional[List[float]] = None
+    transitions_dict: Optional[Dict[str, List[dict]]] = None
+    train_ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    val_ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    noise_train: Optional[Union[NoiseConfig, Dict[str, Any]]] = None
+    noise_val: Optional[Union[NoiseConfig, Dict[str, Any]]] = None
+    with_noise_train: bool = True
+    with_noise_val: bool = True
+    freeze_noise_train: bool = False
+    freeze_noise_val: bool = True
+    strict_check: bool = True
+
+    def resolve_noise(self, split: str, default: Dict[str, Any]) -> Dict[str, Any]:
+        source = self.noise_train if split == "train" else self.noise_val
+        if source is None:
+            return deepcopy(default)
+        if isinstance(source, NoiseConfig):
+            return source.to_dict()
+        return deepcopy(source)
+
+    def resolve_ranges(self, split: str, default: Dict[str, Tuple[float, float]]):
+        ranges = self.train_ranges if split == "train" else self.val_ranges
+        return deepcopy(ranges if ranges is not None else default)
+
+    def effective_device(self) -> str:
+        if self.device is not None:
+            return self.device
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def effective_num_workers(self) -> int:
+        if self.num_workers is not None:
+            return int(self.num_workers)
+        return 0 if sys.platform == "win32" else 4
+
+
+@dataclass
+class ModelConfig:
+    lr: float = 1e-4
+    alpha_param: float = 0.3
+    alpha_phys: float = 0.7
+    head_mode: str = "multi"
+    predict_params: Optional[List[str]] = None
+    film_params: Optional[List[str]] = None
+    refine_steps: int = 1
+    refine_delta_scale: float = 0.1
+    refine_target: str = "noisy"
+    refine_warmup_epochs: int = 30
+    freeze_base_epochs: int = 20
+    base_lr: Optional[float] = None
+    refiner_lr: Optional[float] = None
+    stage3_lr_shrink: float = 0.33
+    stage3_refine_steps: Optional[int] = 2
+    stage3_delta_scale: Optional[float] = 0.08
+    stage3_alpha_phys: Optional[float] = 0.7
+    stage3_alpha_param: Optional[float] = 0.3
+    baseline_fix_enable: bool = False
+    baseline_fix_sideband: int = 50
+    baseline_fix_degree: int = 2
+    baseline_fix_weight: float = 1.0
+    baseline_fix_in_warmup: bool = False
+    recon_max1: bool = True
+    corr_mode: str = "none"
+    corr_savgol_win: int = 15
+    corr_savgol_poly: int = 3
+    weight_mf: float = 1.0
+
+    def to_model_kwargs(self, *, default_predict_params: List[str],
+                        default_film_params: List[str]) -> Dict[str, Any]:
+        predict = list(self.predict_params) if self.predict_params is not None else list(default_predict_params)
+        film = list(self.film_params) if self.film_params is not None else list(default_film_params)
+        kwargs = dict(
+            lr=self.lr,
+            alpha_param=self.alpha_param,
+            alpha_phys=self.alpha_phys,
+            head_mode=self.head_mode,
+            predict_params=predict,
+            film_params=film,
+            refine_steps=self.refine_steps,
+            refine_delta_scale=self.refine_delta_scale,
+            refine_target=self.refine_target,
+            refine_warmup_epochs=self.refine_warmup_epochs,
+            freeze_base_epochs=self.freeze_base_epochs,
+            base_lr=self.base_lr if self.base_lr is not None else self.lr,
+            refiner_lr=self.refiner_lr if self.refiner_lr is not None else self.lr,
+            stage3_lr_shrink=self.stage3_lr_shrink,
+            stage3_refine_steps=self.stage3_refine_steps,
+            stage3_delta_scale=self.stage3_delta_scale,
+            stage3_alpha_phys=self.stage3_alpha_phys,
+            stage3_alpha_param=self.stage3_alpha_param,
+            baseline_fix_enable=self.baseline_fix_enable,
+            baseline_fix_sideband=self.baseline_fix_sideband,
+            baseline_fix_degree=self.baseline_fix_degree,
+            baseline_fix_weight=self.baseline_fix_weight,
+            baseline_fix_in_warmup=self.baseline_fix_in_warmup,
+            recon_max1=self.recon_max1,
+            corr_mode=self.corr_mode,
+            corr_savgol_win=self.corr_savgol_win,
+            corr_savgol_poly=self.corr_savgol_poly,
+            weight_mf=self.weight_mf,
+        )
+        return kwargs
 
 
 # ============================================================
@@ -1480,6 +1641,222 @@ def _save_checkpoint(trainer: pl.Trainer, ckpt_out: Optional[str]):
         trainer.save_checkpoint(ckpt_out)
         print(f"✓ checkpoint sauvegardé: {ckpt_out}")
 
+
+def _default_stage_kwargs(stage: str) -> Dict[str, Any]:
+    stage = stage.upper()
+    if stage == "A":
+        return dict(
+            stage_name="A", epochs=20,
+            base_lr=2e-4, refiner_lr=1e-6,
+            train_base=True, train_heads=True, train_film=False, train_refiner=False,
+            refine_steps=0, delta_scale=0.1,
+            use_film=False, film_subset=None, heads_subset=None,
+            baseline_fix_enable=False, enable_progress_bar=False,
+        )
+    if stage == "B1":
+        return dict(
+            stage_name="B1", epochs=12,
+            base_lr=1e-6, refiner_lr=1e-5,
+            train_base=False, train_heads=False, train_film=False, train_refiner=True,
+            refine_steps=2, delta_scale=0.12,
+            use_film=True, film_subset=["T"], heads_subset=None,
+            baseline_fix_enable=False, enable_progress_bar=False,
+        )
+    if stage == "B2":
+        return dict(
+            stage_name="B2", epochs=15,
+            base_lr=3e-5, refiner_lr=3e-6,
+            train_base=True, train_heads=True, train_film=True, train_refiner=True,
+            refine_steps=2, delta_scale=0.08,
+            use_film=True, film_subset=["P", "T"], heads_subset=None,
+            baseline_fix_enable=False, enable_progress_bar=False,
+        )
+    raise ValueError(f"Stage inconnu: {stage}")
+
+
+def _default_stage_search_space(stage: str) -> Callable[["optuna.trial.Trial"], Dict[str, Any]]:
+    stage = stage.upper()
+    if stage == "A":
+        def space(trial):
+            return {
+                "epochs": trial.suggest_int("epochs", 10, 60),
+                "base_lr": trial.suggest_float("base_lr", 5e-5, 5e-4, log=True),
+                "train_film": trial.suggest_categorical("train_film", [False, True]),
+                "use_film": trial.suggest_categorical("use_film", [False, True]),
+                "delta_scale": trial.suggest_float("delta_scale", 0.05, 0.3),
+            }
+        return space
+    if stage == "B1":
+        def space(trial):
+            return {
+                "epochs": trial.suggest_int("epochs", 6, 25),
+                "refiner_lr": trial.suggest_float("refiner_lr", 5e-6, 5e-4, log=True),
+                "refine_steps": trial.suggest_int("refine_steps", 1, 4),
+                "delta_scale": trial.suggest_float("delta_scale", 0.05, 0.4),
+                "use_film": trial.suggest_categorical("use_film", [False, True]),
+            }
+        return space
+    if stage == "B2":
+        def space(trial):
+            return {
+                "epochs": trial.suggest_int("epochs", 5, 30),
+                "base_lr": trial.suggest_float("base_lr", 1e-6, 3e-4, log=True),
+                "refiner_lr": trial.suggest_float("refiner_lr", 1e-6, 3e-4, log=True),
+                "refine_steps": trial.suggest_int("refine_steps", 1, 4),
+                "delta_scale": trial.suggest_float("delta_scale", 0.05, 0.4),
+                "baseline_fix_enable": trial.suggest_categorical("baseline_fix_enable", [False, True]),
+            }
+        return space
+    raise ValueError(f"Stage inconnu: {stage}")
+
+
+@dataclass
+class StageOptimizationConfig:
+    stage: str
+    n_trials: int = 20
+    timeout: Optional[int] = None
+    direction: str = "minimize"
+    metric_name: str = "val_loss"
+    base_stage_kwargs: Dict[str, Any] = field(default_factory=dict)
+    parameter_space: Optional[Callable[[Any], Dict[str, Any]]] = None
+    sampler: Any = None
+    pruner: Any = None
+    study_name: Optional[str] = None
+    storage: Optional[str] = None
+    load_if_exists: bool = False
+    seed: Optional[int] = 42
+    callbacks: Optional[List[Callback]] = None
+    accelerator: Optional[str] = None
+    checkpoint_path: Optional[str] = None
+    initial_state_dict: Optional[Dict[str, Any]] = None
+    study_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+def optimize_stage_with_optuna(
+    stage_config: StageOptimizationConfig,
+    *,
+    data_config: Optional[DataModuleConfig] = None,
+    model_config: Optional[ModelConfig] = None,
+):
+    """Lance une optimisation Optuna pour une étape d'entraînement donnée.
+
+    Args:
+        stage_config: configuration Optuna (stage, search space, etc.).
+        data_config: configuration des données (facultatif, défauts fournis).
+        model_config: configuration du modèle (facultatif, défauts fournis).
+
+    Returns:
+        Tuple (study Optuna, métadonnées sur les loaders/données) permettant de
+        ré-entraîner facilement le modèle avec les meilleurs hyperparamètres.
+    """
+    if optuna is None:  # pragma: no cover - dépendance optionnelle
+        raise ImportError("Optuna n'est pas installé. Installez-le pour utiliser l'optimisation.")
+
+    data_config = data_config or DataModuleConfig()
+    model_config = model_config or ModelConfig()
+
+    base_model, base_train_loader, base_val_loader, metadata = build_data_and_model_from_config(
+        data_config=data_config,
+        model_config=model_config,
+    )
+    # Libère les loaders initiaux (seront recréés pour chaque essai)
+    del base_model
+    del base_train_loader
+    del base_val_loader
+
+    stage_name = stage_config.stage.upper()
+    default_kwargs = _default_stage_kwargs(stage_name)
+    if stage_config.base_stage_kwargs:
+        default_kwargs.update(stage_config.base_stage_kwargs)
+    search_space = stage_config.parameter_space or _default_stage_search_space(stage_name)
+    callbacks = stage_config.callbacks or []
+    accelerator = stage_config.accelerator
+    checkpoint_path = stage_config.checkpoint_path
+    initial_state = deepcopy(stage_config.initial_state_dict) if stage_config.initial_state_dict is not None else None
+
+    sampler = stage_config.sampler or optuna.samplers.TPESampler(seed=stage_config.seed)
+    study_kwargs = dict(stage_config.study_kwargs)
+    if stage_config.pruner is not None and "pruner" not in study_kwargs:
+        study_kwargs["pruner"] = stage_config.pruner
+
+    study = optuna.create_study(
+        direction=stage_config.direction,
+        sampler=sampler,
+        study_name=stage_config.study_name,
+        storage=stage_config.storage,
+        load_if_exists=stage_config.load_if_exists,
+        **study_kwargs,
+    )
+
+    base_seed = stage_config.seed if stage_config.seed is not None else data_config.seed
+
+    def _model_factory() -> PhysicallyInformedAE:
+        kwargs = deepcopy(metadata["model_kwargs"])
+        return PhysicallyInformedAE(
+            n_points=data_config.n_points,
+            param_names=PARAMS,
+            poly_freq_CH4=metadata["poly_freq_CH4"],
+            transitions_dict=deepcopy(metadata["transitions_dict"]),
+            **kwargs,
+        )
+
+    def _make_loaders():
+        train_loader = DataLoader(
+            metadata["train_dataset"],
+            batch_size=metadata["batch_size"],
+            shuffle=True,
+            num_workers=metadata["num_workers"],
+            pin_memory=metadata["pin_memory"],
+        )
+        val_loader = DataLoader(
+            metadata["val_dataset"],
+            batch_size=metadata["batch_size"],
+            shuffle=False,
+            num_workers=metadata["num_workers"],
+            pin_memory=metadata["pin_memory"],
+        )
+        return train_loader, val_loader
+
+    def objective(trial: "optuna.trial.Trial"):
+        seed = (base_seed or 0) + trial.number
+        pl.seed_everything(seed)
+        train_loader, val_loader = _make_loaders()
+        stage_kwargs = deepcopy(default_kwargs)
+        sampled = search_space(trial) if search_space is not None else {}
+        if sampled:
+            stage_kwargs.update(sampled)
+        stage_kwargs.setdefault("stage_name", stage_name)
+
+        model = _model_factory()
+        if initial_state is not None:
+            model.load_state_dict(deepcopy(initial_state), strict=False)
+        elif checkpoint_path:
+            _load_weights_if_any(model, checkpoint_path)
+
+        train_stage_custom(
+            model,
+            train_loader,
+            val_loader,
+            callbacks=callbacks,
+            accelerator=accelerator,
+            **stage_kwargs,
+        )
+
+        metrics = getattr(model, "last_stage_metrics", {})
+        metric_value = metrics.get(stage_config.metric_name)
+        if metric_value is None:
+            raise RuntimeError(f"Métrique '{stage_config.metric_name}' introuvable dans les logs : {metrics.keys()}")
+        metric_value = float(metric_value)
+        trial.set_user_attr("metrics", metrics)
+        trial.report(metric_value, step=stage_kwargs.get("epochs", 1))
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+        return metric_value
+
+    study.optimize(objective, n_trials=stage_config.n_trials, timeout=stage_config.timeout)
+    return study, metadata
+
+
 def train_stage_custom(
     model: PhysicallyInformedAE,
     train_loader: DataLoader,
@@ -1535,6 +1912,17 @@ def train_stage_custom(
     )
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
+    metrics: Dict[str, float] = {}
+    for name, value in trainer.callback_metrics.items():
+        try:
+            if hasattr(value, "detach"):
+                value = value.detach()
+            if hasattr(value, "cpu"):
+                value = value.cpu()
+            metrics[name] = float(value.item() if hasattr(value, "item") else value)
+        except (TypeError, ValueError, AttributeError):
+            continue
+    model.last_stage_metrics = metrics
     return model
 
 # Facades conviviales
@@ -1738,16 +2126,11 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
 # ============================================================
 # 12) Build data & modèle (exemple par défaut)
 # ============================================================
-def build_data_and_model(
-    *, seed=42, n_points=800, n_train=50000, n_val=5000, batch_size=16,
-    train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
-    predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
-):
-    pl.seed_everything(seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    is_windows = sys.platform == "win32"
-    num_workers = 0 if is_windows else 4
+DEFAULT_PREDICT_PARAMS = ["sig0", "dsig", "mf_CH4", "P", "T", "baseline1", "baseline2"]
+DEFAULT_FILM_PARAMS: List[str] = []
 
+
+def _default_data_assets():
     poly_freq_CH4 = [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
     transitions_ch4_str = """6;1;3085.861015;1.013E-19;0.06;0.078;219.9411;0.73;-0.00712;0.0;0.0221;0.96;0.584;1.12
 6;1;3085.832038;1.693E-19;0.0597;0.078;219.9451;0.73;-0.00712;0.0;0.0222;0.91;0.173;1.11
@@ -1757,7 +2140,6 @@ def build_data_and_model(
 6;1;3086.085994;6.671E-20;0.055;0.078;219.9133;0.70;-0.00610;0.0;0.0300;0.54;0.00;0.0"""
     transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str)}
 
-    # Ranges par défaut
     default_val = {
         'sig0': (3085.43, 3085.46),
         'dsig': (0.001521, 0.00154),
@@ -1772,24 +2154,17 @@ def build_data_and_model(
                       "baseline0": 1, "baseline1": 3.0, "baseline2": 8.0, "P": 2.0, "T": 2.0}
     default_train = map_ranges(default_val, expand_interval, per_param=expand_factors)
 
-    # Plancher log
     lo, hi = default_train['mf_CH4']; default_train['mf_CH4'] = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
     lo, hi = default_val['mf_CH4'];   default_val['mf_CH4']   = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
 
-    global NORM_PARAMS
-    VAL_RANGES = val_ranges or default_val
-    TRAIN_RANGES = train_ranges or default_train
-    assert_subset(VAL_RANGES, TRAIN_RANGES, "VAL", "TRAIN")
-    NORM_PARAMS = TRAIN_RANGES
-
-    NOISE_TRAIN = noise_train or dict(
+    noise_train = dict(
         std_add_range=(0, 1e-2), std_mult_range=(0, 1e-2),
         p_drift=0.1, drift_sigma_range=(10.0, 120.0), drift_amp_range=(0.004, 0.05),
         p_fringes=0.1, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
         p_spikes=0.1, spikes_count_range=(1, 6), spike_amp_range=(0.002, 1), spike_width_range=(1.0, 20.0),
         clip=(0.0, 1.2),
     )
-    NOISE_VAL = noise_val or dict(
+    noise_val = dict(
         std_add_range=(0, 1e-5), std_mult_range=(0, 1e-5),
         p_drift=0, drift_sigma_range=(20.0, 120.0), drift_amp_range=(0.0, 0.01),
         p_fringes=0, n_fringes_range=(1, 2), fringe_freq_range=(0.5, 10.0), fringe_amp_range=(0.0, 0.004),
@@ -1797,37 +2172,164 @@ def build_data_and_model(
         clip=(0.0, 1.2),
     )
 
-    dataset_train = SpectraDataset(n_samples=n_train, num_points=n_points,
-                                   poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-                                   sample_ranges=TRAIN_RANGES, strict_check=True,
-                                   with_noise=True, noise_profile=NOISE_TRAIN, freeze_noise=False)
-    dataset_val = SpectraDataset(n_samples=n_val, num_points=n_points,
-                                 poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-                                 sample_ranges=VAL_RANGES, strict_check=True,
-                                 with_noise=True, noise_profile=NOISE_VAL, freeze_noise=True)
+    return {
+        "poly_freq_CH4": poly_freq_CH4,
+        "transitions_dict": transitions_dict,
+        "train_ranges": default_train,
+        "val_ranges": default_val,
+        "noise_train": noise_train,
+        "noise_val": noise_val,
+        "predict_params": DEFAULT_PREDICT_PARAMS,
+        "film_params": DEFAULT_FILM_PARAMS,
+    }
 
-    train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=(device=='cuda'))
-    val_loader   = DataLoader(dataset_val,   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=(device=='cuda'))
 
-    # baseline0 n'est PAS prédit (normalisation via max LOWESS)
-    predict_list = predict_list or ["sig0","dsig","mf_CH4","P","T","baseline1","baseline2"]
-    film_list    = []
+def build_data_and_model_from_config(
+    data_config: Optional[DataModuleConfig] = None,
+    model_config: Optional[ModelConfig] = None,
+):
+    data_config = data_config or DataModuleConfig()
+    model_config = model_config or ModelConfig()
+
+    assets = _default_data_assets()
+    poly_freq_CH4 = list(data_config.poly_freq_CH4 or assets["poly_freq_CH4"])
+    transitions_dict = deepcopy(data_config.transitions_dict or assets["transitions_dict"])
+
+    pl.seed_everything(data_config.seed)
+
+    train_ranges = data_config.resolve_ranges("train", assets["train_ranges"])
+    val_ranges = data_config.resolve_ranges("val", assets["val_ranges"])
+    assert_subset(val_ranges, train_ranges, "VAL", "TRAIN")
+
+    global NORM_PARAMS
+    NORM_PARAMS = deepcopy(train_ranges)
+
+    noise_train = data_config.resolve_noise("train", assets["noise_train"])
+    noise_val = data_config.resolve_noise("val", assets["noise_val"])
+
+    dataset_train = SpectraDataset(
+        n_samples=data_config.n_train,
+        num_points=data_config.n_points,
+        poly_freq_CH4=poly_freq_CH4,
+        transitions_dict=transitions_dict,
+        sample_ranges=train_ranges,
+        strict_check=data_config.strict_check,
+        with_noise=data_config.with_noise_train,
+        noise_profile=noise_train,
+        freeze_noise=data_config.freeze_noise_train,
+    )
+    dataset_val = SpectraDataset(
+        n_samples=data_config.n_val,
+        num_points=data_config.n_points,
+        poly_freq_CH4=poly_freq_CH4,
+        transitions_dict=transitions_dict,
+        sample_ranges=val_ranges,
+        strict_check=data_config.strict_check,
+        with_noise=data_config.with_noise_val,
+        noise_profile=noise_val,
+        freeze_noise=data_config.freeze_noise_val,
+    )
+
+    device = data_config.effective_device()
+    num_workers = data_config.effective_num_workers()
+    pin_memory = data_config.pin_memory if data_config.pin_memory is not None else (device == 'cuda')
+
+    train_loader = DataLoader(
+        dataset_train,
+        batch_size=data_config.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        dataset_val,
+        batch_size=data_config.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    model_kwargs = model_config.to_model_kwargs(
+        default_predict_params=assets["predict_params"],
+        default_film_params=assets["film_params"],
+    )
 
     model = PhysicallyInformedAE(
-        n_points=n_points, param_names=PARAMS, poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-        lr=lrs[0], alpha_param=0.3, alpha_phys=0.7, head_mode="multi",
-        predict_params=predict_list, film_params=film_list,
-        refine_steps=1, refine_delta_scale=0.1, refine_target="noisy",
-        refine_warmup_epochs=30, freeze_base_epochs=20,
-        base_lr=lrs[0], refiner_lr=lrs[1],
-        baseline_fix_enable=False, baseline_fix_sideband=50, baseline_fix_degree=2,
-        baseline_fix_weight=1.0, baseline_fix_in_warmup=False,
+        n_points=data_config.n_points,
+        param_names=PARAMS,
+        poly_freq_CH4=poly_freq_CH4,
+        transitions_dict=transitions_dict,
+        **model_kwargs,
+    )
+
+    metadata = {
+        "poly_freq_CH4": poly_freq_CH4,
+        "transitions_dict": transitions_dict,
+        "train_ranges": train_ranges,
+        "val_ranges": val_ranges,
+        "noise_train": noise_train,
+        "noise_val": noise_val,
+        "model_kwargs": model_kwargs,
+        "batch_size": data_config.batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "device": device,
+        "train_dataset": dataset_train,
+        "val_dataset": dataset_val,
+    }
+
+    return model, train_loader, val_loader, metadata
+
+
+def build_data_and_model(
+    *, seed=42, n_points=800, n_train=50000, n_val=5000, batch_size=16,
+    train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
+    predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
+):
+    data_config = DataModuleConfig(
+        seed=seed,
+        n_points=n_points,
+        n_train=n_train,
+        n_val=n_val,
+        batch_size=batch_size,
+        train_ranges=train_ranges,
+        val_ranges=val_ranges,
+        noise_train=noise_train,
+        noise_val=noise_val,
+        with_noise_train=True,
+        with_noise_val=True,
+        freeze_noise_train=False,
+        freeze_noise_val=True,
+    )
+
+    model_config = ModelConfig(
+        lr=lrs[0],
+        alpha_param=0.3,
+        alpha_phys=0.7,
+        head_mode="multi",
+        predict_params=predict_list or DEFAULT_PREDICT_PARAMS,
+        film_params=film_list or DEFAULT_FILM_PARAMS,
+        refine_steps=1,
+        refine_delta_scale=0.1,
+        refine_target="noisy",
+        refine_warmup_epochs=30,
+        freeze_base_epochs=20,
+        base_lr=lrs[0],
+        refiner_lr=lrs[1],
+        baseline_fix_enable=False,
+        baseline_fix_sideband=50,
+        baseline_fix_degree=2,
+        baseline_fix_weight=1.0,
+        baseline_fix_in_warmup=False,
         recon_max1=True,
         corr_mode="none",
-        corr_savgol_win= 15,   
-        corr_savgol_poly=3 
+        corr_savgol_win=15,
+        corr_savgol_poly=3,
+    )
+
+    model, train_loader, val_loader, _ = build_data_and_model_from_config(
+        data_config=data_config,
+        model_config=model_config,
     )
     return model, train_loader, val_loader
 
