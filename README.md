@@ -2,6 +2,18 @@
 
 Ce dépôt expose une version modulaire du réseau PhysAE avec une configuration basée sur des fichiers YAML et des utilitaires d'optimisation. Vous trouverez les fichiers de configuration dans `physae/configs` ainsi qu'un carnet Jupyter d'exemple dans `notebooks/optimisation_physae.ipynb`.
 
+## Documentation Read the Docs
+
+Une documentation complète (installation, tutoriel, guide des hyperparamètres) est disponible dans le dossier `docs/` au format Sphinx. Pour la construire localement :
+
+```bash
+pip install -r docs/requirements.txt
+cd docs
+make html
+```
+
+Les pages HTML seront générées dans `docs/_build/html`. Cette structure est compatible avec un déploiement direct sur https://readthedocs.io/.
+
 ## Configurations YAML
 
 * `physae/configs/data/default.yaml` définit les hyperparamètres de génération des données (tailles d'échantillons, intervalles physiques, bruit, etc.).
