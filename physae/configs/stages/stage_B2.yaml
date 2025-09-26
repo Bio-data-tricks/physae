@@ -1,0 +1,32 @@
+stage_name: B2
+epochs: 15
+base_lr: 3.0e-05
+refiner_lr: 3.0e-06
+train_base: true
+train_heads: true
+train_film: true
+train_refiner: true
+refine_steps: 2
+delta_scale: 0.08
+use_film: true
+film_subset:
+  - P
+  - T
+heads_subset: null
+baseline_fix_enable: false
+enable_progress_bar: false
+optuna:
+  base_lr:
+    type: float
+    low: 1.0e-05
+    high: 1.0e-03
+    log: true
+  refiner_lr:
+    type: float
+    low: 1.0e-06
+    high: 1.0e-03
+    log: true
+  delta_scale:
+    type: float
+    low: 0.05
+    high: 0.2

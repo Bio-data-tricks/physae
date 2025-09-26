@@ -1,0 +1,74 @@
+seed: 42
+n_points: 800
+n_train: 50000
+n_val: 5000
+batch_size: 16
+train_ranges_base:
+  sig0: [3085.43, 3085.46]
+  dsig: [0.001521, 0.00154]
+  mf_CH4: [2.0e-06, 2.0e-05]
+  baseline0: [0.99, 1.01]
+  baseline1: [-0.0004, -0.0003]
+  baseline2: [-4.0565e-08, -3.07117e-08]
+  P: [400, 600]
+  T: [303.15, 313.15]
+train_ranges_expand:
+  _default: 1.0
+  sig0: 5.0
+  dsig: 7.0
+  mf_CH4: 2.0
+  baseline0: 1.0
+  baseline1: 3.0
+  baseline2: 8.0
+  P: 2.0
+  T: 2.0
+val_ranges:
+  sig0: [3085.43, 3085.46]
+  dsig: [0.001521, 0.00154]
+  mf_CH4: [2.0e-06, 2.0e-05]
+  baseline0: [0.99, 1.01]
+  baseline1: [-0.0004, -0.0003]
+  baseline2: [-4.0565e-08, -3.07117e-08]
+  P: [400, 600]
+  T: [303.15, 313.15]
+noise:
+  train:
+    std_add_range: [0, 0.01]
+    std_mult_range: [0, 0.01]
+    p_drift: 0.1
+    drift_sigma_range: [10.0, 120.0]
+    drift_amp_range: [0.004, 0.05]
+    p_fringes: 0.1
+    n_fringes_range: [1, 2]
+    fringe_freq_range: [0.3, 50.0]
+    fringe_amp_range: [0.001, 0.015]
+    p_spikes: 0.1
+    spikes_count_range: [1, 6]
+    spike_amp_range: [0.002, 1.0]
+    spike_width_range: [1.0, 20.0]
+    clip: [0.0, 1.2]
+  val:
+    std_add_range: [0, 1.0e-05]
+    std_mult_range: [0, 1.0e-05]
+    p_drift: 0.0
+    drift_sigma_range: [20.0, 120.0]
+    drift_amp_range: [0.0, 0.01]
+    p_fringes: 0.0
+    n_fringes_range: [1, 2]
+    fringe_freq_range: [0.5, 10.0]
+    fringe_amp_range: [0.0, 0.004]
+    p_spikes: 0.0
+    spikes_count_range: [1, 2]
+    spike_amp_range: [0.0, 0.01]
+    spike_width_range: [1.0, 3.0]
+    clip: [0.0, 1.2]
+predict_list:
+  - sig0
+  - dsig
+  - mf_CH4
+  - P
+  - T
+  - baseline1
+  - baseline2
+film_list: []
+lrs: [0.0001, 1.0e-05]

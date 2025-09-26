@@ -3,33 +3,53 @@
 from __future__ import annotations
 
 import sys
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
 from . import config
+from .config_loader import coerce_sequence, load_data_config, merge_dicts
 from .dataset import SpectraDataset
 from .model import PhysicallyInformedAE
 from .physics import parse_csv_transitions
 
 
+def _to_tuple_map(mapping: Dict[str, Tuple[float, float]] | Dict[str, list] | None) -> Dict[str, Tuple[float, float]]:
+    if mapping is None:
+        return {}
+    converted: Dict[str, Tuple[float, float]] = {}
+    for key, value in mapping.items():
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError(f"Interval for '{key}' must be a length-2 sequence.")
+        converted[key] = (float(value[0]), float(value[1]))
+    return converted
+
+
 def build_data_and_model(
     *,
-    seed: int = 42,
-    n_points: int = 800,
-    n_train: int = 50000,
-    n_val: int = 5000,
-    batch_size: int = 16,
+    seed: int | None = None,
+    n_points: int | None = None,
+    n_train: int | None = None,
+    n_val: int | None = None,
+    batch_size: int | None = None,
     train_ranges: Dict[str, Tuple[float, float]] | None = None,
     val_ranges: Dict[str, Tuple[float, float]] | None = None,
     noise_train: Dict | None = None,
     noise_val: Dict | None = None,
     predict_list: list | None = None,
     film_list: list | None = None,
-    lrs: Tuple[float, float] = (1e-4, 1e-5),
+    lrs: Tuple[float, float] | None = None,
+    config_path: str | None = None,
+    config_name: str = "default",
+    config_overrides: Dict[str, Any] | None = None,
 ):
+    data_config = load_data_config(config_path, name=config_name)
+    if config_overrides:
+        data_config = merge_dicts(data_config, config_overrides)
+
+    seed = int(seed if seed is not None else data_config.get("seed", 42))
     pl.seed_everything(seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     is_windows = sys.platform == "win32"
@@ -52,7 +72,11 @@ def build_data_and_model(
         "P": (400, 600),
         "T": (273.15 + 30, 273.15 + 40),
     }
-    expand_factors = {
+    config_val_ranges = _to_tuple_map(data_config.get("val_ranges"))
+    if config_val_ranges:
+        default_val.update(config_val_ranges)
+
+    expand_factors_default = {
         "_default": 1.0,
         "sig0": 5.0,
         "dsig": 7.0,
@@ -63,47 +87,74 @@ def build_data_and_model(
         "P": 2.0,
         "T": 2.0,
     }
-    default_train = config.map_ranges(default_val, config.expand_interval, per_param=expand_factors)
+    expand_factors = dict(expand_factors_default)
+    expand_factors.update(data_config.get("train_ranges_expand", {}))
+    base_ranges = _to_tuple_map(data_config.get("train_ranges_base")) or dict(default_val)
+    default_train = config.map_ranges(base_ranges, config.expand_interval, per_param=expand_factors)
+    direct_train = _to_tuple_map(data_config.get("train_ranges"))
+
     lo, hi = default_train["mf_CH4"]
     default_train["mf_CH4"] = (max(lo, config.LOG_FLOOR), max(hi, config.LOG_FLOOR * 10))
     lo, hi = default_val["mf_CH4"]
     default_val["mf_CH4"] = (max(lo, config.LOG_FLOOR), max(hi, config.LOG_FLOOR * 10))
-    val_ranges = val_ranges or default_val
-    train_ranges = train_ranges or default_train
+    val_ranges = val_ranges or config_val_ranges or default_val
+    if train_ranges is None:
+        train_ranges = direct_train or default_train
     config.assert_subset(val_ranges, train_ranges, "VAL", "TRAIN")
     config.set_norm_params(train_ranges)
-    noise_train = noise_train or dict(
-        std_add_range=(0, 1e-2),
-        std_mult_range=(0, 1e-2),
-        p_drift=0.1,
-        drift_sigma_range=(10.0, 120.0),
-        drift_amp_range=(0.004, 0.05),
-        p_fringes=0.1,
-        n_fringes_range=(1, 2),
-        fringe_freq_range=(0.3, 50.0),
-        fringe_amp_range=(0.001, 0.015),
-        p_spikes=0.1,
-        spikes_count_range=(1, 6),
-        spike_amp_range=(0.002, 1),
-        spike_width_range=(1.0, 20.0),
-        clip=(0.0, 1.2),
-    )
-    noise_val = noise_val or dict(
-        std_add_range=(0, 1e-5),
-        std_mult_range=(0, 1e-5),
-        p_drift=0,
-        drift_sigma_range=(20.0, 120.0),
-        drift_amp_range=(0.0, 0.01),
-        p_fringes=0,
-        n_fringes_range=(1, 2),
-        fringe_freq_range=(0.5, 10.0),
-        fringe_amp_range=(0.0, 0.004),
-        p_spikes=0.0,
-        spikes_count_range=(1, 2),
-        spike_amp_range=(0.0, 0.01),
-        spike_width_range=(1.0, 3.0),
-        clip=(0.0, 1.2),
-    )
+    noise_defaults = {
+        "train": {
+            "std_add_range": (0, 1e-2),
+            "std_mult_range": (0, 1e-2),
+            "p_drift": 0.1,
+            "drift_sigma_range": (10.0, 120.0),
+            "drift_amp_range": (0.004, 0.05),
+            "p_fringes": 0.1,
+            "n_fringes_range": (1, 2),
+            "fringe_freq_range": (0.3, 50.0),
+            "fringe_amp_range": (0.001, 0.015),
+            "p_spikes": 0.1,
+            "spikes_count_range": (1, 6),
+            "spike_amp_range": (0.002, 1),
+            "spike_width_range": (1.0, 20.0),
+            "clip": (0.0, 1.2),
+        },
+        "val": {
+            "std_add_range": (0, 1e-5),
+            "std_mult_range": (0, 1e-5),
+            "p_drift": 0,
+            "drift_sigma_range": (20.0, 120.0),
+            "drift_amp_range": (0.0, 0.01),
+            "p_fringes": 0,
+            "n_fringes_range": (1, 2),
+            "fringe_freq_range": (0.5, 10.0),
+            "fringe_amp_range": (0.0, 0.004),
+            "p_spikes": 0.0,
+            "spikes_count_range": (1, 2),
+            "spike_amp_range": (0.0, 0.01),
+            "spike_width_range": (1.0, 3.0),
+            "clip": (0.0, 1.2),
+        },
+    }
+
+    def _normalise_noise(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in cfg.items():
+            if isinstance(value, list):
+                result[key] = tuple(float(v) for v in value)
+            else:
+                result[key] = value
+        return result
+
+    noise_cfg = data_config.get("noise", {})
+    noise_train_cfg = noise_cfg.get("train")
+    noise_val_cfg = noise_cfg.get("val")
+    noise_train = noise_train or _normalise_noise(noise_train_cfg or noise_defaults["train"])
+    noise_val = noise_val or _normalise_noise(noise_val_cfg or noise_defaults["val"])
+    n_points = int(n_points if n_points is not None else data_config.get("n_points", 800))
+    n_train = int(n_train if n_train is not None else data_config.get("n_train", 50000))
+    n_val = int(n_val if n_val is not None else data_config.get("n_val", 5000))
+    batch_size = int(batch_size if batch_size is not None else data_config.get("batch_size", 16))
     dataset_train = SpectraDataset(
         n_samples=n_train,
         num_points=n_points,
@@ -140,8 +191,17 @@ def build_data_and_model(
         num_workers=num_workers,
         pin_memory=(device == "cuda"),
     )
-    predict_list = predict_list or ["sig0", "dsig", "mf_CH4", "P", "T", "baseline1", "baseline2"]
-    film_list = film_list or []
+    predict_list = predict_list or coerce_sequence(data_config.get("predict_list")) or [
+        "sig0",
+        "dsig",
+        "mf_CH4",
+        "P",
+        "T",
+        "baseline1",
+        "baseline2",
+    ]
+    film_list = film_list or coerce_sequence(data_config.get("film_list"))
+    lrs = lrs or tuple(float(v) for v in data_config.get("lrs", (1e-4, 1e-5)))
     model = PhysicallyInformedAE(
         n_points=n_points,
         param_names=config.PARAMS,

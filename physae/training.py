@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 
+from .config_loader import load_stage_config, merge_dicts
 from .model import PhysicallyInformedAE
 
 
@@ -94,7 +95,8 @@ def train_stage_custom(
     ckpt_in: Optional[str] = None,
     ckpt_out: Optional[str] = None,
     enable_progress_bar: bool = False,
-):
+    return_metrics: bool = False,
+) -> PhysicallyInformedAE | Tuple[PhysicallyInformedAE, Dict[str, float]]:
     print(f"\n===== Stage {stage_name} =====")
     _load_weights_if_any(model, ckpt_in)
     try:
@@ -130,70 +132,38 @@ def train_stage_custom(
     )
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
+    if return_metrics:
+        metrics: Dict[str, float] = {}
+        for key, value in trainer.callback_metrics.items():
+            if isinstance(value, torch.Tensor):
+                metrics[key] = float(value.detach().cpu())
+            elif isinstance(value, (int, float)):
+                metrics[key] = float(value)
+        return model, metrics
     return model
 
 
+def _prepare_stage_arguments(stage: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    overrides = dict(overrides or {})
+    config_path = overrides.pop("config_path", None)
+    stage_overrides = overrides.pop("config_overrides", None)
+    stage_config = load_stage_config(stage, path=config_path)
+    stage_config = merge_dicts(stage_config, stage_overrides)
+    stage_config = merge_dicts(stage_config, overrides)
+    stage_config.pop("optuna", None)
+    return stage_config
+
+
 def train_stage_A(model, train_loader, val_loader, **kwargs):
-    defaults = dict(
-        stage_name="A",
-        epochs=20,
-        base_lr=2e-4,
-        refiner_lr=1e-6,
-        train_base=True,
-        train_heads=True,
-        train_film=False,
-        train_refiner=False,
-        refine_steps=0,
-        delta_scale=0.1,
-        use_film=False,
-        film_subset=None,
-        heads_subset=None,
-        baseline_fix_enable=False,
-        enable_progress_bar=False,
-    )
-    defaults.update(kwargs)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+    params = _prepare_stage_arguments("A", kwargs)
+    return train_stage_custom(model, train_loader, val_loader, **params)
 
 
 def train_stage_B1(model, train_loader, val_loader, **kwargs):
-    defaults = dict(
-        stage_name="B1",
-        epochs=12,
-        base_lr=1e-6,
-        refiner_lr=1e-5,
-        train_base=False,
-        train_heads=False,
-        train_film=False,
-        train_refiner=True,
-        refine_steps=2,
-        delta_scale=0.12,
-        use_film=True,
-        film_subset=["T"],
-        heads_subset=None,
-        baseline_fix_enable=False,
-        enable_progress_bar=False,
-    )
-    defaults.update(kwargs)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+    params = _prepare_stage_arguments("B1", kwargs)
+    return train_stage_custom(model, train_loader, val_loader, **params)
 
 
 def train_stage_B2(model, train_loader, val_loader, **kwargs):
-    defaults = dict(
-        stage_name="B2",
-        epochs=15,
-        base_lr=3e-5,
-        refiner_lr=3e-6,
-        train_base=True,
-        train_heads=True,
-        train_film=True,
-        train_refiner=True,
-        refine_steps=2,
-        delta_scale=0.08,
-        use_film=True,
-        film_subset=["P", "T"],
-        heads_subset=None,
-        baseline_fix_enable=False,
-        enable_progress_bar=False,
-    )
-    defaults.update(kwargs)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+    params = _prepare_stage_arguments("B2", kwargs)
+    return train_stage_custom(model, train_loader, val_loader, **params)

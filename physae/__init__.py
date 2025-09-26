@@ -6,6 +6,7 @@ from .dataset import SpectraDataset
 from .evaluation import evaluate_and_plot
 from .factory import build_data_and_model
 from .model import PhysicallyInformedAE
+from .optimization import optimise_stage
 from .training import train_stage_A, train_stage_B1, train_stage_B2, train_stage_custom
 
 __all__ = [
@@ -16,6 +17,7 @@ __all__ = [
     "evaluate_and_plot",
     "build_data_and_model",
     "PhysicallyInformedAE",
+    "optimise_stage",
     "train_stage_A",
     "train_stage_B1",
     "train_stage_B2",
