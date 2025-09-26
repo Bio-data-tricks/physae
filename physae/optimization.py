@@ -7,7 +7,12 @@ from typing import Any, Dict, Mapping, Optional
 import optuna
 
 from .config_loader import load_data_config, load_stage_config, merge_dicts
-from .factory import build_data_and_model
+from .factory import (
+    TrainingEnvironment,
+    build_data_and_model,
+    instantiate_model,
+    prepare_training_environment,
+)
 from .training import train_stage_custom
 
 
@@ -46,13 +51,26 @@ def optimise_stage(
     data_overrides: Optional[Mapping[str, Any]] = None,
     stage_config_path: str | None = None,
     stage_overrides: Optional[Mapping[str, Any]] = None,
+    reuse_dataloaders: bool = True,
+    reseed_trials: bool = True,
     sampler: optuna.samplers.BaseSampler | None = None,
     pruner: optuna.pruners.BasePruner | None = None,
     storage: str | None = None,
     study_name: str | None = None,
     show_progress_bar: bool = False,
 ) -> optuna.study.Study:
-    """Optimise a training stage using Optuna."""
+    """Optimise a training stage using Optuna.
+
+    Args:
+        reuse_dataloaders: When ``True`` (default) the same dataloaders are
+            reused across trials which drastically reduces the setup cost of an
+            optimisation study.  A fresh :class:`PhysicallyInformedAE` instance
+            is still created for every trial.
+        reseed_trials: Whether to reseed PyTorch/Lightning before each trial
+            when ``reuse_dataloaders`` is enabled.  Disabling this keeps the
+            exact stochastic behaviour across trials but can make comparisons
+            noisier.
+    """
 
     if direction not in {"minimize", "maximize"}:
         raise ValueError("direction must be either 'minimize' or 'maximize'.")
@@ -61,6 +79,19 @@ def optimise_stage(
     if data_overrides:
         # Validate overrides early by ensuring the base configuration can be loaded.
         load_data_config(data_config_path, name=data_config_name)
+
+    shared_env: TrainingEnvironment | None = None
+    if reuse_dataloaders:
+        shared_env = prepare_training_environment(
+            config_path=data_config_path,
+            config_name=data_config_name,
+            config_overrides=data_overrides,
+        )
+        # Reset epoch to a known value to make seeding behaviour predictable.
+        if hasattr(shared_env.train_loader.dataset, "set_epoch"):
+            shared_env.train_loader.dataset.set_epoch(0)
+        if hasattr(shared_env.val_loader.dataset, "set_epoch"):
+            shared_env.val_loader.dataset.set_epoch(0)
 
     def objective(trial: optuna.Trial) -> float:
         stage_cfg = load_stage_config(stage, path=stage_config_path)
@@ -71,11 +102,35 @@ def optimise_stage(
         params.update(stage_cfg)
         for param_name, spec in search_space.items():
             params[param_name] = _suggest_from_spec(trial, param_name, spec)
-        model, train_loader, val_loader = build_data_and_model(
-            config_path=data_config_path,
-            config_name=data_config_name,
-            config_overrides=data_overrides,
-        )
+
+        if shared_env is not None:
+            trial_seed = shared_env.seed + trial.number if reseed_trials else None
+            if trial_seed is not None:
+                try:  # pragma: no cover - best effort reseeding
+                    import pytorch_lightning as pl
+
+                    pl.seed_everything(trial_seed)
+                except Exception:
+                    pass
+                try:
+                    import torch
+
+                    torch.manual_seed(trial_seed)
+                except Exception:
+                    pass
+            if hasattr(shared_env.train_loader.dataset, "set_epoch"):
+                shared_env.train_loader.dataset.set_epoch(trial.number)
+            if hasattr(shared_env.val_loader.dataset, "set_epoch"):
+                shared_env.val_loader.dataset.set_epoch(trial.number)
+            model = instantiate_model(shared_env)
+            train_loader = shared_env.train_loader
+            val_loader = shared_env.val_loader
+        else:
+            model, train_loader, val_loader = build_data_and_model(
+                config_path=data_config_path,
+                config_name=data_config_name,
+                config_overrides=data_overrides,
+            )
         _, metrics = train_stage_custom(
             model,
             train_loader,
