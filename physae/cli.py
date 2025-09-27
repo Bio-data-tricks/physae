@@ -157,7 +157,7 @@ def cmd_train(args: argparse.Namespace) -> None:
         trainer_kwargs["strategy"] = args.strategy
     if args.precision:
         trainer_kwargs["precision"] = args.precision
-    model, metrics, last_ckpt = train_stages(
+    train_result = train_stages(
         args.stages,
         stage_params=stage_params,
         data_config_path=args.data_config_path,
@@ -168,12 +168,12 @@ def cmd_train(args: argparse.Namespace) -> None:
         fine_tune_only=args.fine_tune_only,
     )
     print("Entraînement terminé. Statistiques:")
-    for stage, stage_metrics in metrics.items():
+    for stage, stage_metrics in train_result.metrics.items():
         print(f"  - {stage}: {json.dumps(stage_metrics, indent=2)}")
     if args.metrics_out:
-        _save_json(Path(args.metrics_out), metrics)
-    if last_ckpt is not None:
-        print(f"Dernier checkpoint: {last_ckpt}")
+        _save_json(Path(args.metrics_out), train_result.metrics)
+    if train_result.last_checkpoint is not None:
+        print(f"Dernier checkpoint: {train_result.last_checkpoint}")
 
 
 def cmd_infer(args: argparse.Namespace) -> None:

@@ -59,6 +59,13 @@ class StageOptimisationResult:
     artifact_dir: Optional[Path]
 
 
+@dataclass(slots=True)
+class StageTrainingResult:
+    model: Any
+    metrics: Dict[str, Dict[str, float]]
+    last_checkpoint: Optional[Path]
+
+
 def optimise_stages(
     stages: Iterable[str],
     *,
@@ -153,7 +160,7 @@ def train_stages(
     ckpt_dir: str | Path | None = None,
     trainer_kwargs: Optional[Mapping[str, Any]] = None,
     fine_tune_only: bool = False,
-) -> Tuple[Any, Dict[str, Dict[str, float]], Optional[Path]]:
+) -> StageTrainingResult:
     """Sequentially train the requested stages with the provided parameters."""
 
     stages_expanded = expand_stages(stages)
@@ -195,8 +202,14 @@ def train_stages(
             prev_ckpt = ckpt_out
         elif "ckpt_out" in params:
             prev_ckpt = Path(params["ckpt_out"])
-    return model, metrics, prev_ckpt
+    return StageTrainingResult(model=model, metrics=metrics, last_checkpoint=prev_ckpt)
 
 
-__all__ = ["StageOptimisationResult", "optimise_stages", "train_stages", "expand_stages"]
+__all__ = [
+    "StageOptimisationResult",
+    "StageTrainingResult",
+    "optimise_stages",
+    "train_stages",
+    "expand_stages",
+]
 
