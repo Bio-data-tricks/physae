@@ -212,6 +212,17 @@ class PhysicallyInformedAE(pl.LightningModule):
         refiner_kwargs.setdefault("hidden_scale", float(refiner_hidden_scale))
 
         self.refiner_name = str(refiner_name)
+        legacy_key_map = {
+            "width_mult": ("encoder_width_mult", float),
+            "depth_mult": ("encoder_depth_mult", float),
+            "expand_ratio_scale": ("encoder_expand_ratio_scale", float),
+            "se_ratio": ("encoder_se_ratio", float),
+            "norm_groups": ("encoder_norm_groups", int),
+        }
+        for legacy_key, (target_key, caster) in legacy_key_map.items():
+            if legacy_key in refiner_kwargs:
+                value = refiner_kwargs.pop(legacy_key)
+                refiner_kwargs.setdefault(target_key, caster(value))
         refiner = build_refiner(self.refiner_name, **refiner_kwargs)
         if not isinstance(refiner, nn.Module):
             raise TypeError(
