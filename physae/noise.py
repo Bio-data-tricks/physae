@@ -40,7 +40,15 @@ def add_noise_variety(spectra: torch.Tensor, *, generator=None, **config) -> tor
         return (torch.rand((), device=device, generator=generator) * (b - a) + a).item()
 
     def rand_int(a, b):
-        return int(torch.randint(a, b + 1, (), device=device, generator=generator).item())
+        low = math.ceil(a)
+        high = math.floor(b)
+        if low > high:
+            raise ValueError(
+                "Invalid integer range: lower bound is greater than upper bound"
+            )
+        return int(
+            torch.randint(low, high + 1, (), device=device, generator=generator).item()
+        )
 
     def rand_bool(p):
         return bool(torch.rand((), device=device, generator=generator) < p)
