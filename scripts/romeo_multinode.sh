@@ -11,9 +11,9 @@
 
 set -euo pipefail
 
-module purge
-module load anaconda/2023
-module load cuda/12.1
+romeo_load_armgpu_env
+spack load python@3.13.0/gzl2pkh cuda@12.6.2
+source /home/cosmic_86/envs/pytorch_arm_test/bin/activate
 
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
 export MASTER_PORT=${MASTER_PORT:-12345}
