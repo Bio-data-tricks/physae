@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.nn as nn
 
 from .backbone import EfficientNetEncoder
+from .registry import register_refiner
 
 
 class EfficientNetRefiner(nn.Module):
@@ -90,3 +93,20 @@ class EfficientNetRefiner(nn.Module):
         raw = self.delta_head(context)
         delta = torch.tanh(raw) * scale
         return delta
+
+
+@register_refiner("efficientnet")
+def build_efficientnet_refiner(**kwargs: Any) -> EfficientNetRefiner:
+    """Factory compatible with :func:`register_refiner` to build the default refiner."""
+
+    required = {
+        "m_params",
+        "cond_dim",
+        "backbone_feat_dim",
+    }
+    missing = [name for name in required if name not in kwargs]
+    if missing:
+        raise TypeError(
+            "EfficientNet refiner requires the following arguments: " + ", ".join(missing)
+        )
+    return EfficientNetRefiner(**kwargs)

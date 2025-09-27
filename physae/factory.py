@@ -209,19 +209,28 @@ def build_data_and_model(
     optimizer_cfg = model_cfg.get("optimizer", {}) or {}
     scheduler_cfg = model_cfg.get("scheduler", {}) or {}
     shared_head_hidden_scale = float(model_cfg.get("shared_head_hidden_scale", 0.5))
-    refiner_hidden_scale = float(refiner_cfg.get("hidden_scale", 0.5))
+    encoder_name = str(encoder_cfg.get("name", "efficientnet"))
+    encoder_params = dict(encoder_cfg.get("params", {}))
+    for key in ("width_mult", "depth_mult", "expand_ratio_scale", "se_ratio", "norm_groups"):
+        if key in encoder_cfg and key not in encoder_params:
+            encoder_params[key] = encoder_cfg[key]
+    encoder_width_mult = float(encoder_params.get("width_mult", 1.0))
+    encoder_depth_mult = float(encoder_params.get("depth_mult", 1.0))
+    encoder_expand_ratio_scale = float(encoder_params.get("expand_ratio_scale", 1.0))
+    encoder_se_ratio = float(encoder_params.get("se_ratio", 0.25))
+    encoder_norm_groups = int(encoder_params.get("norm_groups", 8))
 
-    encoder_width_mult = float(encoder_cfg.get("width_mult", 1.0))
-    encoder_depth_mult = float(encoder_cfg.get("depth_mult", 1.0))
-    encoder_expand_ratio_scale = float(encoder_cfg.get("expand_ratio_scale", 1.0))
-    encoder_se_ratio = float(encoder_cfg.get("se_ratio", 0.25))
-    encoder_norm_groups = int(encoder_cfg.get("norm_groups", 8))
-
-    refiner_width_mult = float(refiner_cfg.get("width_mult", 1.0))
-    refiner_depth_mult = float(refiner_cfg.get("depth_mult", 1.0))
-    refiner_expand_ratio_scale = float(refiner_cfg.get("expand_ratio_scale", 1.0))
-    refiner_se_ratio = float(refiner_cfg.get("se_ratio", 0.25))
-    refiner_norm_groups = int(refiner_cfg.get("norm_groups", 8))
+    refiner_name = str(refiner_cfg.get("name", "efficientnet"))
+    refiner_params = dict(refiner_cfg.get("params", {}))
+    for key in ("width_mult", "depth_mult", "expand_ratio_scale", "se_ratio", "norm_groups", "hidden_scale"):
+        if key in refiner_cfg and key not in refiner_params:
+            refiner_params[key] = refiner_cfg[key]
+    refiner_width_mult = float(refiner_params.get("width_mult", 1.0))
+    refiner_depth_mult = float(refiner_params.get("depth_mult", 1.0))
+    refiner_expand_ratio_scale = float(refiner_params.get("expand_ratio_scale", 1.0))
+    refiner_se_ratio = float(refiner_params.get("se_ratio", 0.25))
+    refiner_norm_groups = int(refiner_params.get("norm_groups", 8))
+    refiner_hidden_scale = float(refiner_params.get("hidden_scale", 0.5))
 
     betas_cfg = optimizer_cfg.get("betas", (0.9, 0.999))
     if (
@@ -268,6 +277,8 @@ def build_data_and_model(
         encoder_expand_ratio_scale=encoder_expand_ratio_scale,
         encoder_se_ratio=encoder_se_ratio,
         encoder_norm_groups=encoder_norm_groups,
+        encoder_name=encoder_name,
+        encoder_config=encoder_params,
         shared_head_hidden_scale=shared_head_hidden_scale,
         refiner_encoder_width_mult=refiner_width_mult,
         refiner_encoder_depth_mult=refiner_depth_mult,
@@ -275,6 +286,8 @@ def build_data_and_model(
         refiner_encoder_se_ratio=refiner_se_ratio,
         refiner_encoder_norm_groups=refiner_norm_groups,
         refiner_hidden_scale=refiner_hidden_scale,
+        refiner_name=refiner_name,
+        refiner_config=refiner_params,
         optimizer_name=str(optimizer_cfg.get("name", "adamw")),
         optimizer_betas=optimizer_betas,
         optimizer_weight_decay=float(optimizer_cfg.get("weight_decay", 1e-4)),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,7 +12,12 @@ import pytorch_lightning as pl
 
 from .config import NORM_PARAMS
 from .losses import ReLoBRaLoLoss
-from .models import EfficientNetEncoder, EfficientNetRefiner
+from .models import (
+    EfficientNetEncoder,
+    EfficientNetRefiner,
+    build_encoder,
+    build_refiner,
+)
 from .normalization import norm_param_torch, unnorm_param_torch
 from .physics import batch_physics_forward_multimol_vgrid
 from .optimizers import Lion
@@ -59,6 +64,8 @@ class PhysicallyInformedAE(pl.LightningModule):
         encoder_expand_ratio_scale: float = 1.0,
         encoder_se_ratio: float = 0.25,
         encoder_norm_groups: int = 8,
+        encoder_name: str = "efficientnet",
+        encoder_config: Dict[str, Any] | None = None,
         shared_head_hidden_scale: float = 0.5,
         refiner_encoder_width_mult: float = 1.0,
         refiner_encoder_depth_mult: float = 1.0,
@@ -66,6 +73,8 @@ class PhysicallyInformedAE(pl.LightningModule):
         refiner_encoder_se_ratio: float = 0.25,
         refiner_encoder_norm_groups: int = 8,
         refiner_hidden_scale: float = 0.5,
+        refiner_name: str = "efficientnet",
+        refiner_config: Dict[str, Any] | None = None,
         optimizer_name: str = "adamw",
         optimizer_betas: Tuple[float, float] | List[float] = (0.9, 0.999),
         optimizer_weight_decay: float = 1e-4,
@@ -136,14 +145,25 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.predict_idx = [self.name_to_idx[name] for name in self.predict_params]
         self.provided_idx = [self.name_to_idx[name] for name in self.provided_params]
 
-        self.backbone = EfficientNetEncoder(
-            in_channels=1,
-            width_mult=encoder_width_mult,
-            depth_mult=encoder_depth_mult,
-            expand_ratio_scale=encoder_expand_ratio_scale,
-            se_ratio=encoder_se_ratio,
-            norm_groups=encoder_norm_groups,
-        )
+        encoder_kwargs = dict(encoder_config or {})
+        encoder_kwargs.setdefault("in_channels", 1)
+        encoder_kwargs.setdefault("width_mult", float(encoder_width_mult))
+        encoder_kwargs.setdefault("depth_mult", float(encoder_depth_mult))
+        encoder_kwargs.setdefault("expand_ratio_scale", float(encoder_expand_ratio_scale))
+        encoder_kwargs.setdefault("se_ratio", float(encoder_se_ratio))
+        encoder_kwargs.setdefault("norm_groups", int(encoder_norm_groups))
+
+        self.encoder_name = str(encoder_name)
+        backbone = build_encoder(self.encoder_name, **encoder_kwargs)
+        if not isinstance(backbone, nn.Module):
+            raise TypeError(
+                f"Encoder '{self.encoder_name}' must return an nn.Module, got {type(backbone)!r}."
+            )
+        if not hasattr(backbone, "feat_dim"):
+            raise AttributeError(
+                f"Encoder '{self.encoder_name}' must expose a 'feat_dim' attribute."
+            )
+        self.backbone: nn.Module = backbone
         self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         feat_dim = self.backbone.feat_dim
         hidden = max(32, int(round(feat_dim * float(shared_head_hidden_scale))))
@@ -177,18 +197,27 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             self.out_heads = nn.ModuleDict({name: nn.Linear(hidden, 1) for name in self.predict_params})
 
-        self.refiner = EfficientNetRefiner(
-            m_params=len(self.predict_params),
-            cond_dim=self.cond_dim,
-            backbone_feat_dim=self.backbone.feat_dim,
-            delta_scale=refine_delta_scale,
-            encoder_width_mult=refiner_encoder_width_mult,
-            encoder_depth_mult=refiner_encoder_depth_mult,
-            encoder_expand_ratio_scale=refiner_encoder_expand_ratio_scale,
-            encoder_se_ratio=refiner_encoder_se_ratio,
-            encoder_norm_groups=refiner_encoder_norm_groups,
-            hidden_scale=refiner_hidden_scale,
+        refiner_kwargs = dict(refiner_config or {})
+        refiner_kwargs.setdefault("m_params", len(self.predict_params))
+        refiner_kwargs.setdefault("cond_dim", self.cond_dim)
+        refiner_kwargs.setdefault("backbone_feat_dim", feat_dim)
+        refiner_kwargs.setdefault("delta_scale", float(refine_delta_scale))
+        refiner_kwargs.setdefault("encoder_width_mult", float(refiner_encoder_width_mult))
+        refiner_kwargs.setdefault("encoder_depth_mult", float(refiner_encoder_depth_mult))
+        refiner_kwargs.setdefault(
+            "encoder_expand_ratio_scale", float(refiner_encoder_expand_ratio_scale)
         )
+        refiner_kwargs.setdefault("encoder_se_ratio", float(refiner_encoder_se_ratio))
+        refiner_kwargs.setdefault("encoder_norm_groups", int(refiner_encoder_norm_groups))
+        refiner_kwargs.setdefault("hidden_scale", float(refiner_hidden_scale))
+
+        self.refiner_name = str(refiner_name)
+        refiner = build_refiner(self.refiner_name, **refiner_kwargs)
+        if not isinstance(refiner, nn.Module):
+            raise TypeError(
+                f"Refiner '{self.refiner_name}' must return an nn.Module, got {type(refiner)!r}."
+            )
+        self.refiner = refiner
         self.loss_names_params = [f"param_{name}" for name in self.predict_params]
         self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
         self.loss_names_top = ["phys_mse", "phys_corr", "param_group"]

@@ -14,6 +14,48 @@ make html
 
 Les pages HTML seront générées dans `docs/_build/html`. Cette structure est compatible avec un déploiement direct sur https://readthedocs.io/.
 
+## Installation du package
+
+Le dépôt suit désormais une structure standard de distribution Python avec un fichier `pyproject.toml`. Pour installer PhysAE et ses dépendances de base dans un environnement virtuel :
+
+```bash
+python -m venv .venv
+source .venv/bin/activate  # sous Windows : .venv\Scripts\activate
+pip install .
+```
+
+Une fois le package installé, la commande CLI `physae` devient disponible (identique au module `physae.cli`). Pour installer les dépendances nécessaires à la construction de la documentation :
+
+```bash
+pip install .[docs]
+```
+
+## Étendre les composants du modèle
+
+Les éléments clés du modèle (encodeur principal et module de raffinement) sont enregistrés dans des registres afin de faciliter l'ajout de nouvelles variantes. Les constructeurs existants (`efficientnet`) sont déclarés dans `physae/models/backbone.py` et `physae/models/refiner.py` via les décorateurs `@register_encoder` et `@register_refiner`.
+
+Pour ajouter un encodeur personnalisé, il suffit de définir une fonction de construction qui retourne un module `nn.Module` et d'utiliser le décorateur approprié :
+
+```python
+from physae.models import register_encoder
+
+@register_encoder("mon_encodeur")
+def build_mon_encodeur(**kwargs):
+    return MonEncodeur1D(**kwargs)
+```
+
+La configuration YAML peut ensuite sélectionner ce nouvel encodeur :
+
+```yaml
+model:
+  encoder:
+    name: mon_encodeur
+    params:
+      largeur: 64
+```
+
+La même approche s'applique au raffineur via `register_refiner`. Les paramètres définis dans la section `model.encoder.params` (ou `model.refiner.params`) sont transmis au constructeur correspondant, ce qui permet d'expérimenter facilement avec de nouveaux blocs.
+
 ## Configurations YAML
 
 * `physae/configs/data/default.yaml` définit les hyperparamètres de génération des données (tailles d'échantillons, intervalles physiques, bruit, etc.).

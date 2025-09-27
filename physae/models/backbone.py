@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
+
+from .registry import register_encoder
 
 
 class SiLU(nn.Module):
@@ -174,3 +176,11 @@ class EfficientNetEncoder(nn.Module):
         x = self.stem(x)
         x = self.blocks(x)
         return x, None
+
+
+@register_encoder("efficientnet")
+def build_efficientnet_encoder(**kwargs: Any) -> EfficientNetEncoder:
+    """Factory compatible with :func:`register_encoder` to build the default encoder."""
+
+    in_channels = int(kwargs.pop("in_channels", 1))
+    return EfficientNetEncoder(in_channels=in_channels, **kwargs)
