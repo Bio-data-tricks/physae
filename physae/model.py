@@ -198,6 +198,18 @@ class PhysicallyInformedAE(pl.LightningModule):
             self.out_heads = nn.ModuleDict({name: nn.Linear(hidden, 1) for name in self.predict_params})
 
         refiner_kwargs = dict(refiner_config or {})
+        legacy_to_new = {
+            "width_mult": "encoder_width_mult",
+            "depth_mult": "encoder_depth_mult",
+            "expand_ratio_scale": "encoder_expand_ratio_scale",
+            "se_ratio": "encoder_se_ratio",
+            "norm_groups": "encoder_norm_groups",
+            "hidden_scale": "hidden_scale",
+        }
+        for legacy_key, new_key in legacy_to_new.items():
+            if legacy_key in refiner_kwargs:
+                value = refiner_kwargs.pop(legacy_key)
+                refiner_kwargs.setdefault(new_key, value)
         refiner_kwargs.setdefault("m_params", len(self.predict_params))
         refiner_kwargs.setdefault("cond_dim", self.cond_dim)
         refiner_kwargs.setdefault("backbone_feat_dim", feat_dim)
