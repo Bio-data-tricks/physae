@@ -19,6 +19,7 @@ et propose :
 
    getting_started
    tutorial
+   model_playbook
    hyperparameters
    gases
    experiments

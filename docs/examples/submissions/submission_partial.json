@@ -1,0 +1,28 @@
+[
+  {
+    "sample_id": "val_0001",
+    "params": {
+      "sig0": 3085.4412,
+      "dsig": 0.001532,
+      "mf_CH4": 8.1e-06
+    },
+    "metadata": {
+      "model": "PhysAE-efficientnet",
+      "refine_steps": 2,
+      "notes": "prédiction partielle (sans baseline)"
+    }
+  },
+  {
+    "sample_id": "val_0002",
+    "params": {
+      "sig0": 3085.4521,
+      "dsig": 0.001528,
+      "mf_CH4": 1.24e-05
+    },
+    "metadata": {
+      "model": "PhysAE-efficientnet",
+      "refine_steps": 2,
+      "notes": "utilise calibration interne"
+    }
+  }
+]
