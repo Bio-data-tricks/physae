@@ -9,6 +9,17 @@ pipeline ``PhysAE`` :
 3. contrôler exhaustivement les options des étapes d'entraînement ;
 4. explorer l'espace d'hyperparamètres avec Optuna.
 
+Ressources interactives
+-----------------------
+
+.. note::
+
+   Les démonstrations ci-dessous sont également disponibles sous forme de
+   notebooks Jupyter entièrement paramétrables :
+
+   * :download:`Construction complète des données <../notebooks/data_construction.ipynb>`
+   * :download:`Contrôle total de l'entraînement et d'Optuna <../notebooks/full_control_training_optuna.ipynb>`
+
 Préparation
 -----------
 
