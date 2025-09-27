@@ -5,7 +5,7 @@ import math
 import random
 import sys
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable, Any, Mapping
 
 import numpy as np
 import torch
@@ -1623,14 +1623,33 @@ def train_stage_custom(
     ckpt_in: Optional[str] = None,
     ckpt_out: Optional[str] = None,
     enable_progress_bar: bool = False,
+    trainer_kwargs: Optional[Mapping[str, Any]] = None,
+    return_metrics: bool = False,
 ):
     print(f"\n===== Stage {stage_name} =====")
     _load_weights_if_any(model, ckpt_in)
 
+    def _as_callback_list(obj) -> List[Callback]:
+        if obj is None:
+            return []
+        if isinstance(obj, (list, tuple)):
+            return list(obj)
+        return [obj]
+
+    callbacks_list: List[Callback] = []
+    if trainer_kwargs is not None and isinstance(trainer_kwargs, Mapping):
+        trainer_kwargs_local = dict(trainer_kwargs)
+        extra_callbacks = trainer_kwargs_local.pop("callbacks", None)
+        callbacks_list.extend(_as_callback_list(extra_callbacks))
+    else:
+        trainer_kwargs_local = {}
+
+    callbacks_list.extend(_as_callback_list(callbacks))
+
     try:
         from pytorch_lightning.callbacks.progress import TQDMProgressBar
-        if callbacks is not None and enable_progress_bar is False:
-            callbacks = [cb for cb in callbacks if not isinstance(cb, TQDMProgressBar)]
+        if not enable_progress_bar:
+            callbacks_list = [cb for cb in callbacks_list if not isinstance(cb, TQDMProgressBar)]
     except Exception:
         pass
 
@@ -1645,15 +1664,27 @@ def train_stage_custom(
                         train_base=train_base, train_heads=train_heads, train_film=train_film, train_refiner=train_refiner,
                         heads_subset=heads_subset)
 
-    trainer = pl.Trainer(
-        max_epochs=epochs,
-        accelerator=accelerator or ("gpu" if torch.cuda.is_available() else "cpu"),
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=1,
-        callbacks=callbacks or []
-    )
+    trainer_options = dict(trainer_kwargs_local)
+    trainer_options.setdefault("accelerator", accelerator or ("gpu" if torch.cuda.is_available() else "cpu"))
+    trainer_options.setdefault("enable_progress_bar", enable_progress_bar)
+    trainer_options.setdefault("log_every_n_steps", 1)
+    trainer_options["max_epochs"] = epochs
+    trainer_options["callbacks"] = callbacks_list
+
+    trainer = pl.Trainer(**trainer_options)
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
+    if return_metrics:
+        metrics = {}
+        for key, value in trainer.callback_metrics.items():
+            if isinstance(value, torch.Tensor):
+                metrics[key] = float(value.detach().cpu())
+            else:
+                try:
+                    metrics[key] = float(value)
+                except (TypeError, ValueError):
+                    metrics[key] = value
+        return model, metrics
     return model
 
 # Facades conviviales
@@ -1736,6 +1767,273 @@ def train_stage_B1(model, train_loader, val_loader, stage_config: Optional[Stage
 def train_stage_B2(model, train_loader, val_loader, stage_config: Optional[StageConfig] = None, **kw):
     cfg = stage_config or stage_B2_config()
     return train_stage_with_config(model, train_loader, val_loader, cfg, **kw)
+
+# ============================================================
+# 10b) Optuna: génération de StageConfig & objectif
+# ============================================================
+
+_DEFAULT_STAGE_SEARCH_SPACES: Dict[str, Dict[str, Any]] = {
+    "A": {
+        "epochs": {"low": 15, "high": 80, "type": "int"},
+        "base_lr": {"low": 5e-5, "high": 5e-4, "type": "float", "log": True},
+        "train_film": [False, True],
+        "use_film": [False, True],
+        "baseline_fix_enable": [False, True],
+    },
+    "B1": {
+        "epochs": {"low": 5, "high": 60, "type": "int"},
+        "base_lr": {"low": 1e-7, "high": 1e-4, "type": "float", "log": True},
+        "refiner_lr": {"low": 1e-6, "high": 5e-4, "type": "float", "log": True},
+        "refine_steps": {"low": 1, "high": 4, "type": "int"},
+        "delta_scale": {"low": 0.02, "high": 0.4, "type": "float"},
+        "use_film": [False, True],
+        "train_film": [False, True],
+        "baseline_fix_enable": [False, True],
+    },
+    "B2": {
+        "epochs": {"low": 5, "high": 60, "type": "int"},
+        "base_lr": {"low": 1e-6, "high": 5e-4, "type": "float", "log": True},
+        "refiner_lr": {"low": 1e-6, "high": 5e-4, "type": "float", "log": True},
+        "refine_steps": {"low": 1, "high": 4, "type": "int"},
+        "delta_scale": {"low": 0.02, "high": 0.3, "type": "float"},
+        "use_film": [False, True],
+        "train_film": [False, True],
+        "baseline_fix_enable": [False, True],
+    },
+}
+
+
+def _normalize_stage_name(stage: str) -> str:
+    stage_upper = stage.upper()
+    if stage_upper == "B":
+        return "B2"
+    if stage_upper not in {"A", "B1", "B2"}:
+        raise ValueError(f"Stage inconnu '{stage}'. Utilise 'A', 'B1' ou 'B2'.")
+    return stage_upper
+
+
+def _merge_stage_spaces(stage: str, custom: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    space = copy.deepcopy(_DEFAULT_STAGE_SEARCH_SPACES.get(stage, {}))
+    if custom:
+        for key, value in custom.items():
+            space[key] = value
+    return space
+
+
+def _suggest_stage_value(trial, stage_prefix: str, name: str, spec: Any, current_value: Any):
+    if spec is None:
+        return current_value
+
+    suggestion_name = f"{stage_prefix}_{name}"
+    is_bool = isinstance(current_value, bool)
+
+    if isinstance(spec, (list, tuple)):
+        choices = list(spec)
+        if len(choices) == 0:
+            return current_value
+        if len(choices) == 1:
+            return choices[0]
+        return trial.suggest_categorical(suggestion_name, choices)
+
+    if isinstance(spec, tuple) and len(spec) == 2 and all(isinstance(v, (int, float)) for v in spec):
+        low, high = spec
+        if is_bool:
+            choices = [bool(low), bool(high)]
+            return trial.suggest_categorical(suggestion_name, choices)
+        if isinstance(current_value, int) and not is_bool and all(isinstance(v, int) for v in spec):
+            return trial.suggest_int(suggestion_name, int(low), int(high))
+        return trial.suggest_float(suggestion_name, float(low), float(high))
+
+    if isinstance(spec, dict):
+        if "choices" in spec:
+            choices = list(spec["choices"])
+            if len(choices) == 0:
+                return current_value
+            if len(choices) == 1:
+                return choices[0]
+            return trial.suggest_categorical(suggestion_name, choices)
+        if "value" in spec:
+            return spec["value"]
+        low = spec.get("low")
+        high = spec.get("high")
+        if low is not None and high is not None:
+            value_type = spec.get("type")
+            if value_type is None:
+                if is_bool:
+                    value_type = "categorical"
+                elif isinstance(current_value, int) and not is_bool:
+                    value_type = "int"
+                else:
+                    value_type = "float"
+            if value_type == "categorical":
+                choices = spec.get("choices")
+                if not choices:
+                    raise ValueError(f"Aucune option pour {suggestion_name}")
+                return trial.suggest_categorical(suggestion_name, list(choices))
+            if value_type == "int":
+                step = spec.get("step", 1)
+                return trial.suggest_int(suggestion_name, int(low), int(high), step=int(step))
+            if value_type == "float":
+                step = spec.get("step")
+                log = bool(spec.get("log", False))
+                return trial.suggest_float(suggestion_name, float(low), float(high), log=log, step=step)
+        if "callable" in spec:
+            fn = spec["callable"]
+            if callable(fn):
+                return fn(trial, current_value)
+        return current_value
+
+    if callable(spec):
+        return spec(trial, current_value)
+
+    return spec
+
+
+def suggest_stage_config(
+    trial,
+    *,
+    stage: str,
+    base_config: Optional[StageConfig] = None,
+    search_space: Optional[Mapping[str, Any]] = None,
+) -> StageConfig:
+    """Génère un :class:`StageConfig` optimisable via Optuna.
+
+    Args:
+        trial: essai Optuna en cours.
+        stage: identifiant du stage ("A", "B1" ou "B2").
+        base_config: configuration servant de point de départ (facultatif).
+        search_space: dictionnaire ``{champ: spec}`` décrivant les distributions à explorer.
+
+    Returns:
+        StageConfig suggéré par Optuna.
+    """
+
+    stage_name = _normalize_stage_name(stage)
+    if base_config is None:
+        factory = {"A": stage_A_config, "B1": stage_B1_config, "B2": stage_B2_config}[stage_name]
+        cfg = factory()
+    else:
+        cfg = copy.deepcopy(base_config)
+
+    space = _merge_stage_spaces(stage_name, search_space)
+    for field_name, spec in space.items():
+        if not hasattr(cfg, field_name):
+            raise KeyError(f"Champ inconnu dans StageConfig: '{field_name}'")
+        current = getattr(cfg, field_name)
+        suggested = _suggest_stage_value(trial, stage_name, field_name, spec, current)
+        setattr(cfg, field_name, suggested)
+
+    return cfg
+
+
+def optuna_stage_objective(
+    trial,
+    *,
+    stage: str,
+    model_factory: Callable[[], PhysicallyInformedAE],
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    base_config: Optional[StageConfig] = None,
+    search_space: Optional[Mapping[str, Any]] = None,
+    metric_key: str = "val_loss",
+    callbacks_factory: Optional[Callable[[Any], Optional[Any]]] = None,
+    trainer_overrides: Optional[Mapping[str, Any]] = None,
+    load_state_dict: Optional[Mapping[str, torch.Tensor]] = None,
+    ckpt_in: Optional[str] = None,
+    enable_pruning: bool = True,
+) -> float:
+    """Objectif Optuna prêt à l'emploi pour optimiser un stage A/B.
+
+    Cette fonction crée un nouveau modèle via ``model_factory`` pour chaque essai,
+    échantillonne une :class:`StageConfig` et exécute l'entraînement Lightning via
+    :func:`train_stage_with_config` en renvoyant la métrique ``metric_key``.
+
+    Args:
+        trial: essai Optuna.
+        stage: "A", "B1" ou "B2".
+        model_factory: callable qui renvoie un ``PhysicallyInformedAE`` neuf.
+        train_loader: DataLoader d'entraînement.
+        val_loader: DataLoader de validation.
+        base_config: config de départ (facultatif).
+        search_space: surcharges du search space par défaut.
+        metric_key: métrique (log Lightning) à minimiser.
+        callbacks_factory: callable ``trial -> [Callback]`` (optionnel).
+        trainer_overrides: paramètres additionnels passés à ``train_stage_with_config``.
+        load_state_dict: state_dict initial à charger sur le modèle (optionnel).
+        ckpt_in: checkpoint disque à recharger avant l'entraînement.
+        enable_pruning: ajoute ``PyTorchLightningPruningCallback`` si possible.
+
+    Returns:
+        Valeur de la métrique choisie (float).
+    """
+
+    try:
+        import optuna  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("Optuna doit être installé pour utiliser optuna_stage_objective.") from exc
+
+    stage_name = _normalize_stage_name(stage)
+    cfg = suggest_stage_config(
+        trial,
+        stage=stage_name,
+        base_config=base_config,
+        search_space=search_space,
+    )
+
+    trial.set_user_attr("stage", stage_name)
+    trial.set_user_attr("stage_config", cfg.to_kwargs())
+
+    model = model_factory()
+    if load_state_dict is not None:
+        model.load_state_dict(load_state_dict, strict=False)
+
+    overrides = dict(trainer_overrides or {})
+    callbacks_list = list(overrides.pop("callbacks", []))
+
+    if callbacks_factory is not None:
+        extra_callbacks = callbacks_factory(trial) or []
+        if isinstance(extra_callbacks, (list, tuple)):
+            callbacks_list.extend(list(extra_callbacks))
+        elif extra_callbacks:
+            callbacks_list.append(extra_callbacks)
+
+    if enable_pruning:
+        try:
+            from optuna.integration import PyTorchLightningPruningCallback
+
+            callbacks_list.append(PyTorchLightningPruningCallback(trial, monitor=metric_key))
+        except Exception:
+            pass
+
+    if callbacks_list:
+        overrides["callbacks"] = callbacks_list
+
+    overrides["return_metrics"] = True
+    if ckpt_in is not None:
+        overrides.setdefault("ckpt_in", ckpt_in)
+
+    model, metrics = train_stage_with_config(
+        model,
+        train_loader,
+        val_loader,
+        cfg,
+        **overrides,
+    )
+
+    metric_value = metrics.get(metric_key)
+    if metric_value is None:
+        available = ", ".join(sorted(metrics.keys())) or "aucune métrique"
+        raise KeyError(f"Métrique '{metric_key}' introuvable dans les logs ({available}).")
+
+    metric_value = float(metric_value)
+    trial.set_user_attr("metrics", metrics)
+    trial.report(metric_value, step=getattr(cfg, "epochs", 0))
+    if enable_pruning and trial.should_prune():
+        from optuna.exceptions import TrialPruned
+
+        raise TrialPruned()
+
+    return metric_value
 
 # ============================================================
 # 11) Évaluation + refit baseline (bords)
@@ -2014,6 +2312,21 @@ if __name__ == "__main__":
     # stageA_cfg = stage_A_config(base_lr=1.5e-4, epochs=30)
     # train_stage_A(model, train_loader, val_loader, stage_config=stageA_cfg)
     cb = [PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1), UpdateEpochInDataset()]
+
+    # --- Exemple Optuna : tuning du stage A (simplifié) ---
+    # import optuna
+    # def objective(trial):
+    #     model_opt, train_opt, val_opt = build_data_and_model()
+    #     return optuna_stage_objective(
+    #         trial,
+    #         stage="A",
+    #         model_factory=lambda: model_opt,
+    #         train_loader=train_opt,
+    #         val_loader=val_opt,
+    #         metric_key="val_loss",
+    #     )
+    # study = optuna.create_study(direction="minimize")
+    # study.optimize(objective, n_trials=20)
 
     #--- Étape A (base + heads). Ici on ACTIVE FiLM dès A (optionnel).
     train_stage_A(
