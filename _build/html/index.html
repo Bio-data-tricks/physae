@@ -1,0 +1,185 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="fr" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PhysAE &mdash; Documentation PhysAE </title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=d1a510d7"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/translations.js?v=e6b791cb"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Recherche" href="search.html" />
+    <link rel="next" title="Premiers pas" href="getting_started.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="#" class="icon icon-home">
+            PhysAE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Rechercher docs" aria-label="Rechercher docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="getting_started.html">Premiers pas</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tutorial.html">Tutoriel complet</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gases.html">Gestion des gaz et transitions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="experiments.html">Variations expérimentales</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="#">PhysAE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="#" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">PhysAE</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/index.rst.txt" rel="nofollow"> Afficher la source de la page</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="physae">
+<h1>PhysAE<a class="headerlink" href="#physae" title="Lien vers cette rubrique"></a></h1>
+<p>Bienvenue dans la documentation officielle de <strong>PhysAE</strong>, un autoencodeur physique
+pour la reconstruction et l’inférence de spectres infrarouges. Cette
+documentation s’inspire de la mise en page standard <a class="reference external" href="https://readthedocs.io">Read the Docs</a>
+et propose :</p>
+<ul class="simple">
+<li><p>une présentation du projet et de son architecture ;</p></li>
+<li><p>un tutoriel de prise en main complet ;</p></li>
+<li><p>un guide détaillé des hyperparamètres et de leur impact ;</p></li>
+<li><p>des conseils pour créer vos propres expériences (variation de bruit,
+sélection des gaz, etc.) ;</p></li>
+<li><p>une synthèse des principaux modules Python fournis dans ce dépôt.</p></li>
+</ul>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="getting_started.html">Premiers pas</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="getting_started.html#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting_started.html#structure-du-depot">Structure du dépôt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting_started.html#prerequis-physiques">Prérequis physiques</a></li>
+<li class="toctree-l2"><a class="reference internal" href="getting_started.html#ressources-de-donnees">Ressources de données</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="tutorial.html">Tutoriel complet</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="tutorial.html#preparation">Préparation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorial.html#entrainement-par-etapes">Entraînement par étapes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorial.html#recherche-d-hyperparametres-avec-optuna">Recherche d’hyperparamètres avec Optuna</a></li>
+<li class="toctree-l2"><a class="reference internal" href="tutorial.html#sauvegarde-reprise">Sauvegarde &amp; reprise</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#apercu-general">Aperçu général</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#architecture-de-reference">Architecture de référence</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#correspondance-des-hyperparametres">Correspondance des hyperparamètres</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#recettes-pratiques">Recettes pratiques</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#flux-jupyter-prets-a-l-emploi">Flux Jupyter prêts à l’emploi</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#gabarits-de-soumission">Gabarits de soumission</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_playbook.html#aller-plus-loin">Aller plus loin</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="hyperparameters.html#configuration-des-donnees">Configuration des données</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hyperparameters.html#configurations-d-etape">Configurations d’étape</a></li>
+<li class="toctree-l2"><a class="reference internal" href="hyperparameters.html#bonnes-pratiques-de-selection">Bonnes pratiques de sélection</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="gases.html">Gestion des gaz et transitions</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="gases.html#ajouter-un-nouveau-gaz">Ajouter un nouveau gaz</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gases.html#modifier-le-maillage-spectral">Modifier le maillage spectral</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gases.html#choisir-les-fractions-molaires">Choisir les fractions molaires</a></li>
+<li class="toctree-l2"><a class="reference internal" href="gases.html#controler-la-pression-et-la-temperature">Contrôler la pression et la température</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="experiments.html">Variations expérimentales</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="experiments.html#comparer-differentes-intensites-de-bruit">Comparer différentes intensités de bruit</a></li>
+<li class="toctree-l2"><a class="reference internal" href="experiments.html#tester-plusieurs-tailles-d-echantillon">Tester plusieurs tailles d’échantillon</a></li>
+<li class="toctree-l2"><a class="reference internal" href="experiments.html#balayer-delta-scale">Balayer <code class="docutils literal notranslate"><span class="pre">delta_scale</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="experiments.html#changer-de-tete-film">Changer de tête FiLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="experiments.html#sauvegarde-systematique-des-metriques">Sauvegarde systématique des métriques</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+</div>
+<section id="indices-et-tables">
+<h2>Indices et tables<a class="headerlink" href="#indices-et-tables" title="Lien vers cette rubrique"></a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
+<li><p><a class="reference internal" href="py-modindex.html"><span class="std std-ref">Index du module</span></a></p></li>
+<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Page de recherche</span></a></p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Pied de page">
+        <a href="getting_started.html" class="btn btn-neutral float-right" title="Premiers pas" accesskey="n" rel="next">Suivant <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Droits d'auteur 2025, PhysAE contributors.</p>
+  </div>
+
+  Compilé avec <a href="https://www.sphinx-doc.org/">Sphinx</a> en utilisant un
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">thème</a>
+    fourni par <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

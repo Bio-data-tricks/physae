@@ -1,0 +1,228 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="fr" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tutoriel complet &mdash; Documentation PhysAE </title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=d1a510d7"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/translations.js?v=e6b791cb"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Recherche" href="search.html" />
+    <link rel="next" title="Guide complet des modèles et des flux PhysAE" href="model_playbook.html" />
+    <link rel="prev" title="Premiers pas" href="getting_started.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PhysAE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Rechercher docs" aria-label="Rechercher docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="getting_started.html">Premiers pas</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Tutoriel complet</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#preparation">Préparation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#entrainement-par-etapes">Entraînement par étapes</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#etape-a-pre-entrainement-des-tetes">Étape A (pré-entraînement des têtes)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#etape-b1-raffinement-cible">Étape B1 (raffinement ciblé)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#etape-b2-affinage-conjoint">Étape B2 (affinage conjoint)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#recherche-d-hyperparametres-avec-optuna">Recherche d’hyperparamètres avec Optuna</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sauvegarde-reprise">Sauvegarde &amp; reprise</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gases.html">Gestion des gaz et transitions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="experiments.html">Variations expérimentales</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PhysAE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Tutoriel complet</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/tutorial.rst.txt" rel="nofollow"> Afficher la source de la page</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="tutoriel-complet">
+<h1>Tutoriel complet<a class="headerlink" href="#tutoriel-complet" title="Lien vers cette rubrique"></a></h1>
+<p>Ce tutoriel montre comment :</p>
+<ol class="arabic simple">
+<li><p>charger les configurations YAML ;</p></li>
+<li><p>générer des données synthétiques ;</p></li>
+<li><p>entraîner successivement les étapes <code class="docutils literal notranslate"><span class="pre">A</span></code>, <code class="docutils literal notranslate"><span class="pre">B1</span></code> et <code class="docutils literal notranslate"><span class="pre">B2</span></code> ;</p></li>
+<li><p>explorer l’espace d’hyperparamètres avec Optuna.</p></li>
+</ol>
+<section id="preparation">
+<h2>Préparation<a class="headerlink" href="#preparation" title="Lien vers cette rubrique"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">physae.factory</span><span class="w"> </span><span class="kn">import</span> <span class="n">build_data_and_model</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">physae.training</span><span class="w"> </span><span class="kn">import</span> <span class="n">train_stage_A</span><span class="p">,</span> <span class="n">train_stage_B1</span><span class="p">,</span> <span class="n">train_stage_B2</span>
+
+<span class="n">model</span><span class="p">,</span> <span class="n">train_loader</span><span class="p">,</span> <span class="n">val_loader</span> <span class="o">=</span> <span class="n">build_data_and_model</span><span class="p">(</span>
+    <span class="n">config_path</span><span class="o">=</span><span class="s2">&quot;physae/configs/data&quot;</span><span class="p">,</span>
+    <span class="n">config_name</span><span class="o">=</span><span class="s2">&quot;default&quot;</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>La fonction <code class="xref py py-func docutils literal notranslate"><span class="pre">physae.factory.build_data_and_model()</span></code> lit le fichier YAML,
+construit un <code class="xref py py-class docutils literal notranslate"><span class="pre">SpectraDataset</span></code> pour l’entraînement et la
+validation, et instancie <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.model.PhysicallyInformedAE</span></code> avec les
+paramètres de base (taux d’apprentissage, refinements, film, etc.).</p>
+</section>
+<section id="entrainement-par-etapes">
+<h2>Entraînement par étapes<a class="headerlink" href="#entrainement-par-etapes" title="Lien vers cette rubrique"></a></h2>
+<section id="etape-a-pre-entrainement-des-tetes">
+<h3>Étape A (pré-entraînement des têtes)<a class="headerlink" href="#etape-a-pre-entrainement-des-tetes" title="Lien vers cette rubrique"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">train_stage_A</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span>
+    <span class="n">train_loader</span><span class="p">,</span>
+    <span class="n">val_loader</span><span class="p">,</span>
+    <span class="n">epochs</span><span class="o">=</span><span class="mi">20</span><span class="p">,</span>          <span class="c1"># surcharge optionnelle</span>
+    <span class="n">base_lr</span><span class="o">=</span><span class="mf">2e-4</span><span class="p">,</span>
+    <span class="n">enable_progress_bar</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Cette phase active <code class="docutils literal notranslate"><span class="pre">train_base</span></code> et <code class="docutils literal notranslate"><span class="pre">train_heads</span></code> (voir
+<code class="xref py py-func docutils literal notranslate"><span class="pre">physae.training.train_stage_custom()</span></code>). Aucune étape de raffinement n’est
+lancée (<code class="docutils literal notranslate"><span class="pre">refine_steps=0</span></code>).</p>
+</section>
+<section id="etape-b1-raffinement-cible">
+<h3>Étape B1 (raffinement ciblé)<a class="headerlink" href="#etape-b1-raffinement-cible" title="Lien vers cette rubrique"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">train_stage_B1</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span>
+    <span class="n">train_loader</span><span class="p">,</span>
+    <span class="n">val_loader</span><span class="p">,</span>
+    <span class="n">refiner_lr</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span>
+    <span class="n">delta_scale</span><span class="o">=</span><span class="mf">0.12</span><span class="p">,</span>
+    <span class="n">film_subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;T&quot;</span><span class="p">],</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Seule la tête de raffinage est entraînée et les paramètres <code class="docutils literal notranslate"><span class="pre">T</span></code> sont utilisés
+pour la modulation FiLM. Le raffinement applique un décalage de <code class="docutils literal notranslate"><span class="pre">delta_scale</span></code>
+sur les paramètres prédits.</p>
+</section>
+<section id="etape-b2-affinage-conjoint">
+<h3>Étape B2 (affinage conjoint)<a class="headerlink" href="#etape-b2-affinage-conjoint" title="Lien vers cette rubrique"></a></h3>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span> <span class="o">=</span> <span class="n">train_stage_B2</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span>
+    <span class="n">train_loader</span><span class="p">,</span>
+    <span class="n">val_loader</span><span class="p">,</span>
+    <span class="n">base_lr</span><span class="o">=</span><span class="mf">3e-5</span><span class="p">,</span>
+    <span class="n">refiner_lr</span><span class="o">=</span><span class="mf">3e-6</span><span class="p">,</span>
+    <span class="n">film_subset</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;P&quot;</span><span class="p">,</span> <span class="s2">&quot;T&quot;</span><span class="p">],</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Tous les sous-modèles sont dégelés. Utilisez <code class="docutils literal notranslate"><span class="pre">heads_subset</span></code> si vous souhaitez
+ne raffiner qu’une partie des sorties.</p>
+</section>
+</section>
+<section id="recherche-d-hyperparametres-avec-optuna">
+<h2>Recherche d’hyperparamètres avec Optuna<a class="headerlink" href="#recherche-d-hyperparametres-avec-optuna" title="Lien vers cette rubrique"></a></h2>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">physae.optimization</span><span class="w"> </span><span class="kn">import</span> <span class="n">optimise_stage</span>
+
+<span class="n">study</span> <span class="o">=</span> <span class="n">optimise_stage</span><span class="p">(</span>
+    <span class="s2">&quot;B2&quot;</span><span class="p">,</span>
+    <span class="n">n_trials</span><span class="o">=</span><span class="mi">15</span><span class="p">,</span>
+    <span class="n">metric</span><span class="o">=</span><span class="s2">&quot;val_loss&quot;</span><span class="p">,</span>
+    <span class="n">data_overrides</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;n_train&quot;</span><span class="p">:</span> <span class="mi">8192</span><span class="p">,</span> <span class="s2">&quot;noise&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;train&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;p_drift&quot;</span><span class="p">:</span> <span class="mf">0.2</span><span class="p">}}},</span>
+    <span class="n">stage_overrides</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;epochs&quot;</span><span class="p">:</span> <span class="mi">10</span><span class="p">},</span>
+    <span class="n">show_progress_bar</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Meilleurs paramètres:&quot;</span><span class="p">,</span> <span class="n">study</span><span class="o">.</span><span class="n">best_params</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Score:&quot;</span><span class="p">,</span> <span class="n">study</span><span class="o">.</span><span class="n">best_value</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>La clé <code class="docutils literal notranslate"><span class="pre">data_overrides</span></code> accepte toute structure conforme au YAML. Les
+paramètres préfixés par <code class="docutils literal notranslate"><span class="pre">data.</span></code> dans la section <code class="docutils literal notranslate"><span class="pre">optuna</span></code> des fichiers YAML
+sont automatiquement redirigés vers <code class="docutils literal notranslate"><span class="pre">data_overrides</span></code> (voir
+<code class="xref py py-func docutils literal notranslate"><span class="pre">physae.optimization.optimise_stage()</span></code>).</p>
+</section>
+<section id="sauvegarde-reprise">
+<h2>Sauvegarde &amp; reprise<a class="headerlink" href="#sauvegarde-reprise" title="Lien vers cette rubrique"></a></h2>
+<p>Les fonctions <code class="docutils literal notranslate"><span class="pre">train_stage_*</span></code> acceptent <code class="docutils literal notranslate"><span class="pre">ckpt_in</span></code> et <code class="docutils literal notranslate"><span class="pre">ckpt_out</span></code> pour
+recharger un point de contrôle Lightning ou sauver les poids finaux. Combinez
+les callbacks Lightning (ex. <code class="docutils literal notranslate"><span class="pre">ModelCheckpoint</span></code>) avec <code class="docutils literal notranslate"><span class="pre">callbacks=[...]</span></code> pour
+personnaliser vos expériences.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Pied de page">
+        <a href="getting_started.html" class="btn btn-neutral float-left" title="Premiers pas" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Précédent</a>
+        <a href="model_playbook.html" class="btn btn-neutral float-right" title="Guide complet des modèles et des flux PhysAE" accesskey="n" rel="next">Suivant <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Droits d'auteur 2025, PhysAE contributors.</p>
+  </div>
+
+  Compilé avec <a href="https://www.sphinx-doc.org/">Sphinx</a> en utilisant un
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">thème</a>
+    fourni par <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

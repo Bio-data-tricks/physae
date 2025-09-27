@@ -1,0 +1,190 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="fr" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Variations expérimentales &mdash; Documentation PhysAE </title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=d1a510d7"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/translations.js?v=e6b791cb"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Recherche" href="search.html" />
+    <link rel="next" title="Panorama des modules" href="api_overview.html" />
+    <link rel="prev" title="Gestion des gaz et transitions" href="gases.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PhysAE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Rechercher docs" aria-label="Rechercher docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="getting_started.html">Premiers pas</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tutorial.html">Tutoriel complet</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gases.html">Gestion des gaz et transitions</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Variations expérimentales</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#comparer-differentes-intensites-de-bruit">Comparer différentes intensités de bruit</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#tester-plusieurs-tailles-d-echantillon">Tester plusieurs tailles d’échantillon</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#balayer-delta-scale">Balayer <code class="docutils literal notranslate"><span class="pre">delta_scale</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#changer-de-tete-film">Changer de tête FiLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#sauvegarde-systematique-des-metriques">Sauvegarde systématique des métriques</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PhysAE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Variations expérimentales</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/experiments.rst.txt" rel="nofollow"> Afficher la source de la page</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="variations-experimentales">
+<h1>Variations expérimentales<a class="headerlink" href="#variations-experimentales" title="Lien vers cette rubrique"></a></h1>
+<p>Cette section propose des scénarios pour explorer les capacités de PhysAE.</p>
+<section id="comparer-differentes-intensites-de-bruit">
+<h2>Comparer différentes intensités de bruit<a class="headerlink" href="#comparer-differentes-intensites-de-bruit" title="Lien vers cette rubrique"></a></h2>
+<ol class="arabic simple">
+<li><p>Dupliquez <code class="docutils literal notranslate"><span class="pre">physae/configs/data/default.yaml</span></code> sous un nouveau nom (ex.
+<code class="docutils literal notranslate"><span class="pre">noisy.yaml</span></code>).</p></li>
+<li><p>Multipliez <code class="docutils literal notranslate"><span class="pre">std_add_range</span></code> et <code class="docutils literal notranslate"><span class="pre">std_mult_range</span></code> par 5.</p></li>
+<li><p>Lancez <code class="docutils literal notranslate"><span class="pre">build_data_and_model(config_name=&quot;noisy&quot;)</span></code> puis l’entraînement.</p></li>
+<li><p>Évaluez l’impact sur <code class="docutils literal notranslate"><span class="pre">val_loss</span></code> et les métriques physiques (pression,
+température).</p></li>
+</ol>
+</section>
+<section id="tester-plusieurs-tailles-d-echantillon">
+<h2>Tester plusieurs tailles d’échantillon<a class="headerlink" href="#tester-plusieurs-tailles-d-echantillon" title="Lien vers cette rubrique"></a></h2>
+<p>Utilisez <code class="docutils literal notranslate"><span class="pre">data_overrides</span></code> pour modifier <code class="docutils literal notranslate"><span class="pre">n_train</span></code> et <code class="docutils literal notranslate"><span class="pre">n_val</span></code> lors d’un
+appel à <code class="xref py py-func docutils literal notranslate"><span class="pre">physae.training.train_stage_A()</span></code>. Par exemple :</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">model</span><span class="p">,</span> <span class="n">train_loader</span><span class="p">,</span> <span class="n">val_loader</span> <span class="o">=</span> <span class="n">build_data_and_model</span><span class="p">(</span>
+    <span class="n">config_overrides</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;n_train&quot;</span><span class="p">:</span> <span class="mi">2048</span><span class="p">,</span> <span class="s2">&quot;n_val&quot;</span><span class="p">:</span> <span class="mi">512</span><span class="p">}</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>Puis relancez les trois étapes. Comparez la stabilité des pertes et la variance
+des prédictions.</p>
+</section>
+<section id="balayer-delta-scale">
+<h2>Balayer <code class="docutils literal notranslate"><span class="pre">delta_scale</span></code><a class="headerlink" href="#balayer-delta-scale" title="Lien vers cette rubrique"></a></h2>
+<p>Pour évaluer la sensibilité du raffinement, utilisez Optuna ou une boucle
+manuelle :</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">delta</span> <span class="ow">in</span> <span class="p">[</span><span class="mf">0.05</span><span class="p">,</span> <span class="mf">0.1</span><span class="p">,</span> <span class="mf">0.15</span><span class="p">,</span> <span class="mf">0.2</span><span class="p">]:</span>
+    <span class="n">metrics</span> <span class="o">=</span> <span class="n">train_stage_custom</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span>
+        <span class="n">train_loader</span><span class="p">,</span>
+        <span class="n">val_loader</span><span class="p">,</span>
+        <span class="n">stage_name</span><span class="o">=</span><span class="s2">&quot;B1&quot;</span><span class="p">,</span>
+        <span class="n">epochs</span><span class="o">=</span><span class="mi">12</span><span class="p">,</span>
+        <span class="n">base_lr</span><span class="o">=</span><span class="mf">1e-6</span><span class="p">,</span>
+        <span class="n">refiner_lr</span><span class="o">=</span><span class="mf">1e-5</span><span class="p">,</span>
+        <span class="n">train_base</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">train_heads</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">train_film</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">train_refiner</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+        <span class="n">refine_steps</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+        <span class="n">delta_scale</span><span class="o">=</span><span class="n">delta</span><span class="p">,</span>
+        <span class="n">return_metrics</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">delta</span><span class="p">,</span> <span class="n">metrics</span><span class="p">[</span><span class="s2">&quot;val_loss&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+</section>
+<section id="changer-de-tete-film">
+<h2>Changer de tête FiLM<a class="headerlink" href="#changer-de-tete-film" title="Lien vers cette rubrique"></a></h2>
+<p>Pour comprendre l’influence des conditionnements, modifiez <code class="docutils literal notranslate"><span class="pre">film_subset</span></code> :</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">[&quot;T&quot;]</span></code> (par défaut B1) : FiLM basé sur la température.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">[&quot;P&quot;,</span> <span class="pre">&quot;T&quot;]</span></code> (B2) : combinaison pression + température.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">None</span></code> : FiLM désactivé (<code class="docutils literal notranslate"><span class="pre">use_film=False</span></code>).</p></li>
+</ul>
+<p>Observez les écarts sur les paramètres les plus corrélés (moyenne absolue de
+l’erreur sur <code class="docutils literal notranslate"><span class="pre">mf_CH4</span></code> et <code class="docutils literal notranslate"><span class="pre">sig0</span></code>).</p>
+</section>
+<section id="sauvegarde-systematique-des-metriques">
+<h2>Sauvegarde systématique des métriques<a class="headerlink" href="#sauvegarde-systematique-des-metriques" title="Lien vers cette rubrique"></a></h2>
+<p>Couplez <code class="xref py py-class docutils literal notranslate"><span class="pre">pytorch_lightning.callbacks.ModelCheckpoint</span></code> et
+<code class="xref py py-class docutils literal notranslate"><span class="pre">pytorch_lightning.callbacks.EarlyStopping</span></code> pour enregistrer chaque
+variation. Les callbacks se passent via <code class="docutils literal notranslate"><span class="pre">callbacks=[...]</span></code> dans
+<code class="docutils literal notranslate"><span class="pre">train_stage_custom</span></code>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Pied de page">
+        <a href="gases.html" class="btn btn-neutral float-left" title="Gestion des gaz et transitions" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Précédent</a>
+        <a href="api_overview.html" class="btn btn-neutral float-right" title="Panorama des modules" accesskey="n" rel="next">Suivant <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Droits d'auteur 2025, PhysAE contributors.</p>
+  </div>
+
+  Compilé avec <a href="https://www.sphinx-doc.org/">Sphinx</a> en utilisant un
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">thème</a>
+    fourni par <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

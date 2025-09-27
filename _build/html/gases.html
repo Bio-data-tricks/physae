@@ -1,0 +1,209 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="fr" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gestion des gaz et transitions &mdash; Documentation PhysAE </title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=d1a510d7"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/translations.js?v=e6b791cb"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Recherche" href="search.html" />
+    <link rel="next" title="Variations expérimentales" href="experiments.html" />
+    <link rel="prev" title="Hyperparamètres et réglages" href="hyperparameters.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PhysAE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Rechercher docs" aria-label="Rechercher docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="getting_started.html">Premiers pas</a></li>
+<li class="toctree-l1"><a class="reference internal" href="tutorial.html">Tutoriel complet</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Gestion des gaz et transitions</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#ajouter-un-nouveau-gaz">Ajouter un nouveau gaz</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#modifier-le-maillage-spectral">Modifier le maillage spectral</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#choisir-les-fractions-molaires">Choisir les fractions molaires</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#controler-la-pression-et-la-temperature">Contrôler la pression et la température</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="experiments.html">Variations expérimentales</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PhysAE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Gestion des gaz et transitions</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/gases.rst.txt" rel="nofollow"> Afficher la source de la page</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="gestion-des-gaz-et-transitions">
+<h1>Gestion des gaz et transitions<a class="headerlink" href="#gestion-des-gaz-et-transitions" title="Lien vers cette rubrique"></a></h1>
+<p>Le module <code class="xref py py-mod docutils literal notranslate"><span class="pre">physae.physics</span></code> modélise la génération spectrale en utilisant la
+fonction <code class="xref py py-func docutils literal notranslate"><span class="pre">physae.physics.batch_physics_forward_multimol_vgrid()</span></code>. Par
+défaut, la fabrique (<code class="xref py py-mod docutils literal notranslate"><span class="pre">physae.factory</span></code>) configure un dictionnaire de
+transitions contenant uniquement le CH<sub>4</sub>. Voici comment personnaliser la
+physique.</p>
+<section id="ajouter-un-nouveau-gaz">
+<h2>Ajouter un nouveau gaz<a class="headerlink" href="#ajouter-un-nouveau-gaz" title="Lien vers cette rubrique"></a></h2>
+<ol class="arabic simple">
+<li><p>Récupérez les transitions spectrales (format HITRAN ou personnalisé).</p></li>
+<li><p>Convertissez-les au format CSV semi-colon séparé attendu par
+<code class="xref py py-func docutils literal notranslate"><span class="pre">physae.physics.parse_csv_transitions()</span></code> (14 colonnes).</p></li>
+<li><p>Instanciez manuellement <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.dataset.SpectraDataset</span></code> et
+<code class="xref py py-class docutils literal notranslate"><span class="pre">physae.model.PhysicallyInformedAE</span></code> en fournissant un dictionnaire de
+transitions enrichi.</p></li>
+</ol>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">physae.dataset</span><span class="w"> </span><span class="kn">import</span> <span class="n">SpectraDataset</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">physae.model</span><span class="w"> </span><span class="kn">import</span> <span class="n">PhysicallyInformedAE</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">physae.physics</span><span class="w"> </span><span class="kn">import</span> <span class="n">parse_csv_transitions</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">physae</span><span class="w"> </span><span class="kn">import</span> <span class="n">config</span>
+
+<span class="n">poly_freq_coeffs</span> <span class="o">=</span> <span class="p">[</span><span class="o">-</span><span class="mf">2.3614803e-07</span><span class="p">,</span> <span class="mf">1.2103413e-10</span><span class="p">,</span> <span class="o">-</span><span class="mf">3.1617856e-14</span><span class="p">]</span>
+<span class="n">train_ranges</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;sig0&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">3085.43</span><span class="p">,</span> <span class="mf">3085.46</span><span class="p">),</span>
+    <span class="s2">&quot;dsig&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.001521</span><span class="p">,</span> <span class="mf">0.00154</span><span class="p">),</span>
+    <span class="s2">&quot;mf_CH4&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">2e-6</span><span class="p">,</span> <span class="mf">2e-5</span><span class="p">),</span>
+    <span class="s2">&quot;mf_CO2&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">5e-6</span><span class="p">,</span> <span class="mf">5e-5</span><span class="p">),</span>
+    <span class="s2">&quot;baseline0&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">0.99</span><span class="p">,</span> <span class="mf">1.01</span><span class="p">),</span>
+    <span class="s2">&quot;baseline1&quot;</span><span class="p">:</span> <span class="p">(</span><span class="o">-</span><span class="mf">4e-4</span><span class="p">,</span> <span class="o">-</span><span class="mf">3e-4</span><span class="p">),</span>
+    <span class="s2">&quot;baseline2&quot;</span><span class="p">:</span> <span class="p">(</span><span class="o">-</span><span class="mf">4.1e-8</span><span class="p">,</span> <span class="o">-</span><span class="mf">3.0e-8</span><span class="p">),</span>
+    <span class="s2">&quot;P&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mi">400</span><span class="p">,</span> <span class="mi">600</span><span class="p">),</span>
+    <span class="s2">&quot;T&quot;</span><span class="p">:</span> <span class="p">(</span><span class="mf">303.15</span><span class="p">,</span> <span class="mf">313.15</span><span class="p">),</span>
+<span class="p">}</span>
+<span class="n">transitions</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;CH4&quot;</span><span class="p">:</span> <span class="n">parse_csv_transitions</span><span class="p">(</span><span class="n">ch4_csv_string</span><span class="p">),</span>
+    <span class="s2">&quot;CO2&quot;</span><span class="p">:</span> <span class="n">parse_csv_transitions</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="s2">&quot;co2.csv&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">read</span><span class="p">()),</span>
+<span class="p">}</span>
+<span class="n">train_dataset</span> <span class="o">=</span> <span class="n">SpectraDataset</span><span class="p">(</span>
+    <span class="n">n_samples</span><span class="o">=</span><span class="mi">50000</span><span class="p">,</span>
+    <span class="n">num_points</span><span class="o">=</span><span class="mi">800</span><span class="p">,</span>
+    <span class="n">poly_freq_CH4</span><span class="o">=</span><span class="n">poly_freq_coeffs</span><span class="p">,</span>
+    <span class="n">transitions_dict</span><span class="o">=</span><span class="n">transitions</span><span class="p">,</span>
+    <span class="n">sample_ranges</span><span class="o">=</span><span class="n">train_ranges</span><span class="p">,</span>
+<span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">PhysicallyInformedAE</span><span class="p">(</span>
+    <span class="n">n_points</span><span class="o">=</span><span class="mi">800</span><span class="p">,</span>
+    <span class="n">param_names</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">PARAMS</span><span class="p">,</span>
+    <span class="n">poly_freq_CH4</span><span class="o">=</span><span class="n">poly_freq_coeffs</span><span class="p">,</span>
+    <span class="n">transitions_dict</span><span class="o">=</span><span class="n">transitions</span><span class="p">,</span>
+    <span class="n">predict_params</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;sig0&quot;</span><span class="p">,</span> <span class="s2">&quot;dsig&quot;</span><span class="p">,</span> <span class="s2">&quot;mf_CH4&quot;</span><span class="p">,</span> <span class="s2">&quot;mf_CO2&quot;</span><span class="p">,</span> <span class="s2">&quot;P&quot;</span><span class="p">,</span> <span class="s2">&quot;T&quot;</span><span class="p">],</span>
+    <span class="n">film_params</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;P&quot;</span><span class="p">,</span> <span class="s2">&quot;T&quot;</span><span class="p">],</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>À l’heure actuelle, la fonction <code class="xref py py-func docutils literal notranslate"><span class="pre">physae.factory.build_data_and_model()</span></code> se
+concentre sur le cas CH<sub>4</sub>. Pour des scénarios multi-gaz avancés,
+réutilisez les utilitaires <code class="docutils literal notranslate"><span class="pre">load_data_config</span></code> et <code class="docutils literal notranslate"><span class="pre">merge_dicts</span></code> définis dans
+<code class="xref py py-mod docutils literal notranslate"><span class="pre">physae.config_loader</span></code> pour initialiser vos propres chargeurs de données.</p>
+</section>
+<section id="modifier-le-maillage-spectral">
+<h2>Modifier le maillage spectral<a class="headerlink" href="#modifier-le-maillage-spectral" title="Lien vers cette rubrique"></a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">build_data_and_model</span></code> accepte l’argument <code class="docutils literal notranslate"><span class="pre">n_points</span></code>. Celui-ci influence :</p>
+<ul class="simple">
+<li><p>la longueur des spectres générés par <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.dataset.SpectraDataset</span></code> ;</p></li>
+<li><p>la taille des tenseurs traités par <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.model.PhysicallyInformedAE</span></code> ;</p></li>
+<li><p>le polynôme <code class="docutils literal notranslate"><span class="pre">poly_freq_CH4</span></code> utilisé pour générer la grille <code class="docutils literal notranslate"><span class="pre">v_grid</span></code>
+(fichier <code class="docutils literal notranslate"><span class="pre">factory.py</span></code>).</p></li>
+</ul>
+<p>Veillez à ajuster <code class="docutils literal notranslate"><span class="pre">poly_freq_CH4</span></code> si le domaine spectral change drastiquement.</p>
+</section>
+<section id="choisir-les-fractions-molaires">
+<h2>Choisir les fractions molaires<a class="headerlink" href="#choisir-les-fractions-molaires" title="Lien vers cette rubrique"></a></h2>
+<p>Les fractions sont normalisées logarithmiquement par <code class="xref py py-func docutils literal notranslate"><span class="pre">physae.config.map_ranges()</span></code>.
+Pour explorer des concentrations extrêmes, augmentez <code class="docutils literal notranslate"><span class="pre">train_ranges_expand</span></code>
+(<em>ex.</em> <code class="docutils literal notranslate"><span class="pre">mf_CH4:</span> <span class="pre">4.0</span></code> double encore les bornes logarithmiques) et gardez
+<code class="docutils literal notranslate"><span class="pre">val_ranges</span></code> dans l’enveloppe pour éviter les erreurs <code class="docutils literal notranslate"><span class="pre">strict_check</span></code>.</p>
+</section>
+<section id="controler-la-pression-et-la-temperature">
+<h2>Contrôler la pression et la température<a class="headerlink" href="#controler-la-pression-et-la-temperature" title="Lien vers cette rubrique"></a></h2>
+<p>Les paramètres <code class="docutils literal notranslate"><span class="pre">P</span></code> et <code class="docutils literal notranslate"><span class="pre">T</span></code> influencent directement la largeur des raies via
+<code class="xref py py-func docutils literal notranslate"><span class="pre">physae.physics.batch_physics_forward_multimol_vgrid()</span></code>. Les recommandations :</p>
+<ul class="simple">
+<li><p>définissez <code class="docutils literal notranslate"><span class="pre">train_ranges</span></code> suffisamment larges pour couvrir vos conditions
+expérimentales ;</p></li>
+<li><p>utilisez <code class="docutils literal notranslate"><span class="pre">film_subset</span></code> pour conditionner les raffinements FiLM sur les
+paramètres les plus corrélés aux variations du spectre (souvent <code class="docutils literal notranslate"><span class="pre">P</span></code> et <code class="docutils literal notranslate"><span class="pre">T</span></code>).</p></li>
+</ul>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Pied de page">
+        <a href="hyperparameters.html" class="btn btn-neutral float-left" title="Hyperparamètres et réglages" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Précédent</a>
+        <a href="experiments.html" class="btn btn-neutral float-right" title="Variations expérimentales" accesskey="n" rel="next">Suivant <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Droits d'auteur 2025, PhysAE contributors.</p>
+  </div>
+
+  Compilé avec <a href="https://www.sphinx-doc.org/">Sphinx</a> en utilisant un
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">thème</a>
+    fourni par <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

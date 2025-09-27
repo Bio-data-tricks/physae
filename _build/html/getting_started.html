@@ -1,0 +1,174 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="fr" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Premiers pas &mdash; Documentation PhysAE </title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=e59714d7" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=d1a510d7"></script>
+      <script src="_static/doctools.js?v=9bcbadda"></script>
+      <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+      <script src="_static/translations.js?v=e6b791cb"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Recherche" href="search.html" />
+    <link rel="next" title="Tutoriel complet" href="tutorial.html" />
+    <link rel="prev" title="PhysAE" href="index.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html" class="icon icon-home">
+            PhysAE
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Rechercher docs" aria-label="Rechercher docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Guide utilisateur</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Premiers pas</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#installation">Installation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#structure-du-depot">Structure du dépôt</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#prerequis-physiques">Prérequis physiques</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#ressources-de-donnees">Ressources de données</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="tutorial.html">Tutoriel complet</a></li>
+<li class="toctree-l1"><a class="reference internal" href="model_playbook.html">Guide complet des modèles et des flux PhysAE</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hyperparameters.html">Hyperparamètres et réglages</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gases.html">Gestion des gaz et transitions</a></li>
+<li class="toctree-l1"><a class="reference internal" href="experiments.html">Variations expérimentales</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api_overview.html">Panorama des modules</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">PhysAE</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Premiers pas</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/getting_started.rst.txt" rel="nofollow"> Afficher la source de la page</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="premiers-pas">
+<h1>Premiers pas<a class="headerlink" href="#premiers-pas" title="Lien vers cette rubrique"></a></h1>
+<section id="installation">
+<h2>Installation<a class="headerlink" href="#installation" title="Lien vers cette rubrique"></a></h2>
+<p>Le projet est basé sur PyTorch, PyTorch Lightning et Optuna. Pour reproduire
+l’environnement, créez un nouvel environnement virtuel et installez les
+modules requis :</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>venv<span class="w"> </span>.venv
+<span class="nb">source</span><span class="w"> </span>.venv/bin/activate<span class="w">  </span><span class="c1"># sous Windows: .venv\\Scripts\\activate</span>
+pip<span class="w"> </span>install<span class="w"> </span>-U<span class="w"> </span>pip
+pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>.<span class="o">[</span>dev<span class="o">]</span>
+</pre></div>
+</div>
+<p>Le paquet <code class="docutils literal notranslate"><span class="pre">physae</span></code> est installable en mode editable : toutes les
+modifications locales sont immédiatement disponibles sans réinstallation.</p>
+</section>
+<section id="structure-du-depot">
+<h2>Structure du dépôt<a class="headerlink" href="#structure-du-depot" title="Lien vers cette rubrique"></a></h2>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">physae/</span></code></dt><dd><p>Contient les modules Python (génération de données, modèle Lightning,
+fonctions de physique, etc.).</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">physae/configs</span></code></dt><dd><p>Fichiers YAML décrivant les hyperparamètres des données et des différentes
+étapes d’entraînement.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">notebooks/</span></code></dt><dd><p>Carnets Jupyter d’exemple, dont <code class="docutils literal notranslate"><span class="pre">optimisation_physae.ipynb</span></code> qui illustre
+un flux complet de formation + recherche d’hyperparamètres.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">docs/</span></code></dt><dd><p>La documentation Read the Docs présentée ici.</p>
+</dd>
+</dl>
+</section>
+<section id="prerequis-physiques">
+<h2>Prérequis physiques<a class="headerlink" href="#prerequis-physiques" title="Lien vers cette rubrique"></a></h2>
+<p>PhysAE cible la reconstruction de spectres CH<sub>4</sub> (méthane) sur un
+maillage spectral défini par <code class="docutils literal notranslate"><span class="pre">n_points</span></code>. Les paramètres physiques étudiés
+correspondent aux entrées de <code class="xref py py-data docutils literal notranslate"><span class="pre">physae.config.PARAMS</span></code>, notamment la
+position de raie <code class="docutils literal notranslate"><span class="pre">sig0</span></code>, la largeur <code class="docutils literal notranslate"><span class="pre">dsig</span></code> ou encore la fraction molaire
+<code class="docutils literal notranslate"><span class="pre">mf_CH4</span></code>. La normalisation des paramètres est contrôlée par
+<code class="xref py py-data docutils literal notranslate"><span class="pre">physae.config.NORM_PARAMS</span></code>.</p>
+</section>
+<section id="ressources-de-donnees">
+<h2>Ressources de données<a class="headerlink" href="#ressources-de-donnees" title="Lien vers cette rubrique"></a></h2>
+<p>Aucun fichier externe n’est requis : le module <code class="xref py py-mod docutils literal notranslate"><span class="pre">physae.factory</span></code>
+construit automatiquement :</p>
+<ul class="simple">
+<li><p>les dictionnaires de transitions spectraux via
+<code class="xref py py-func docutils literal notranslate"><span class="pre">physae.physics.parse_csv_transitions()</span></code> ;</p></li>
+<li><p>les jeux de données synthétiques via <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.dataset.SpectraDataset</span></code> ;</p></li>
+<li><p>le module Lightning <code class="xref py py-class docutils literal notranslate"><span class="pre">physae.model.PhysicallyInformedAE</span></code>.</p></li>
+</ul>
+<p>Pour modifier la physique (ajout d’un gaz, nouvelles transitions, autre
+maillage), consultez <a class="reference internal" href="gases.html"><span class="doc">Gestion des gaz et transitions</span></a>.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Pied de page">
+        <a href="index.html" class="btn btn-neutral float-left" title="PhysAE" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Précédent</a>
+        <a href="tutorial.html" class="btn btn-neutral float-right" title="Tutoriel complet" accesskey="n" rel="next">Suivant <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Droits d'auteur 2025, PhysAE contributors.</p>
+  </div>
+
+  Compilé avec <a href="https://www.sphinx-doc.org/">Sphinx</a> en utilisant un
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">thème</a>
+    fourni par <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
