@@ -138,10 +138,12 @@ def build_data_and_model(
     }
 
     def _normalise_noise(cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert list based intervals to tuples preserving element types."""
+
         result: Dict[str, Any] = {}
         for key, value in cfg.items():
             if isinstance(value, list):
-                result[key] = tuple(float(v) for v in value)
+                result[key] = tuple(value)
             else:
                 result[key] = value
         return result
