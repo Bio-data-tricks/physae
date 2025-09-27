@@ -141,7 +141,10 @@ def build_data_and_model(
         result: Dict[str, Any] = {}
         for key, value in cfg.items():
             if isinstance(value, list):
-                result[key] = tuple(float(v) for v in value)
+                if value and all(isinstance(v, int) for v in value):
+                    result[key] = tuple(int(v) for v in value)
+                else:
+                    result[key] = tuple(float(v) for v in value)
             else:
                 result[key] = value
         return result
