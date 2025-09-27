@@ -64,9 +64,15 @@ def add_noise_variety(spectra: torch.Tensor, *, generator=None, **config) -> tor
     if rand_bool(p_drift):
         sigma = rand_float(*drift_sigma_range)
         radius = max(1, int(3 * sigma))
+        max_reflect_pad = max(0, length - 1)
+        if radius > max_reflect_pad:
+            radius = max_reflect_pad
         grid = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
-        kernel = torch.exp(-0.5 * (grid / sigma) ** 2)
-        kernel = kernel / kernel.sum()
+        if grid.numel() == 0:
+            kernel = torch.ones(1, device=device, dtype=dtype)
+        else:
+            kernel = torch.exp(-0.5 * (grid / max(sigma, 1e-6)) ** 2)
+        kernel = kernel / kernel.sum().clamp_min(1e-12)
         drift = torch.randn((batch, length), device=device, dtype=dtype, generator=generator)
         drift = drift - drift.mean(dim=-1, keepdim=True)
         drift = F.pad(drift.unsqueeze(1), (radius, radius), mode="reflect")
