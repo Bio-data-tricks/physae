@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -102,6 +103,7 @@ def train_stage_custom(
     scheduler_eta_min: Optional[float] = None,
     scheduler_T_max: Optional[int] = None,
     return_metrics: bool = False,
+    trainer_kwargs: Optional[Dict[str, Any]] = None,
 ) -> PhysicallyInformedAE | Tuple[PhysicallyInformedAE, Dict[str, float]]:
     print(f"\n===== Stage {stage_name} =====")
     _load_weights_if_any(model, ckpt_in)
@@ -143,13 +145,22 @@ def train_stage_custom(
         train_refiner=train_refiner,
         heads_subset=heads_subset,
     )
-    trainer = pl.Trainer(
-        max_epochs=epochs,
-        accelerator=accelerator or ("gpu" if torch.cuda.is_available() else "cpu"),
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=1,
-        callbacks=callbacks or [],
-    )
+    resolved_accelerator = accelerator or ("gpu" if torch.cuda.is_available() else "cpu")
+    trainer_args: Dict[str, Any] = {
+        "max_epochs": epochs,
+        "accelerator": resolved_accelerator,
+        "enable_progress_bar": enable_progress_bar,
+        "log_every_n_steps": 1,
+        "callbacks": callbacks or [],
+    }
+    if trainer_kwargs:
+        trainer_args.update(trainer_kwargs)
+    default_root_dir = trainer_args.get("default_root_dir")
+    if default_root_dir is not None:
+        trainer_args["default_root_dir"] = str(Path(default_root_dir))
+    if "devices" not in trainer_args and resolved_accelerator != "cpu":
+        trainer_args["devices"] = trainer_args.get("devices", "auto")
+    trainer = pl.Trainer(**trainer_args)
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
     if return_metrics:
