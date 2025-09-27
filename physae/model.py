@@ -576,7 +576,7 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.log(f"{step_name}_loss_phys_corr", loss_phys_corr, on_epoch=True)
         self.log(f"{step_name}_loss_param_group", loss_param_group, on_epoch=True)
         if len(per_param_losses) > 0:
-            self.log(f"{step_name}_loss_param", torch.stack(per_param_losses).mean(), on_epoch=True)
+            self.log(f"{step_name}_loss_param", per_param_losses.mean(), on_epoch=True)
         self.log(f"{step_name}_w_top_phys", w_top[0], on_epoch=True)
         self.log(f"{step_name}_w_top_phys_corr", w_top[1], on_epoch=True)
         self.log(f"{step_name}_w_top_param_group", w_top[2], on_epoch=True)
