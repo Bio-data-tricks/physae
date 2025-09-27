@@ -1,5 +1,10 @@
 
-import math, random, sys
+import copy
+import copy
+import math
+import random
+import sys
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -65,7 +70,9 @@ def unnorm_param_torch(name: str, val_norm_t: torch.Tensor) -> torch.Tensor:
     else:
         return val_norm_t*(vmax_t-vmin_t)+vmin_t
 
-import math, torch, torch.nn.functional as F
+import math
+import torch
+import torch.nn.functional as F
 
 def _gauss1d(sigma, device, dtype):
     r = max(1, int(math.ceil(3*sigma)))
@@ -496,54 +503,108 @@ class SqueezeExcitation1D(nn.Module):
     def forward(self, x): return x * self.se(x)
 
 class MBConvBlock1D(nn.Module):
-    def __init__(self, in_c, out_c, kernel, stride, expand_ratio, se_ratio=0.25):
+    def __init__(self, in_c, out_c, kernel, stride, expand_ratio, se_ratio=0.25, norm_groups: int = 8):
         super().__init__()
         self.use_residual = in_c == out_c and stride == 1
-        hidden_dim = in_c * expand_ratio
-        reduced_dim = max(1, int(in_c * se_ratio))
-        num_groups = 8
+        hidden_dim = max(1, int(round(in_c * expand_ratio)))
+        reduced_dim = max(1, int(round(in_c * se_ratio)))
+        self.norm_groups = max(1, int(norm_groups))
+
+        def _make_group_norm(channels: int) -> nn.GroupNorm:
+            groups = math.gcd(channels, self.norm_groups)
+            if groups == 0:
+                groups = 1
+            return nn.GroupNorm(groups, channels)
+
         layers = []
         if expand_ratio != 1:
             layers.append(nn.Sequential(
                 nn.Conv1d(in_c, hidden_dim, 1, bias=False),
-                nn.GroupNorm(num_groups, hidden_dim),
+                _make_group_norm(hidden_dim),
                 SiLU()
             ))
         layers.extend([
             nn.Sequential(
                 nn.Conv1d(hidden_dim, hidden_dim, kernel, stride,
                           padding=kernel//2, groups=hidden_dim, bias=False),
-                nn.GroupNorm(num_groups, hidden_dim),
+                _make_group_norm(hidden_dim),
                 SiLU()
             ),
             SqueezeExcitation1D(hidden_dim, reduced_dim),
             nn.Conv1d(hidden_dim, out_c, 1, bias=False),
-            nn.GroupNorm(max(1, out_c // num_groups), out_c)
+            _make_group_norm(out_c)
         ])
         self.conv = nn.Sequential(*layers)
     def forward(self, x): return x + self.conv(x) if self.use_residual else self.conv(x)
 
+
+@dataclass
+class EfficientNetBlockConfig:
+    out_channels: int
+    kernel_size: int
+    stride: int
+    expand_ratio: float = 1.0
+    repeats: int = 1
+
+
+@dataclass
+class EfficientNet1DConfig:
+    stem_channels: int = 32
+    stem_kernel: int = 3
+    stem_stride: int = 2
+    se_ratio: float = 0.25
+    norm_groups: int = 8
+    block_configs: List[EfficientNetBlockConfig] = field(default_factory=lambda: [
+        EfficientNetBlockConfig(24, 3, 2, 1, 1),
+        EfficientNetBlockConfig(40, 5, 2, 6, 1),
+        EfficientNetBlockConfig(80, 3, 2, 6, 1),
+        EfficientNetBlockConfig(112, 5, 1, 6, 1),
+        EfficientNetBlockConfig(192, 5, 2, 6, 1),
+    ])
+
+    def final_channels(self) -> int:
+        if not self.block_configs:
+            return self.stem_channels
+        return self.block_configs[-1].out_channels
+
+
 class EfficientNetEncoder(nn.Module):
-    def __init__(self, in_channels=1):
+    def __init__(self, in_channels: int = 1, config: Optional[EfficientNet1DConfig] = None):
         super().__init__()
+        self.config = copy.deepcopy(config) if config is not None else EfficientNet1DConfig()
+
+        stem_pad = self.config.stem_kernel // 2
+        stem_out = self.config.stem_channels
+        stem_groups = math.gcd(stem_out, self.config.norm_groups) or 1
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, 32, 3, 2, 1, bias=False),
-            nn.GroupNorm(8, 32),
+            nn.Conv1d(in_channels, stem_out, self.config.stem_kernel, self.config.stem_stride,
+                      stem_pad, bias=False),
+            nn.GroupNorm(stem_groups, stem_out),
             SiLU()
         )
-        self.block1 = MBConvBlock1D(32, 24, 3, 2, 1)
-        self.block2 = MBConvBlock1D(24, 40, 5, 2, 6)
-        self.block3 = MBConvBlock1D(40, 80, 3, 2, 6)
-        self.block4 = MBConvBlock1D(80, 112, 5, 1, 6)
-        self.block5 = MBConvBlock1D(112, 192, 5, 2, 6)
-        self.feat_dim = 192
+
+        blocks = []
+        in_c = stem_out
+        for block_cfg in self.config.block_configs:
+            repeats = max(1, int(block_cfg.repeats))
+            for i in range(repeats):
+                stride = block_cfg.stride if i == 0 else 1
+                block = MBConvBlock1D(
+                    in_c,
+                    block_cfg.out_channels,
+                    block_cfg.kernel_size,
+                    stride,
+                    block_cfg.expand_ratio,
+                    se_ratio=self.config.se_ratio,
+                    norm_groups=self.config.norm_groups,
+                )
+                blocks.append(block)
+                in_c = block_cfg.out_channels
+        self.blocks = nn.Sequential(*blocks)
+        self.feat_dim = in_c
     def forward(self, x):
         x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.block5(x)
+        x = self.blocks(x)
         return x, None
 
 # ============================================================
@@ -582,14 +643,16 @@ class ReLoBRaLoLoss:
 # ============================================================
 class EfficientNetRefiner(nn.Module):
     def __init__(self, m_params: int, cond_dim: int, backbone_feat_dim: int,
-                 delta_scale: float = 0.1):
+                 delta_scale: float = 0.1,
+                 encoder_config: Optional[EfficientNet1DConfig] = None):
         super().__init__()
         self.delta_scale = float(delta_scale)
         self.m_params = int(m_params)
         self.cond_dim = int(cond_dim)
         self.use_film = True
 
-        self.encoder = EfficientNetEncoder(in_channels=2)
+        self.encoder_config = copy.deepcopy(encoder_config) if encoder_config is not None else None
+        self.encoder = EfficientNetEncoder(in_channels=2, config=self.encoder_config)
         self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         D = self.encoder.feat_dim
         H = max(64, D // 2)
@@ -655,10 +718,12 @@ class PhysicallyInformedAE(pl.LightningModule):
                  baseline_fix_enable: bool = False, baseline_fix_sideband: int = 50,
                  baseline_fix_degree: int = 2, baseline_fix_weight: float = 1.0,
                  baseline_fix_in_warmup: bool = False,  recon_max1: bool = False,
-                 corr_mode: str = "savgol",           
+                 corr_mode: str = "savgol",
                  corr_savgol_win: int = 11,
                  corr_savgol_poly: int = 3,
-                 weight_mf: float = 1.0):
+                 weight_mf: float = 1.0,
+                 backbone_config: Optional[EfficientNet1DConfig] = None,
+                 refiner_config: Optional[EfficientNet1DConfig] = None):
         
         super().__init__()
         self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4"])
@@ -717,9 +782,11 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.predict_idx = [self.name_to_idx[p] for p in self.predict_params]
         self.provided_idx= [self.name_to_idx[p] for p in self.provided_params]
 
-        self.backbone = EfficientNetEncoder(in_channels=1)
+        backbone_cfg = copy.deepcopy(backbone_config) if backbone_config is not None else EfficientNet1DConfig()
+        self.backbone_config = backbone_cfg
+        self.backbone = EfficientNetEncoder(in_channels=1, config=backbone_cfg)
         self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
-        feat_dim = self.backbone.feat_dim; hidden = feat_dim // 2
+        feat_dim = self.backbone.feat_dim; hidden = max(32, feat_dim // 2)
 
         self.shared_head = nn.Sequential(
             nn.Linear(feat_dim, hidden),
@@ -747,11 +814,14 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             self.out_heads = nn.ModuleDict({p: nn.Linear(hidden, 1) for p in self.predict_params})
 
+        refiner_cfg = copy.deepcopy(refiner_config) if refiner_config is not None else copy.deepcopy(backbone_cfg)
+        self.refiner_config = refiner_cfg
         self.refiner = EfficientNetRefiner(
             m_params=len(self.predict_params),
             cond_dim=self.cond_dim,
             backbone_feat_dim=self.backbone.feat_dim,
-            delta_scale=refine_delta_scale
+            delta_scale=refine_delta_scale,
+            encoder_config=refiner_cfg
         )
         self.loss_names_params = [f"param_{p}" for p in self.predict_params]
         self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
@@ -1431,6 +1501,55 @@ def assert_subset(child: dict, parent: dict, name_child="child", name_parent="pa
 # ============================================================
 # 10) Stages d'entraînement (A / B1 / B2), contrôle fin
 # ============================================================
+@dataclass
+class StageConfig:
+    stage_name: str
+    epochs: int
+    base_lr: float
+    refiner_lr: float
+    train_base: bool
+    train_heads: bool
+    train_film: bool
+    train_refiner: bool
+    refine_steps: int
+    delta_scale: float
+    use_film: bool
+    film_subset: Optional[List[str]] = None
+    heads_subset: Optional[List[str]] = None
+    baseline_fix_enable: bool = False
+    enable_progress_bar: bool = False
+
+    def to_kwargs(self) -> Dict[str, object]:
+        return {
+            "stage_name": self.stage_name,
+            "epochs": self.epochs,
+            "base_lr": self.base_lr,
+            "refiner_lr": self.refiner_lr,
+            "train_base": self.train_base,
+            "train_heads": self.train_heads,
+            "train_film": self.train_film,
+            "train_refiner": self.train_refiner,
+            "refine_steps": self.refine_steps,
+            "delta_scale": self.delta_scale,
+            "use_film": self.use_film,
+            "film_subset": self.film_subset,
+            "heads_subset": self.heads_subset,
+            "baseline_fix_enable": self.baseline_fix_enable,
+            "enable_progress_bar": self.enable_progress_bar,
+        }
+
+
+def train_stage_with_config(
+    model: "PhysicallyInformedAE",
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    stage_config: StageConfig,
+    **overrides,
+):
+    cfg_kwargs = stage_config.to_kwargs()
+    cfg_kwargs.update(overrides)
+    return train_stage_custom(model, train_loader, val_loader, **cfg_kwargs)
+
 def _freeze_all(model: PhysicallyInformedAE):
     for p in model.parameters(): p.requires_grad_(False)
 
@@ -1538,41 +1657,85 @@ def train_stage_custom(
     return model
 
 # Facades conviviales
-def train_stage_A(model, train_loader, val_loader, **kw):
-    # A = base + heads (+/- FiLM), pas de raffineur
-    defaults = dict(
-        stage_name="A", epochs=20,
-        base_lr=2e-4, refiner_lr=1e-6,
-        train_base=True, train_heads=True, train_film=False, train_refiner=False,
-        refine_steps=0, delta_scale=0.1,
-        use_film=False, film_subset=None, heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+def stage_A_config(**overrides) -> StageConfig:
+    data = dict(
+        stage_name="A",
+        epochs=20,
+        base_lr=2e-4,
+        refiner_lr=1e-6,
+        train_base=True,
+        train_heads=True,
+        train_film=False,
+        train_refiner=False,
+        refine_steps=0,
+        delta_scale=0.1,
+        use_film=False,
+        film_subset=None,
+        heads_subset=None,
+        baseline_fix_enable=False,
+        enable_progress_bar=False,
+    )
+    data.update(overrides)
+    return StageConfig(**data)
 
-def train_stage_B1(model, train_loader, val_loader, **kw):
-    # B1 = raffineur seul
-    defaults = dict(
-        stage_name="B1", epochs=12,
-        base_lr=1e-6, refiner_lr=1e-5,
-        train_base=False, train_heads=False, train_film=False, train_refiner=True,
-        refine_steps=2, delta_scale=0.12,
-        use_film=True, film_subset=["T"], heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
 
-def train_stage_B2(model, train_loader, val_loader, **kw):
-    # B2 = fine-tune global (petits LR), raffinement ON
-    defaults = dict(
-        stage_name="B2", epochs=15,
-        base_lr=3e-5, refiner_lr=3e-6,
-        train_base=True, train_heads=True, train_film=True, train_refiner=True,
-        refine_steps=2, delta_scale=0.08,
-        use_film=True, film_subset=["P","T"], heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+def stage_B1_config(**overrides) -> StageConfig:
+    data = dict(
+        stage_name="B1",
+        epochs=12,
+        base_lr=1e-6,
+        refiner_lr=1e-5,
+        train_base=False,
+        train_heads=False,
+        train_film=False,
+        train_refiner=True,
+        refine_steps=2,
+        delta_scale=0.12,
+        use_film=True,
+        film_subset=["T"],
+        heads_subset=None,
+        baseline_fix_enable=False,
+        enable_progress_bar=False,
+    )
+    data.update(overrides)
+    return StageConfig(**data)
+
+
+def stage_B2_config(**overrides) -> StageConfig:
+    data = dict(
+        stage_name="B2",
+        epochs=15,
+        base_lr=3e-5,
+        refiner_lr=3e-6,
+        train_base=True,
+        train_heads=True,
+        train_film=True,
+        train_refiner=True,
+        refine_steps=2,
+        delta_scale=0.08,
+        use_film=True,
+        film_subset=["P", "T"],
+        heads_subset=None,
+        baseline_fix_enable=False,
+        enable_progress_bar=False,
+    )
+    data.update(overrides)
+    return StageConfig(**data)
+
+
+def train_stage_A(model, train_loader, val_loader, stage_config: Optional[StageConfig] = None, **kw):
+    cfg = stage_config or stage_A_config()
+    return train_stage_with_config(model, train_loader, val_loader, cfg, **kw)
+
+
+def train_stage_B1(model, train_loader, val_loader, stage_config: Optional[StageConfig] = None, **kw):
+    cfg = stage_config or stage_B1_config()
+    return train_stage_with_config(model, train_loader, val_loader, cfg, **kw)
+
+
+def train_stage_B2(model, train_loader, val_loader, stage_config: Optional[StageConfig] = None, **kw):
+    cfg = stage_config or stage_B2_config()
+    return train_stage_with_config(model, train_loader, val_loader, cfg, **kw)
 
 # ============================================================
 # 11) Évaluation + refit baseline (bords)
@@ -1742,6 +1905,8 @@ def build_data_and_model(
     *, seed=42, n_points=800, n_train=50000, n_val=5000, batch_size=16,
     train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
     predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
+    backbone_config: Optional[EfficientNet1DConfig] = None,
+    refiner_config: Optional[EfficientNet1DConfig] = None,
 ):
     pl.seed_everything(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1826,8 +1991,10 @@ def build_data_and_model(
         baseline_fix_weight=1.0, baseline_fix_in_warmup=False,
         recon_max1=True,
         corr_mode="none",
-        corr_savgol_win= 15,   
-        corr_savgol_poly=3 
+        corr_savgol_win= 15,
+        corr_savgol_poly=3,
+        backbone_config=backbone_config,
+        refiner_config=refiner_config,
     )
     return model, train_loader, val_loader
 
@@ -1836,7 +2003,17 @@ def build_data_and_model(
 # ============================================================
 if __name__ == "__main__":
     model, train_loader, val_loader = build_data_and_model()
-    cb = [PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1), UpdateEpochInDataset()] 
+    # Exemple : pour une recherche d'hyperparamètres, construis une config personnalisée :
+    # custom_cfg = EfficientNet1DConfig(stem_channels=48)
+    # model, train_loader, val_loader = build_data_and_model(
+    #     backbone_config=custom_cfg,
+    #     refiner_config=copy.deepcopy(custom_cfg),
+    # )
+
+    # Pour explorer des réglages de stage, crée un StageConfig et passe-le à train_stage_A/B* :
+    # stageA_cfg = stage_A_config(base_lr=1.5e-4, epochs=30)
+    # train_stage_A(model, train_loader, val_loader, stage_config=stageA_cfg)
+    cb = [PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1), UpdateEpochInDataset()]
 
     #--- Étape A (base + heads). Ici on ACTIVE FiLM dès A (optionnel).
     train_stage_A(
