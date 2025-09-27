@@ -39,3 +39,56 @@ print(study.best_params)
 ```
 
 Le carnet `notebooks/optimisation_physae.ipynb` présente un flux complet : chargement des configurations YAML, entraînement rapide des phases A et B, puis optimisation automatique des hyperparamètres.
+
+## Sélection du matériel (CPU, GPU, multi-GPU)
+
+Les fichiers YAML de ``physae/configs/stages`` acceptent désormais des options
+Pytorch Lightning supplémentaires pour contrôler l'accélérateur et le nombre de
+périphériques utilisés. Les mêmes clés peuvent être passées dynamiquement via
+``stage_overrides`` ou directement dans les appels ``train_stage_*``.
+
+```yaml
+# Exemple de surcharge YAML
+accelerator: gpu        # "cpu" pour forcer l'entraînement sur CPU
+devices: 4              # ou [0, 1, 2, 3] pour désigner des GPU précis
+precision: 16           # bfloat16/fp16 selon votre matériel (optionnel)
+```
+
+Avec ``devices`` > 1, la stratégie ``ddp`` de Lightning est sélectionnée par
+défaut afin de distribuer l'entraînement sur plusieurs GPU sans conflit entre
+processus. Utilisez ``strategy`` pour la modifier si nécessaire (par exemple
+``"ddp_spawn"`` sur certains supercalculateurs).
+
+Pour une exécution hors-ligne sur un cluster sans accès Internet, préparez un
+script de soumission qui charge votre environnement conda/module et lance votre
+expérience. Exemple minimal avec SLURM :
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=physae-optuna
+#SBATCH --nodes=1
+#SBATCH --gpus=4
+#SBATCH --cpus-per-task=8
+#SBATCH --time=04:00:00
+
+module load anaconda
+source activate physae
+
+python - <<'PYTHON'
+from physae.optimization import optimise_stage
+
+study = optimise_stage(
+    "A",
+    n_trials=20,
+    stage_overrides={
+        "accelerator": "gpu",
+        "devices": 4,
+    },
+)
+print("Best score:", study.best_value)
+print("Best params:", study.best_params)
+PYTHON
+```
+
+Ce script peut être adapté à d'autres planificateurs (PBS, LSF) en modifiant la
+section d'en-tête et les commandes d'activation d'environnement.

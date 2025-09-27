@@ -24,7 +24,9 @@ La bibliothèque est organisée autour de quelques modules clés :
 :mod:`physae.training`
     Regroupe les fonctions ``train_stage_A/B1/B2`` qui appliquent des schémas de
     gel/dégel adaptés. Le coeur ``train_stage_custom`` accepte des callbacks
-    Lightning standards et gère la sauvegarde/reprise.
+    Lightning standards, gère la sauvegarde/reprise et permet de spécifier
+    l'accélérateur ``(cpu/gpu)``, le nombre de périphériques et la stratégie DDP
+    pour l'entraînement multi-GPU.
 
 :mod:`physae.optimization`
     Enveloppe Optuna pour la recherche d'hyperparamètres. La fonction

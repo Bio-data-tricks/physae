@@ -82,6 +82,52 @@ sur les paramètres prédits.
 Tous les sous-modèles sont dégelés. Utilisez ``heads_subset`` si vous souhaitez
 ne raffiner qu'une partie des sorties.
 
+Contrôle du matériel (CPU/GPU)
+------------------------------
+
+Les fichiers ``stage_*.yaml`` acceptent des arguments Lightning supplémentaires
+pour sélectionner l'accélérateur et le nombre de périphériques. Ils sont
+directement transmis à :func:`physae.training.train_stage_custom`.
+
+.. code-block:: yaml
+
+   accelerator: gpu   # ou "cpu" pour désactiver CUDA
+   devices: 2         # nombre de GPU (ou liste [0, 1])
+   precision: 16      # mix-precision si supporté
+
+Lorsque ``devices`` est supérieur à 1 et que ``accelerator`` cible les GPU, la
+stratégie ``ddp`` est activée automatiquement pour orchestrer le multi-processus
+de Lightning. Spécifiez ``strategy`` dans le YAML si vous devez choisir une
+variante différente (``ddp_spawn``, ``fsdp``, ...).
+
+Sur un supercalculateur sans accès Internet, exécutez vos expériences via un
+fichier de soumission. Exemple minimal SLURM :
+
+.. code-block:: bash
+
+   #!/bin/bash
+   #SBATCH --job-name=physae-optuna
+   #SBATCH --gpus=4
+   #SBATCH --cpus-per-task=8
+   #SBATCH --time=04:00:00
+
+   module load anaconda
+   source activate physae
+
+   python - <<'PYTHON'
+   from physae.optimization import optimise_stage
+
+   study = optimise_stage(
+       "A",
+       n_trials=10,
+       stage_overrides={
+           "accelerator": "gpu",
+           "devices": 4,
+       },
+   )
+   print("Meilleurs hyperparamètres:", study.best_params)
+   PYTHON
+
 Recherche d'hyperparamètres avec Optuna
 ---------------------------------------
 

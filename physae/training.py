@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Collection, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
@@ -92,6 +92,10 @@ def train_stage_custom(
     baseline_fix_enable: Optional[bool] = None,
     callbacks: Optional[list] = None,
     accelerator: Optional[str] = None,
+    devices: Optional[Union[int, str, Collection[int]]] = None,
+    strategy: Optional[str] = None,
+    num_nodes: Optional[int] = None,
+    precision: Optional[Union[str, int]] = None,
     ckpt_in: Optional[str] = None,
     ckpt_out: Optional[str] = None,
     enable_progress_bar: bool = False,
@@ -143,13 +147,43 @@ def train_stage_custom(
         train_refiner=train_refiner,
         heads_subset=heads_subset,
     )
-    trainer = pl.Trainer(
-        max_epochs=epochs,
-        accelerator=accelerator or ("gpu" if torch.cuda.is_available() else "cpu"),
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=1,
-        callbacks=callbacks or [],
-    )
+    trainer_kwargs: Dict[str, Any] = {
+        "max_epochs": epochs,
+        "enable_progress_bar": enable_progress_bar,
+        "log_every_n_steps": 1,
+        "callbacks": callbacks or [],
+    }
+
+    resolved_accelerator = accelerator or ("gpu" if torch.cuda.is_available() else "cpu")
+    trainer_kwargs["accelerator"] = resolved_accelerator
+
+    if devices is not None:
+        trainer_kwargs["devices"] = devices
+
+    inferred_device_count: Optional[int] = None
+    if isinstance(devices, int):
+        inferred_device_count = devices
+    elif isinstance(devices, Collection) and not isinstance(devices, str):
+        inferred_device_count = len(devices)
+
+    if strategy is None:
+        is_multi_gpu = (
+            resolved_accelerator in {"gpu", "cuda"}
+            and inferred_device_count is not None
+            and inferred_device_count > 1
+        )
+        if is_multi_gpu:
+            trainer_kwargs["strategy"] = "ddp"
+    else:
+        trainer_kwargs["strategy"] = strategy
+
+    if num_nodes is not None:
+        trainer_kwargs["num_nodes"] = num_nodes
+
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
+
+    trainer = pl.Trainer(**trainer_kwargs)
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
     if return_metrics:
