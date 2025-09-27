@@ -40,7 +40,11 @@ définit la génération de spectres.
 ``model``
     Sous-clefs ``encoder`` et ``refiner`` qui contrôlent la largeur, la
     profondeur et le facteur ``expand_ratio`` des blocs EfficientNet (cf.
-    :class:`physae.models.EfficientNetEncoder`).
+    :class:`physae.models.EfficientNetEncoder`). Les variantes
+    :class:`physae.models.EfficientNetV2Encoder` et
+    :class:`physae.models.ConvNeXtEncoder` sont également enregistrées sous les
+    noms ``efficientnet_v2`` et ``convnext`` pour explorer des architectures
+    plus ambitieuses.
 
 Configurations d'étape
 ----------------------
