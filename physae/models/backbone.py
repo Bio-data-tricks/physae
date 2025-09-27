@@ -184,3 +184,37 @@ def build_efficientnet_encoder(**kwargs: Any) -> EfficientNetEncoder:
 
     in_channels = int(kwargs.pop("in_channels", 1))
     return EfficientNetEncoder(in_channels=in_channels, **kwargs)
+
+
+class EfficientNetLargeEncoder(EfficientNetEncoder):
+    """More expressive EfficientNet variant tuned for higher-capacity experiments."""
+
+    DEFAULT_BLOCKS: Sequence[MBConvConfig] = (
+        MBConvConfig(out_channels=32, kernel=3, stride=2, expand_ratio=1, repeats=2),
+        MBConvConfig(out_channels=56, kernel=5, stride=2, expand_ratio=6, repeats=4),
+        MBConvConfig(out_channels=112, kernel=3, stride=2, expand_ratio=6, repeats=4),
+        MBConvConfig(out_channels=160, kernel=5, stride=1, expand_ratio=6, repeats=6),
+        MBConvConfig(out_channels=272, kernel=5, stride=2, expand_ratio=6, repeats=2),
+    )
+
+    def __init__(self, in_channels: int = 1, **kwargs: Any) -> None:
+        width_mult = float(kwargs.pop("width_mult", 1.4))
+        depth_mult = float(kwargs.pop("depth_mult", 1.8))
+        expand_ratio_scale = float(kwargs.pop("expand_ratio_scale", 1.2))
+        block_settings = tuple(kwargs.pop("block_settings", self.DEFAULT_BLOCKS))
+        super().__init__(
+            in_channels=in_channels,
+            width_mult=width_mult,
+            depth_mult=depth_mult,
+            expand_ratio_scale=expand_ratio_scale,
+            block_settings=block_settings,
+            **kwargs,
+        )
+
+
+@register_encoder("efficientnet_large")
+def build_efficientnet_large_encoder(**kwargs: Any) -> EfficientNetLargeEncoder:
+    """Build the higher-capacity EfficientNet variant registered as ``efficientnet_large``."""
+
+    in_channels = int(kwargs.pop("in_channels", 1))
+    return EfficientNetLargeEncoder(in_channels=in_channels, **kwargs)

@@ -1,6 +1,12 @@
 """Model components for the PhysAE package."""
 
-from .backbone import EfficientNetEncoder, MBConvBlock1D, SiLU, SqueezeExcitation1D
+from .backbone import (
+    EfficientNetEncoder,
+    EfficientNetLargeEncoder,
+    MBConvBlock1D,
+    SiLU,
+    SqueezeExcitation1D,
+)
 from .refiner import EfficientNetRefiner
 from .registry import (
     available_encoders,
@@ -13,6 +19,7 @@ from .registry import (
 
 __all__ = [
     "EfficientNetEncoder",
+    "EfficientNetLargeEncoder",
     "MBConvBlock1D",
     "SiLU",
     "SqueezeExcitation1D",

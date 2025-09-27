@@ -32,7 +32,12 @@ pip install .[docs]
 
 ## Étendre les composants du modèle
 
-Les éléments clés du modèle (encodeur principal et module de raffinement) sont enregistrés dans des registres afin de faciliter l'ajout de nouvelles variantes. Les constructeurs existants (`efficientnet`) sont déclarés dans `physae/models/backbone.py` et `physae/models/refiner.py` via les décorateurs `@register_encoder` et `@register_refiner`.
+Les éléments clés du modèle (encodeur principal et module de raffinement) sont enregistrés dans des registres afin de faciliter l'ajout de nouvelles variantes. Deux constructeurs d'encodeur sont fournis par défaut :
+
+* `efficientnet`, fidèle au backbone historique.
+* `efficientnet_large`, une déclinaison plus profonde et plus large reposant sur les mêmes blocs MBConv pour des expériences à plus forte capacité.
+
+Ces implémentations sont déclarées dans `physae/models/backbone.py` tandis que les raffinements associés sont définis dans `physae/models/refiner.py` via les décorateurs `@register_encoder` et `@register_refiner`.
 
 Pour ajouter un encodeur personnalisé, il suffit de définir une fonction de construction qui retourne un module `nn.Module` et d'utiliser le décorateur approprié :
 
