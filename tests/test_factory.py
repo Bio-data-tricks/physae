@@ -38,9 +38,11 @@ def test_build_data_and_model_default_refiner_config():
     from physae.factory import build_data_and_model
     from physae.model import PhysicallyInformedAE
 
-    model, train_loader, val_loader = build_data_and_model(**_small_build_kwargs())
+    model, (train_loader, val_loader), metadata = build_data_and_model(**_small_build_kwargs())
 
     assert isinstance(model, PhysicallyInformedAE)
+
+    assert metadata["input_shape"] == (32,)
 
     batch = next(iter(train_loader))
     assert batch["noisy_spectra"].ndim == 2
@@ -72,7 +74,7 @@ def test_noise_integer_ranges_generate_batches_without_error():
         "clip": (0.0, 1.5),
     }
 
-    _, train_loader, _ = build_data_and_model(
+    _, (train_loader, _), _ = build_data_and_model(
         **_small_build_kwargs(noise_train=integer_noise, noise_val=integer_noise)
     )
 

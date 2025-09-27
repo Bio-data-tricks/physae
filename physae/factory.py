@@ -294,4 +294,19 @@ def build_data_and_model(
         scheduler_eta_min=float(scheduler_cfg.get("eta_min", 1e-9)),
         scheduler_T_max=scheduler_t_max,
     )
-    return model, train_loader, val_loader
+
+    metadata = {
+        "input_shape": (n_points,),
+        "train_size": n_train,
+        "val_size": n_val,
+        "batch_size": batch_size,
+        "train_ranges": train_ranges,
+        "val_ranges": val_ranges,
+        "noise_train": noise_train,
+        "noise_val": noise_val,
+        "predict_list": predict_list,
+        "film_list": film_list,
+        "lrs": lrs,
+    }
+
+    return model, (train_loader, val_loader), metadata

@@ -16,10 +16,12 @@ Préparation
    from physae.factory import build_data_and_model
    from physae.training import train_stage_A, train_stage_B1, train_stage_B2
 
-   model, train_loader, val_loader = build_data_and_model(
+   model, (train_loader, val_loader), metadata = build_data_and_model(
        config_path="physae/configs/data",
        config_name="default",
    )
+
+   print("Dimensions des entrées attendues :", metadata["input_shape"])
 
 La fonction :func:`physae.factory.build_data_and_model` lit le fichier YAML,
 construit un :class:`~physae.dataset.SpectraDataset` pour l'entraînement et la

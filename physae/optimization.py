@@ -160,7 +160,7 @@ def optimise_stage(
                 params[param_name] = value
         trial.set_user_attr("stage_params", copy.deepcopy(params))
         trial.set_user_attr("data_overrides", copy.deepcopy(trial_data_overrides))
-        model, train_loader, val_loader = build_data_and_model(
+        model, (train_loader, val_loader), _ = build_data_and_model(
             config_path=data_config_path,
             config_name=data_config_name,
             config_overrides=trial_data_overrides or None,

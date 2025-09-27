@@ -178,7 +178,7 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 def cmd_infer(args: argparse.Namespace) -> None:
     overrides = _load_mapping(args.data_overrides)
-    model, _, val_loader = build_data_and_model(
+    model, (_, val_loader), _ = build_data_and_model(
         config_path=args.data_config_path,
         config_name=args.data_config_name,
         config_overrides=overrides or None,

@@ -162,7 +162,7 @@ def train_stages(
     if missing:
         raise KeyError(f"Paramètres manquants pour les stages: {', '.join(missing)}")
     overrides = dict(data_overrides or {})
-    model, train_loader, val_loader = build_data_and_model(
+    model, (train_loader, val_loader), _ = build_data_and_model(
         config_path=data_config_path,
         config_name=data_config_name,
         config_overrides=overrides or None,

@@ -21,7 +21,7 @@ appel à :func:`physae.training.train_stage_A`. Par exemple :
 
 .. code-block:: python
 
-   model, train_loader, val_loader = build_data_and_model(
+   model, (train_loader, val_loader), _ = build_data_and_model(
        config_overrides={"n_train": 2048, "n_val": 512}
    )
 
