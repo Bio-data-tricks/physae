@@ -1,6 +1,9 @@
 # PhysAE
 
-Ce dépôt expose une version modulaire du réseau PhysAE avec une configuration basée sur des fichiers YAML et des utilitaires d'optimisation. Vous trouverez les fichiers de configuration dans `physae/configs` ainsi qu'un carnet Jupyter d'exemple dans `notebooks/optimisation_physae.ipynb`.
+Ce dépôt expose une version modulaire du réseau PhysAE avec une configuration basée sur des fichiers YAML et des utilitaires d'optimisation. Vous trouverez les fichiers de configuration dans `physae/configs` ainsi que deux notebooks prêts à l'emploi :
+
+- `notebooks/training_workflow.ipynb` pour lancer les entraînements des stages A, B1 et B2 avec un paramétrage exhaustif.
+- `notebooks/optuna_workflow.ipynb` pour préparer des recherches Optuna sur les stages A, B ou la chaîne A→B.
 
 ## Documentation Read the Docs
 
@@ -87,4 +90,9 @@ study = optimise_stage(
 print(study.best_params)
 ```
 
-Le carnet `notebooks/optimisation_physae.ipynb` présente un flux complet : chargement des configurations YAML, entraînement rapide des phases A et B, puis optimisation automatique des hyperparamètres.
+Deux scripts complémentaires (installés avec le package ou utilisables depuis `scripts/`) facilitent les exécutions en ligne de commande :
+
+- `scripts/train_stage.py` expose tous les paramètres modifiables pour entraîner un stage donné avec ou sans checkpoints intermédiaires.
+- `scripts/run_optuna.py` lance des recherches Optuna pour un ou plusieurs stages en appliquant des overrides JSON directement depuis le terminal.
+
+Les notebooks mentionnés en introduction proposent les mêmes scénarios avec des cellules prêtes à l'emploi pour ajuster chaque paramètre sans écrire de code supplémentaire.
