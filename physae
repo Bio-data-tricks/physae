@@ -1,6 +1,6 @@
 
 import math, random, sys
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import torch
@@ -29,6 +29,106 @@ PARAM_TO_IDX = {n:i for i,n in enumerate(PARAMS)}
 LOG_SCALE_PARAMS = {'mf_CH4'}
 LOG_FLOOR = 1e-7
 NORM_PARAMS: Dict[str, tuple] = {}
+
+# --- Accelerated tensor caches -------------------------------------------------
+_WOFZ_COEFF_CACHE: Dict[Tuple[torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+_PHYS_CONSTANT_VALUES = {
+    "C": 2.99792458e10,
+    "NA": 6.02214129e23,
+    "KB": 1.380649e-16,
+    "P0": 1013.25,
+    "T0": 273.15,
+    "L0": 2.6867773e19,
+    "TREF": 296.0,
+}
+_PHYS_CONSTANT_CACHE: Dict[Tuple[torch.device, torch.dtype], Dict[str, torch.Tensor]] = {}
+_TRANSITION_CACHE: Dict[int, Dict[str, object]] = {}
+_POLYVAL_POWERS_CACHE: Dict[Tuple[int, torch.device, torch.dtype], torch.Tensor] = {}
+_BASELINE_SUPPORT_CACHE: Dict[Tuple[int, int, torch.device, torch.dtype], torch.Tensor] = {}
+_MOLECULE_CONST_CACHE: Dict[Tuple[str, torch.device, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _ensure_tensor_like(value, *, device, dtype) -> torch.Tensor:
+    """Convert a scalar/list/tensor to the requested device/dtype without losing autograd."""
+    if isinstance(value, torch.Tensor):
+        out = value.to(device=device, dtype=dtype)
+    else:
+        out = torch.tensor(value, device=device, dtype=dtype)
+    if out.ndim == 0:
+        out = out.unsqueeze(0)
+    return out
+
+
+def _get_wofz_coeffs(device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    key = (device, dtype)
+    cached = _WOFZ_COEFF_CACHE.get(key)
+    if cached is None:
+        cached = (_b.to(device=device, dtype=dtype), _c.to(device=device, dtype=dtype))
+        _WOFZ_COEFF_CACHE[key] = cached
+    return cached
+
+
+def _get_phys_constants(device: torch.device, dtype: torch.dtype) -> Dict[str, torch.Tensor]:
+    key = (device, dtype)
+    cached = _PHYS_CONSTANT_CACHE.get(key)
+    if cached is None:
+        cached = {
+            name: torch.tensor(value, device=device, dtype=dtype)
+            for name, value in _PHYS_CONSTANT_VALUES.items()
+        }
+        _PHYS_CONSTANT_CACHE[key] = cached
+    return cached
+
+
+def _prepare_transitions_cache(transitions_dict, device: torch.device, dtype: torch.dtype):
+    cache_key = id(transitions_dict)
+    cache_entry = _TRANSITION_CACHE.get(cache_key)
+    if cache_entry is None or cache_entry.get("obj") is not transitions_dict:
+        cache_entry = {"obj": transitions_dict, "data": {}}
+        _TRANSITION_CACHE[cache_key] = cache_entry
+
+    data = cache_entry["data"].get((device, dtype))
+    if data is None:
+        prepared = {}
+        for mol, transitions in transitions_dict.items():
+            tensors = transitions_to_tensors(transitions, device=device, dtype=dtype)
+            prepared[mol] = tuple(t.view(1, -1, 1) for t in tensors)
+        data = prepared
+        cache_entry["data"][(device, dtype)] = data
+    return data
+
+
+def _get_polyval_powers(length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (int(length), device, dtype)
+    cached = _POLYVAL_POWERS_CACHE.get(key)
+    if cached is None:
+        cached = torch.arange(length, device=device, dtype=dtype)
+        _POLYVAL_POWERS_CACHE[key] = cached
+    return cached
+
+
+def _get_baseline_support(N: int, degree: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (int(N), int(degree), device, dtype)
+    cached = _BASELINE_SUPPORT_CACHE.get(key)
+    if cached is None:
+        x = torch.arange(N, device=device, dtype=dtype)
+        powers = torch.arange(degree, device=device, dtype=dtype).unsqueeze(1)
+        cached = x.unsqueeze(0).pow(powers)  # [degree, N]
+        _BASELINE_SUPPORT_CACHE[key] = cached
+    return cached
+
+
+def _get_molecule_constants(molecule: str, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+    key = (molecule, device, dtype)
+    cached = _MOLECULE_CONST_CACHE.get(key)
+    if cached is None:
+        params = MOLECULE_PARAMS[molecule]
+        cached = (
+            torch.tensor(params['M'], device=device, dtype=dtype),
+            torch.tensor(params['PL'], device=device, dtype=dtype),
+        )
+        _MOLECULE_CONST_CACHE[key] = cached
+    return cached
 
 def norm_param_value(name: str, val: float):
     vmin, vmax = NORM_PARAMS[name]
@@ -232,10 +332,10 @@ def parse_csv_transitions(csv_str):
         })
     return transitions
 
-def transitions_to_tensors(transitions, device):
+def transitions_to_tensors(transitions, device, dtype=torch.float32):
     keys = ['amplitude', 'center', 'gamma_air', 'gamma_self', 'n_air',
             'shift_air', 'gDicke', 'nDicke', 'lmf', 'nlmf']
-    return [torch.tensor([t[k] for t in transitions], dtype=torch.float32, device=device) for k in keys]
+    return [torch.tensor([t[k] for t in transitions], dtype=dtype, device=device) for k in keys]
 
 MOLECULE_PARAMS = {'CH4': {'M': 16.04, 'PL': 15.12}, 'H2O': {'M': 18.02, 'PL': 15.12}}
 
@@ -243,10 +343,12 @@ _b = torch.tensor([-0.0173-0.0463j, -0.7399+0.8395j, 5.8406+0.9536j, -5.5834-11.
 _b = torch.cat((_b, _b.conj()))
 _c = torch.tensor([2.2377-1.626j, 1.4652-1.7896j, 0.8393-1.892j, 0.2739-1.9418j], dtype=torch.cdouble)
 _c = torch.cat((_c, -_c.conj()))
+
+
 def wofz_torch(z: torch.Tensor) -> torch.Tensor:
     inv_sqrt_pi = 1.0 / math.sqrt(math.pi)
-    _b_local = _b.to(device=z.device, dtype=z.dtype)
-    _c_local = _c.to(device=z.device, dtype=z.dtype)
+    device, dtype = z.device, z.dtype
+    _b_local, _c_local = _get_wofz_coeffs(device, dtype)
     w = (_b_local / (z.unsqueeze(-1) - _c_local)).sum(dim=-1)
     w = w * (1j * inv_sqrt_pi)
     mask = (z.imag < 0)
@@ -273,60 +375,93 @@ def apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T, TREF=296.):
     return real_prof + imag_prof * flm
 
 def polyval_torch(coeffs, x):
-    powers = torch.arange(coeffs.shape[1], device=coeffs.device, dtype=coeffs.dtype)
+    device, dtype = coeffs.device, coeffs.dtype
+    powers = _get_polyval_powers(coeffs.shape[1], device, dtype)
+    x = x.to(device=device, dtype=dtype)
     return torch.sum(coeffs.unsqueeze(2) * x.unsqueeze(0).pow(powers.view(1, -1, 1)), dim=1)
 
 def batch_physics_forward_multimol_vgrid(
     sig0, dsig, poly_freq, v_grid_idx, baseline_coeffs,
     transitions_dict, P, T, mf_dict, device='cpu'
 ):
-    B, N = sig0.shape[0], v_grid_idx.shape[0]
-    v_grid_idx = v_grid_idx.to(device=device, dtype=torch.float64)
-    sig0, dsig, P, T = (
-        sig0.to(dtype=torch.float64).unsqueeze(1),
-        dsig.to(dtype=torch.float64).unsqueeze(1),
-        P.to(dtype=torch.float64).unsqueeze(1),
-        T.to(dtype=torch.float64).unsqueeze(1)
-    )
+    device = torch.device(device)
+    dtype = torch.float64
+
+    v_grid_idx = v_grid_idx.to(device=device, dtype=dtype)
+    sig0 = _ensure_tensor_like(sig0, device=device, dtype=dtype)
+    dsig = _ensure_tensor_like(dsig, device=device, dtype=dtype)
+    P = _ensure_tensor_like(P, device=device, dtype=dtype)
+    T = _ensure_tensor_like(T, device=device, dtype=dtype)
+
+    B = sig0.shape[0]
+    sig0 = sig0.view(B, 1)
+    dsig = dsig.view(B, 1)
+    P = P.view(B, 1)
+    T = T.view(B, 1)
+
+    if isinstance(baseline_coeffs, torch.Tensor):
+        baseline_coeffs = baseline_coeffs
+    else:
+        baseline_coeffs = torch.tensor(baseline_coeffs)
     if baseline_coeffs.dim() == 1:
         baseline_coeffs = baseline_coeffs.unsqueeze(0)
-    baseline_coeffs = baseline_coeffs.to(dtype=torch.float64)
+    baseline_coeffs = baseline_coeffs.to(device=device, dtype=dtype)
 
-    poly_freq_torch = torch.tensor(poly_freq, dtype=torch.float64, device=device).unsqueeze(0).expand(B, -1)
+    poly_freq_torch = torch.as_tensor(poly_freq, device=device, dtype=dtype)
+    if poly_freq_torch.ndim == 1:
+        poly_freq_torch = poly_freq_torch.unsqueeze(0)
+    if poly_freq_torch.shape[0] not in (1, B):
+        raise ValueError(f"poly_freq shape incompatible with batch size {B}: {tuple(poly_freq_torch.shape)}")
+    if poly_freq_torch.shape[0] == 1 and B > 1:
+        poly_freq_torch = poly_freq_torch.expand(B, -1)
+
     coeffs = torch.cat([sig0, dsig, poly_freq_torch], dim=1)
     v_grid_batch = polyval_torch(coeffs, v_grid_idx)
 
-    total_profile = torch.zeros((B, N), device=device, dtype=torch.float64)
+    N = v_grid_idx.shape[0]
+    total_profile = torch.zeros((B, N), device=device, dtype=dtype)
 
-    C  = torch.tensor(2.99792458e10, dtype=torch.float64, device=device)
-    NA = torch.tensor(6.02214129e23, dtype=torch.float64, device=device)
-    KB = torch.tensor(1.380649e-16, dtype=torch.float64, device=device)
-    P0 = torch.tensor(1013.25, dtype=torch.float64, device=device)
-    T0 = torch.tensor(273.15, dtype=torch.float64, device=device)
-    L0 = torch.tensor(2.6867773e19, dtype=torch.float64, device=device)
-    TREF = torch.tensor(296.0, dtype=torch.float64, device=device)
+    const = _get_phys_constants(device, dtype)
+    C, NA, KB = const["C"], const["NA"], const["KB"]
+    P0, T0, L0, TREF = const["P0"], const["T0"], const["L0"], const["TREF"]
 
-    for mol, trans in transitions_dict.items():
-        tensors = transitions_to_tensors(trans, device)
-        amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf = [t.to(dtype=torch.float64).view(1, -1, 1) for t in tensors]
-        mf   = mf_dict[mol].to(dtype=torch.float64).view(B, 1, 1)
-        Mmol = torch.tensor(MOLECULE_PARAMS[mol]['M'], dtype=torch.float64, device=device)
-        PL   = torch.tensor(MOLECULE_PARAMS[mol]['PL'], dtype=torch.float64, device=device)
-        T_exp, P_exp, v_grid_exp = T.view(B, 1, 1), P.view(B, 1, 1), v_grid_batch.view(B, 1, N)
-        x = v_grid_exp - center
-        sigma_HWHM = (center / C) * torch.sqrt(2 * NA * KB * T_exp * math.log(2.) / Mmol)
+    transitions_cache = _prepare_transitions_cache(transitions_dict, device, dtype)
+
+    missing_mf = set(transitions_cache.keys()) - set(mf_dict.keys())
+    if missing_mf:
+        raise KeyError(f"mf_dict missing mixing ratios for molecules: {sorted(missing_mf)}")
+
+    T_exp = T.view(B, 1, 1)
+    P_exp = P.view(B, 1, 1)
+    v_grid_exp = v_grid_batch.view(B, 1, N)
+
+    for mol, tensors in transitions_cache.items():
+        amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf = tensors
+        mf_val = mf_dict[mol]
+        if isinstance(mf_val, torch.Tensor):
+            mf_tensor = mf_val.to(device=device, dtype=dtype)
+        else:
+            mf_tensor = torch.as_tensor(mf_val, device=device, dtype=dtype)
+        if mf_tensor.ndim == 0:
+            mf_tensor = mf_tensor.reshape(1).expand(B)
+        elif mf_tensor.numel() == 1 and B > 1:
+            mf_tensor = mf_tensor.reshape(1).expand(B)
+        elif mf_tensor.numel() != B:
+            raise ValueError(f"mf_dict[{mol!r}] has incompatible shape {tuple(mf_tensor.shape)} for batch size {B}")
+        mf = mf_tensor.reshape(B, 1, 1)
+
+        Mmol, PL = _get_molecule_constants(mol, device, dtype)
+        sigma_HWHM = (center / C) * torch.sqrt(2 * NA * KB * T_exp * math.log(2.0) / Mmol)
         gamma = P_exp / P0 * (TREF / T_exp) ** na * (ga * (1 - mf) + gs * mf)
-        real_prof, imag_prof = pine_profile_torch_complex(x, sigma_HWHM, gamma, gd, device=device)
+        real_prof, imag_prof = pine_profile_torch_complex(v_grid_exp - center, sigma_HWHM, gamma, gd, device=device)
         profile = apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T_exp)
-        band = profile * amp * PL * 100 * mf * L0 * P_exp / P0 * T0 / T_exp
+        band = profile * amp * PL * 100.0 * mf * L0 * P_exp / P0 * T0 / T_exp
         total_profile += band.sum(dim=1)
 
     transmission = torch.exp(-total_profile)
 
-    # Baseline poly (monômes 1, x, x^2 sur l'index — cohérent avec les ranges)
-    x_bl = torch.arange(N, device=device, dtype=torch.float64)
-    powers_bl = torch.arange(baseline_coeffs.shape[1], device=device, dtype=torch.float64)
-    baseline = torch.sum(baseline_coeffs.unsqueeze(2) * x_bl.unsqueeze(0).pow(powers_bl.view(1, -1, 1)), dim=1)
+    basis = _get_baseline_support(N, baseline_coeffs.shape[1], device, dtype)
+    baseline = baseline_coeffs @ basis
 
     return transmission * baseline, v_grid_batch
 
