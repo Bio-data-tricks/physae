@@ -1,56 +1,67 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-import math, random, sys
-from typing import Optional, List, Dict
-
+import os, json, argparse, math, random, sys
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any, Tuple
+import optuna 
+from optuna.samplers import TPESampler
 import numpy as np
 import torch
+torch.set_float32_matmul_precision("high")   
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
-from pytorch_lightning.callbacks import Callback
-import matplotlib.pyplot as plt
-from IPython.display import display, update_display
-
-# --- Matplotlib: polices compatibles emoji (Windows) ---
 import matplotlib as mpl
-try:
-    mpl.rcParams['font.family'] = ['DejaVu Sans', 'Segoe UI Emoji', 'Segoe UI Symbol']
-    mpl.rcParams['axes.unicode_minus'] = False
-except Exception:
-    pass
-
-
-# ============================================================
-# 1) Configs globaux & normalisation
+mpl.use("Agg")  # backend non interactif pour cluster/headless
+mpl.rcParams['font.family'] = ['DejaVu Sans', 'Segoe UI Emoji', 'Segoe UI Symbol']
+mpl.rcParams['axes.unicode_minus'] = False
+import matplotlib.pyplot as plt
+import torch
+import argparse, os, csv, math, json, random, numpy as np, torch, pytorch_lightning as pl
+import optuna
+from optuna.storages.journal import JournalFileBackend
+from optuna.storages import JournalStorage
+# ===========================================================
+# 1) Configs globaux & normalisation (section "core")
 # ============================================================
 PARAMS = ['sig0', 'dsig', 'mf_CH4', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
 PARAM_TO_IDX = {n:i for i,n in enumerate(PARAMS)}
 LOG_SCALE_PARAMS = {'mf_CH4'}
 LOG_FLOOR = 1e-7
-NORM_PARAMS: Dict[str, tuple] = {}
+NORM_PARAMS: Dict[str, tuple] = {}  # rempli par le builder
 
 def norm_param_value(name: str, val: float):
-    vmin, vmax = NORM_PARAMS[name]
-    if name in LOG_SCALE_PARAMS:
-        vmin = max(vmin, LOG_FLOOR); vmax = max(vmax, vmin*(1+1e-12)); val = max(val, LOG_FLOOR)
-        lv, lmin, lmax = math.log10(val), math.log10(vmin), math.log10(vmax)
-        return (lv - lmin) / (lmax - lmin)
-    else:
-        return (val - vmin) / (vmax - vmin)
+     vmin, vmax = NORM_PARAMS[name]
+     if name in LOG_SCALE_PARAMS:
+         vmin = max(vmin, LOG_FLOOR); vmax = max(vmax, vmin*(1+1e-12)); val = max(val, LOG_FLOOR)
+         lv, lmin, lmax = math.log10(val), math.log10(vmin), math.log10(vmax)
+         return (lv - lmin) / (lmax - lmin)
+     else:
+        # Sécurité: éviter division par zéro si vmax == vmin
+        # Utilise la plus petite valeur positive représentable en float64 (~2e-308) comme plancher.
+        denom = max(vmax - vmin, sys.float_info.epsilon)
+        return (val - vmin) / denom
 
 def norm_param_torch(name: str, val_t: torch.Tensor) -> torch.Tensor:
-    vmin, vmax = NORM_PARAMS[name]
-    vmin_t = torch.as_tensor(vmin, dtype=val_t.dtype, device=val_t.device)
-    vmax_t = torch.as_tensor(vmax, dtype=val_t.dtype, device=val_t.device)
-    if name in LOG_SCALE_PARAMS:
-        vmin_t = torch.clamp(vmin_t, min=LOG_FLOOR)
-        vmax_t = torch.maximum(vmax_t, vmin_t*(1+torch.finfo(val_t.dtype).eps))
-        val_t  = torch.clamp(val_t,  min=LOG_FLOOR)
-        lval   = torch.log10(val_t); lmin = torch.log10(vmin_t); lmax = torch.log10(vmax_t)
-        return (lval - lmin) / (lmax - lmin)
-    else:
-        return (val_t - vmin_t) / (vmax_t - vmin_t)
+     vmin, vmax = NORM_PARAMS[name]
+     vmin_t = torch.as_tensor(vmin, dtype=val_t.dtype, device=val_t.device)
+     vmax_t = torch.as_tensor(vmax, dtype=val_t.dtype, device=val_t.device)
+     if name in LOG_SCALE_PARAMS:
+         vmin_t = torch.clamp(vmin_t, min=LOG_FLOOR)
+         vmax_t = torch.maximum(vmax_t, vmin_t*(1+torch.finfo(val_t.dtype).eps))
+         val_t  = torch.clamp(val_t,  min=LOG_FLOOR)
+         lval   = torch.log10(val_t); lmin = torch.log10(vmin_t); lmax = torch.log10(vmax_t)
+         return (lval - lmin) / (lmax - lmin)
+     else:
+        # Sécurité: clamp du dénominateur (respecte le dtype: float32 ou float64)
+        denom = (vmax_t - vmin_t).clamp_min(torch.finfo(val_t.dtype).eps)
+        return (val_t - vmin_t) / denom
 
 def unnorm_param_torch(name: str, val_norm_t: torch.Tensor) -> torch.Tensor:
     vmin, vmax = NORM_PARAMS[name]
@@ -65,157 +76,101 @@ def unnorm_param_torch(name: str, val_norm_t: torch.Tensor) -> torch.Tensor:
     else:
         return val_norm_t*(vmax_t-vmin_t)+vmin_t
 
-import math, torch, torch.nn.functional as F
+# === NEW ===
+from functools import lru_cache
 
-def _gauss1d(sigma, device, dtype):
-    r = max(1, int(math.ceil(3*sigma)))
-    x = torch.arange(-r, r+1, device=device, dtype=dtype)
-    k = torch.exp(-0.5*(x/sigma)**2); k /= k.sum().clamp_min(1e-12)
-    return k.view(1,1,-1), r
-
-def scale_first_window(y: torch.Tensor, win: int = 20, sigma: float = 4.0):
-    # y: [N] or [B,N] -> returns [B]
-    if y.ndim == 1:
-        y = y.unsqueeze(0)
-    k, r = _gauss1d(sigma, y.device, y.dtype)
-    ys = F.conv1d(F.pad(y[:, None, :], (r, r), mode="reflect"), k).squeeze(1)
-    m = min(int(win), ys.size(1))
-    s = ys[:, :m].amax(dim=1)              # [B]
-    return s                                # <-- ALWAYS 1-D
-
-
-
-# ---------- LOWESS (valeur lissée au début du spectre) ----------
-def _lowess_start_one(y1d: torch.Tensor, frac: float = 0.08, iters: int = 2) -> torch.Tensor:
+def preprocess_transitions(transitions_dict: Dict[str, list],
+                           device: torch.device | str = "cpu",
+                           dtype: torch.dtype = torch.float64) -> Dict[str, Dict[str, torch.Tensor]]:
     """
-    Renvoie la valeur LOWESS lissée au tout début (x=0) d'un spectre 1D.
-    - y1d : Tensor [N]
-    - frac : fraction de points utilisée au début (fenêtre)
-    - iters : itérations robustes (bisquare)
+    Convertit une fois pour toutes les transitions par molécule en tenseurs.
+    Retourne, pour chaque molécule, un dict {field: tensor [L]}.
     """
-    assert y1d.ndim == 1
-    N = y1d.numel()
-    wN = max(5, int(frac * N))
-    if wN <= 2:
-        return y1d[0].to(torch.float64)
+    KEYS = ['amplitude', 'center', 'gamma_air', 'gamma_self', 'n_air',
+            'shift_air', 'gDicke', 'nDicke', 'lmf', 'nlmf']
+    out: Dict[str, Dict[str, torch.Tensor]] = {}
+    for mol, trans in transitions_dict.items():
+        # trans est une liste de dicts (comme retourné par parse_csv_transitions)
+        arr = {k: torch.tensor([t[k] for t in trans], device=device, dtype=dtype) for k in KEYS}
+        out[mol] = arr
+    return out
 
-    dev = y1d.device
-    y = y1d[:wN].to(torch.float64)
-    x = torch.arange(wN, device=dev, dtype=torch.float64)
-    x = x / x[-1]  # [0..1]
-
-    # Tri-cube en distance à 0
-    d = x  # distance depuis 0
-    w = (1 - d.pow(3)).clamp(min=0).pow(3)
-
-    # Design linéaire : y ~ a + b*x
-    X = torch.stack([torch.ones_like(x), x], dim=1)  # [wN, 2]
-
-    def _solve_wls(X, y, w):
-        WX = X * w.unsqueeze(1)
-        XtWX = X.T @ WX
-        XtWy = WX.T @ y
-        beta = torch.linalg.pinv(XtWX) @ XtWy
-        return beta
-
-    beta = _solve_wls(X, y, w)
-
-    # Repondération robuste (bisquare) sur résidus
-    for _ in range(max(0, iters-1)):
-        r = y - (X @ beta)
-        s = torch.median(torch.abs(r)) + 1e-12
-        u = (r / (6*s)).clamp(min=-1, max=1)
-        w_rob = (1 - u.pow(2)).clamp(min=0).pow(2)
-        w_all = w * w_rob
-        beta = _solve_wls(X, y, w_all + 1e-12)
-
-    # valeur lissée en x=0 = intercept
-    a0 = beta[0]
-    return a0
-
-def lowess_start_value(y: torch.Tensor, frac: float = 0.08, iters: int = 2) -> torch.Tensor:
+@lru_cache(maxsize=None)
+def _physics_constants(device: str, dtype_name: str):
     """
-    y : [N] ou [B, N] => renvoie un scalaire (ou [B]) avec la valeur LOWESS lissée en début de spectre.
+    Mise en cache des constantes physiques par (device, dtype).
     """
-    if y.ndim == 1:
-        return _lowess_start_one(y, frac=frac, iters=iters).to(y.dtype)
-    elif y.ndim == 2:
-        vals = [ _lowess_start_one(y[i], frac=frac, iters=iters) for i in range(y.shape[0]) ]
-        return torch.stack(vals).to(y.dtype)
-    else:
-        raise ValueError("lowess_start_value attend un tensor 1D ou 2D.")
+    d = getattr(torch, dtype_name)
+    dev = torch.device(device)
+    C  = torch.tensor(2.99792458e10, dtype=d, device=dev)
+    NA = torch.tensor(6.02214129e23, dtype=d, device=dev)
+    KB = torch.tensor(1.380649e-16, dtype=d, device=dev)
+    P0 = torch.tensor(1013.25, dtype=d, device=dev)
+    T0 = torch.tensor(273.15, dtype=d, device=dev)
+    L0 = torch.tensor(2.6867773e19, dtype=d, device=dev)
+    TREF = torch.tensor(296.0, dtype=d, device=dev)
+    tiny = torch.finfo(d).tiny
+    return C, NA, KB, P0, T0, L0, TREF, tiny
 
-# ---------- LOWESS local & max robuste ----------
-def _lowess_value_at(y1d: torch.Tensor, x0: float, frac: float = 0.08, iters: int = 2) -> torch.Tensor:
-    """
-    Estime y(x0) via une régression locale pondérée (LOWESS linéaire).
-    - y1d : [N]
-    - x0  : position (float, en indices 0..N-1)
-    - frac: fraction de points utilisés localement
-    """
-    assert y1d.ndim == 1
-    N = y1d.numel()
-    k = max(5, int(frac * N))
-    dev = y1d.device
-    dtype = torch.float64
+# petites constantes numériques en module-level (pas critique, mais ça évite de les recalc)
+ROOT_PI = math.sqrt(math.pi)
+RT2LN2 = math.sqrt(math.log(2.0))
 
-    x = torch.arange(N, device=dev, dtype=dtype)
-    y = y1d.to(dtype)
-
-    # k plus proches voisins autour de x0
-    dist = (x - x0).abs()
-    idx  = torch.topk(dist, k, largest=False).indices
-    xs   = x[idx]; ys = y[idx]
-    dmax = dist[idx].max().clamp_min(1e-12)
-
-    # Poids tri-cube sur la distance normalisée
-    u = (dist[idx] / dmax).clamp(max=1)
-    w = (1 - u.pow(3)).clamp(min=0).pow(3)
-
-    # Régression linéaire locale en (x - x0)
-    X = torch.stack([torch.ones_like(xs), (xs - x0)], dim=1)
-
-    def _solve_wls(X, y, w):
-        WX   = X * w.unsqueeze(1)
-        XtWX = X.T @ WX
-        XtWy = WX.T @ y
-        beta = torch.linalg.pinv(XtWX) @ XtWy
-        return beta
-
-    beta = _solve_wls(X, ys, w)
-
-    # Repondération robuste (bisquare) sur résidus
-    for _ in range(max(0, iters - 1)):
-        r = ys - (X @ beta)
-        s = torch.median(torch.abs(r)) + 1e-12
-        u = (r / (6*s)).clamp(min=-1, max=1)
-        w_rob = (1 - u.pow(2)).clamp(min=0).pow(2)
-        beta = _solve_wls(X, ys, w * w_rob + 1e-12)
-
-    # Valeur lissée en x0 = intercept
-    return beta[0].to(y1d.dtype)
-
-def lowess_max_value(y: torch.Tensor, frac: float = 0.08, iters: int = 2, n_eval: int = 64) -> torch.Tensor:
-    """
-    Estime le max du signal via LOWESS local évalué en `n_eval` abscisses.
-    - y : [N] ou [B,N]
-    """
-    def _one(y1d):
-        N = y1d.numel()
-        xs = torch.linspace(0, max(0, N-1), n_eval, device=y1d.device, dtype=torch.float32)
-        vals = torch.stack([_lowess_value_at(y1d, float(x0), frac=frac, iters=iters) for x0 in xs])
-        return vals.max()
-
-    if y.ndim == 1:
-        return _one(y).clamp_min(torch.tensor(1e-6, dtype=y.dtype, device=y.device)).to(y.dtype)
-    elif y.ndim == 2:
-        out = [ _one(y[i]) for i in range(y.shape[0]) ]
-        return torch.stack(out).to(y.dtype).clamp_min(torch.tensor(1e-6, dtype=y.dtype, device=y.device))
-    else:
-        raise ValueError("lowess_max_value attend un tensor 1D ou 2D.")
 
 # ============================================================
-# 2) Moteur physique & parsing
+# 1.b) Lissage et échelles d’entrée
+# ============================================================
+@torch.no_grad()
+def lowess_firstN_start_value(y: torch.Tensor, Nwin: int = 20, iters: int = 2) -> torch.Tensor:
+    """
+    Lisse par LOWESS sur les Nwin premiers points et renvoie la valeur lissée au tout début (x=0).
+    y : [N] ou [B,N] -> scalaire (ou [B])
+    """
+    def _one(y1d: torch.Tensor) -> torch.Tensor:
+        assert y1d.ndim == 1
+        N = y1d.numel()
+        k = max(5, min(int(Nwin), N))  # borne
+        if k <= 2:
+            return y1d[0].to(torch.float64)
+
+        dev = y1d.device
+        y = y1d[:k].to(torch.float64)
+        x = torch.arange(k, device=dev, dtype=torch.float64)
+        x = x / max(1.0, float(k-1))  # [0..1]
+
+        # poids tri-cube vs distance à 0
+        d = x
+        w = (1 - d.pow(3)).clamp(min=0).pow(3) + 1e-12
+
+        # régression linéaire locale y ~ a + b*x
+        X = torch.stack([torch.ones_like(x), x], dim=1)
+
+        def _solve_wls(X, y, w):
+            WX = X * w.unsqueeze(1)
+            XtWX = X.T @ WX + 1e-12 * torch.eye(2, dtype=torch.float64, device=dev)
+            XtWy = WX.T @ y
+            return torch.linalg.solve(XtWX, XtWy)
+
+        beta = _solve_wls(X, y, w)
+        for _ in range(max(0, iters - 1)):
+            r = y - (X @ beta)
+            s = torch.median(torch.abs(r)) + 1e-12
+            u = (r / (6*s)).clamp(min=-1, max=1)
+            w_rob = (1 - u.pow(2)).clamp(min=0).pow(2)
+            beta = _solve_wls(X, y, w * w_rob + 1e-12)
+
+        return beta[0]  # intercept = valeur en x=0
+
+    if y.ndim == 1:
+        return _one(y).to(y.dtype)
+    elif y.ndim == 2:
+        vals = [ _one(y[i]) for i in range(y.shape[0]) ]
+        return torch.stack(vals).to(y.dtype)
+    else:
+        raise ValueError("lowess_firstN_start_value attend un tensor 1D ou 2D.")
+
+# ============================================================
+# 2) Physique : parsing + forward multi-molécules
 # ============================================================
 def parse_csv_transitions(csv_str):
     transitions = []
@@ -239,99 +194,175 @@ def transitions_to_tensors(transitions, device):
 
 MOLECULE_PARAMS = {'CH4': {'M': 16.04, 'PL': 15.12}, 'H2O': {'M': 18.02, 'PL': 15.12}}
 
+# — Faddeeva (W(z)) approx —
 _b = torch.tensor([-0.0173-0.0463j, -0.7399+0.8395j, 5.8406+0.9536j, -5.5834-11.2086j], dtype=torch.cdouble)
 _b = torch.cat((_b, _b.conj()))
 _c = torch.tensor([2.2377-1.626j, 1.4652-1.7896j, 0.8393-1.892j, 0.2739-1.9418j], dtype=torch.cdouble)
 _c = torch.cat((_c, -_c.conj()))
+
 def wofz_torch(z: torch.Tensor) -> torch.Tensor:
+    """
+    Approximation rationnelle de W(z). Supporte cfloat/cdouble et batch arbitraire.
+    """
     inv_sqrt_pi = 1.0 / math.sqrt(math.pi)
-    _b_local = _b.to(device=z.device, dtype=z.dtype)
-    _c_local = _c.to(device=z.device, dtype=z.dtype)
-    w = (_b_local / (z.unsqueeze(-1) - _c_local)).sum(dim=-1)
-    w = w * (1j * inv_sqrt_pi)
+    # Assure dtype complexe
+    if z.dtype not in (torch.complex64, torch.complex128):
+        z = z.to(torch.complex128 if z.dtype == torch.float64 else torch.complex64)
+
+    b = _b.to(device=z.device, dtype=z.dtype)
+    c = _c.to(device=z.device, dtype=z.dtype)
+
+    z_expanded = z.unsqueeze(-1)  # [..., 1]
+    w = (b / (z_expanded - c)).sum(dim=-1) * (1j * inv_sqrt_pi)
+    # symétrie pour Im(z)<0
     mask = (z.imag < 0)
-    w_ref_all = torch.exp(-(z**2)) * 2.0 - w.conj()
-    w = torch.where(mask, w_ref_all, w)
-    return w
+    w_ref = torch.exp(-(z**2)) * 2.0 - w.conj()
+    return torch.where(mask, w_ref, w)
+
 
 def pine_profile_torch_complex(x, sigma_hwhm, gamma, gDicke, *, device='cpu'):
-    sigma = sigma_hwhm / math.sqrt(2*math.log(2.))
-    xh = math.sqrt(math.log(2.))*x/sigma_hwhm
-    yh = math.sqrt(math.log(2.))*gamma/sigma_hwhm
-    zD = math.sqrt(math.log(2.))*gDicke/sigma_hwhm
-    z = xh + 1j*(yh + zD)
-    k = -wofz_torch(z)
-    k_r, k_i = k.real, k.imag
-    denom = (1 - zD*math.sqrt(math.pi)*k_r)**2 + (zD*math.sqrt(math.pi)*k_i)**2
-    real = (k_r - zD*math.sqrt(math.pi)*(k_r**2 + k_i**2)) / denom
+    """
+    Retourne (réel, imag) du profil complex de Pine.
+    S’assure que les largeurs sont positifs et non-nuls.
+    """
+    # dtype commun (float64 conseillé en amont)
+    dtype = torch.promote_types(x.dtype, sigma_hwhm.dtype)
+    dtype = torch.promote_types(dtype, gamma.dtype)
+    x = x.to(device=device, dtype=dtype)
+    sigma_hwhm = sigma_hwhm.to(device=device, dtype=dtype).clamp_min(torch.finfo(dtype).tiny)
+    gamma = gamma.to(device=device, dtype=dtype).clamp_min(torch.finfo(dtype).tiny)
+    gDicke = gDicke.to(device=device, dtype=dtype).clamp_min(torch.finfo(dtype).tiny)
+
+    sigma = sigma_hwhm / math.sqrt(2*math.log(2.0))
+    rt2ln2 = math.sqrt(math.log(2.0))
+    xh = rt2ln2 * x / sigma_hwhm
+    yh = rt2ln2 * gamma / sigma_hwhm
+    zD = rt2ln2 * gDicke / sigma_hwhm
+
+    z = xh.to(torch.float64) + 1j*(yh.to(torch.float64) + zD.to(torch.float64))
+    k = -wofz_torch(z)  # complex64/128
+    k_r, k_i = k.real.to(dtype), k.imag.to(dtype)
+
+    root_pi = math.sqrt(math.pi)
+    denom = (1 - zD*root_pi*k_r)**2 + (zD*root_pi*k_i)**2
+    denom = denom.clamp_min(torch.finfo(dtype).tiny)
+
+    real = (k_r - zD*root_pi*(k_r**2 + k_i**2)) / denom
     imag = k_i / denom
-    factor = math.sqrt(math.log(2.) / math.pi) / sigma
+    factor = math.sqrt(math.log(2.0) / math.pi) / sigma
     return real * factor, imag * factor
 
-def apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T, TREF=296.): 
-    flm = lmf * ((T/TREF) ** nlmf)
+
+def apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T, TREF=296.0):
+    flm = lmf * ((T / TREF) ** nlmf)
     return real_prof + imag_prof * flm
 
-def polyval_torch(coeffs, x):
-    powers = torch.arange(coeffs.shape[1], device=coeffs.device, dtype=coeffs.dtype)
-    return torch.sum(coeffs.unsqueeze(2) * x.unsqueeze(0).pow(powers.view(1, -1, 1)), dim=1)
+
+def polyval_torch(coeffs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    coeffs: [B, K] avec a0,a1,...,a_{K-1}; x: [N] ou [B,N]
+    Renvoie [B,N]
+    """
+    if x.ndim == 1:
+        x = x.unsqueeze(0).expand(coeffs.size(0), -1)
+    B, K = coeffs.shape
+    N = x.shape[1]
+    powers = torch.arange(K, device=x.device, dtype=x.dtype)  # aligne le dtype
+    X = x.unsqueeze(1).pow(powers.view(-1, 1))  # [B,K,N]
+    return (coeffs.unsqueeze(2) * X).sum(dim=1)  # [B,N]
+
+
+def _is_preprocessed(transitions_dict: Dict[str, Any]) -> bool:
+    # Heuristique : si pour une mol, on a des tenseurs directement au lieu de listes de dicts
+    k = next(iter(transitions_dict))
+    return isinstance(next(iter(transitions_dict[k].values())), torch.Tensor)
 
 def batch_physics_forward_multimol_vgrid(
     sig0, dsig, poly_freq, v_grid_idx, baseline_coeffs,
     transitions_dict, P, T, mf_dict, device='cpu'
 ):
-    B, N = sig0.shape[0], v_grid_idx.shape[0]
-    v_grid_idx = v_grid_idx.to(device=device, dtype=torch.float64)
-    sig0, dsig, P, T = (
-        sig0.to(dtype=torch.float64).unsqueeze(1),
-        dsig.to(dtype=torch.float64).unsqueeze(1),
-        P.to(dtype=torch.float64).unsqueeze(1),
-        T.to(dtype=torch.float64).unsqueeze(1)
-    )
+    """
+    Compatible arrière :
+      - transitions_dict peut être soit la version brute (listes de dicts),
+        soit la version pré-tensorisée (dict de {field: tensor[L]}).
+    """
+    B = sig0.shape[0]
+    N = v_grid_idx.shape[0]
+    d64 = torch.float64
+
+    v_grid_idx = v_grid_idx.to(device=device, dtype=d64)
+    sig0 = sig0.to(device=device, dtype=d64).unsqueeze(1)
+    dsig = dsig.to(device=device, dtype=d64).unsqueeze(1)
+    P    = P.to(device=device, dtype=d64).unsqueeze(1)
+    T    = T.to(device=device, dtype=d64).unsqueeze(1)
+
     if baseline_coeffs.dim() == 1:
         baseline_coeffs = baseline_coeffs.unsqueeze(0)
-    baseline_coeffs = baseline_coeffs.to(dtype=torch.float64)
+    baseline_coeffs = baseline_coeffs.to(device=device, dtype=d64)
 
-    poly_freq_torch = torch.tensor(poly_freq, dtype=torch.float64, device=device).unsqueeze(0).expand(B, -1)
+    poly_freq_torch = torch.tensor(poly_freq, dtype=d64, device=device).unsqueeze(0).expand(B, -1)
     coeffs = torch.cat([sig0, dsig, poly_freq_torch], dim=1)
-    v_grid_batch = polyval_torch(coeffs, v_grid_idx)
+    v_grid_batch = polyval_torch(coeffs, v_grid_idx)  # [B,N]
 
-    total_profile = torch.zeros((B, N), device=device, dtype=torch.float64)
+    total_profile = torch.zeros((B, N), device=device, dtype=d64)
 
-    C  = torch.tensor(2.99792458e10, dtype=torch.float64, device=device)
-    NA = torch.tensor(6.02214129e23, dtype=torch.float64, device=device)
-    KB = torch.tensor(1.380649e-16, dtype=torch.float64, device=device)
-    P0 = torch.tensor(1013.25, dtype=torch.float64, device=device)
-    T0 = torch.tensor(273.15, dtype=torch.float64, device=device)
-    L0 = torch.tensor(2.6867773e19, dtype=torch.float64, device=device)
-    TREF = torch.tensor(296.0, dtype=torch.float64, device=device)
+    # constantes (mises en cache par device/dtype)
+    C, NA, KB, P0, T0, L0, TREF, tiny = _physics_constants(str(device), "float64")
 
     for mol, trans in transitions_dict.items():
-        tensors = transitions_to_tensors(trans, device)
-        amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf = [t.to(dtype=torch.float64).view(1, -1, 1) for t in tensors]
-        mf   = mf_dict[mol].to(dtype=torch.float64).view(B, 1, 1)
-        Mmol = torch.tensor(MOLECULE_PARAMS[mol]['M'], dtype=torch.float64, device=device)
-        PL   = torch.tensor(MOLECULE_PARAMS[mol]['PL'], dtype=torch.float64, device=device)
-        T_exp, P_exp, v_grid_exp = T.view(B, 1, 1), P.view(B, 1, 1), v_grid_batch.view(B, 1, N)
-        x = v_grid_exp - center
-        sigma_HWHM = (center / C) * torch.sqrt(2 * NA * KB * T_exp * math.log(2.) / Mmol)
-        gamma = P_exp / P0 * (TREF / T_exp) ** na * (ga * (1 - mf) + gs * mf)
+        if _is_preprocessed(transitions_dict):
+            amp   = trans['amplitude'].to(device=device, dtype=d64).view(1, -1, 1)
+            center= trans['center'].to(device=device, dtype=d64).view(1, -1, 1)
+            ga    = trans['gamma_air'].to(device=device, dtype=d64).view(1, -1, 1)
+            gs    = trans['gamma_self'].to(device=device, dtype=d64).view(1, -1, 1)
+            na    = trans['n_air'].to(device=device, dtype=d64).view(1, -1, 1)
+            sa    = trans['shift_air'].to(device=device, dtype=d64).view(1, -1, 1)
+            gd    = trans['gDicke'].to(device=device, dtype=d64).view(1, -1, 1)
+            nd    = trans['nDicke'].to(device=device, dtype=d64).view(1, -1, 1)
+            lmf   = trans['lmf'].to(device=device, dtype=d64).view(1, -1, 1)
+            nlmf  = trans['nlmf'].to(device=device, dtype=d64).view(1, -1, 1)
+        else:
+            # chemin “ancien” (pas pré-tensorisé)
+            amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf = [
+                torch.tensor([t[k] for t in trans], dtype=d64, device=device).view(1, -1, 1)
+                for k in ['amplitude', 'center', 'gamma_air', 'gamma_self', 'n_air',
+                          'shift_air', 'gDicke', 'nDicke', 'lmf', 'nlmf']
+            ]
+
+        mf = mf_dict[mol].to(device=device, dtype=d64).view(B, 1, 1)
+        Mmol = torch.tensor(MOLECULE_PARAMS[mol]['M'], dtype=d64, device=device)
+        PL   = torch.tensor(MOLECULE_PARAMS[mol]['PL'], dtype=d64, device=device)
+
+        T_exp = T.view(B, 1, 1); P_exp = P.view(B, 1, 1)
+        v_grid_exp = v_grid_batch.view(B, 1, N)
+
+        x = v_grid_exp - center  # [B,L,N]
+
+        sigma_HWHM = (center / C) * torch.sqrt((2 * NA * KB * T_exp * math.log(2.0)) / Mmol)
+        sigma_HWHM = sigma_HWHM.clamp_min(tiny)
+
+        gamma = (P_exp / P0) * (TREF / T_exp).pow(na) * (ga * (1 - mf) + gs * mf)
+        gamma = gamma.clamp_min(tiny)
+
         real_prof, imag_prof = pine_profile_torch_complex(x, sigma_HWHM, gamma, gd, device=device)
-        profile = apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T_exp)
-        band = profile * amp * PL * 100 * mf * L0 * P_exp / P0 * T0 / T_exp
-        total_profile += band.sum(dim=1)
+        profile = apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T_exp, TREF=TREF)
 
-    transmission = torch.exp(-total_profile)
+        band = profile * amp * PL * 100.0 * mf * L0 * (P_exp / P0) * (T0 / T_exp)
+        total_profile = total_profile + band.sum(dim=1)  # [B,N]
 
-    # Baseline poly (monômes 1, x, x^2 sur l'index — cohérent avec les ranges)
-    x_bl = torch.arange(N, device=device, dtype=torch.float64)
-    powers_bl = torch.arange(baseline_coeffs.shape[1], device=device, dtype=torch.float64)
-    baseline = torch.sum(baseline_coeffs.unsqueeze(2) * x_bl.unsqueeze(0).pow(powers_bl.view(1, -1, 1)), dim=1)
+    transmission = torch.exp(-total_profile).clamp_min(tiny)
 
-    return transmission * baseline, v_grid_batch
+    x_bl = torch.arange(N, device=device, dtype=d64)
+    powers_bl = torch.arange(baseline_coeffs.shape[1], device=device, dtype=d64)
+    Xbl = x_bl.unsqueeze(0).pow(powers_bl.view(-1, 1))  # [K,N]
+    baseline = (baseline_coeffs.unsqueeze(2) * Xbl.unsqueeze(0)).sum(dim=1).clamp_min(tiny)  # [B,N]
+
+    return (transmission * baseline), v_grid_batch
+
+
 
 # ============================================================
-# 3) Dataset & bruits
+# 3) Bruits & Utils
 # ============================================================
 def add_noise_variety(spectra, *, generator=None, **cfg):
     std_add_range     = cfg.get("std_add_range", (0.001, 0.01))
@@ -399,86 +430,25 @@ def add_noise_variety(spectra, *, generator=None, **cfg):
         out = torch.clamp(out, *clip)
     return out
 
-class SpectraDataset(Dataset):
-    def __init__(self, n_samples, num_points, poly_freq_CH4, transitions_dict,
-                 sample_ranges: Optional[dict] = None, strict_check: bool = True,
-                 with_noise: bool = True, noise_profile: Optional[dict] = None,
-                 freeze_noise: bool = False):
-        self.n_samples, self.num_points = n_samples, num_points
-        self.poly_freq_CH4, self.transitions_dict = poly_freq_CH4, transitions_dict
-        self.sample_ranges = sample_ranges if sample_ranges is not None else NORM_PARAMS
-        self.with_noise = bool(with_noise)
-        self.noise_profile = dict(noise_profile or {})
-        self.freeze_noise = bool(freeze_noise)
-        self.epoch = 0
-        if strict_check:
-            for k in PARAMS:
-                smin, smax = self.sample_ranges[k]
-                nmin, nmax = NORM_PARAMS[k]
-                if smin < nmin or smax > nmax:
-                    raise ValueError(
-                        f"sample_ranges['{k}']={self.sample_ranges[k]} sort de NORM_PARAMS[{k}]={NORM_PARAMS[k]}."
-                    )
-
-    def set_epoch(self, e: int):  self.epoch = int(e)
-
-    def _make_generator(self, idx: int) -> torch.Generator:
-        base = torch.initial_seed()
-        g = torch.Generator(device='cpu')
-        if self.freeze_noise:
-            seed = (123456789 + 97 * idx) % (2**63 - 1)
-        else:
-            seed = (base + 1_000_003 * self.epoch + 97 * idx) % (2**63 - 1)
-        g.manual_seed(seed)
-        return g
-
-    def __len__(self): return self.n_samples
-
-    def __getitem__(self, idx):
-        device, dtype = 'cpu', torch.float32
-        vals = [torch.empty(1, dtype=dtype).uniform_(*self.sample_ranges[k]) for k in PARAMS]
-        sig0, dsig, mf_CH4, b0, b1, b2, P, T = vals
-        baseline_coeffs = torch.cat([b0, b1, b2]).unsqueeze(0)
-        mf_dict = {'CH4': mf_CH4}
-        v_grid_idx = torch.arange(self.num_points, dtype=dtype, device=device)
-
-        params_norm = torch.tensor([norm_param_value(k, v.item()) for k, v in zip(PARAMS, vals)],
-                                   dtype=torch.float32)
-
-        spectra_clean, _ = batch_physics_forward_multimol_vgrid(
-            sig0, dsig, self.poly_freq_CH4, v_grid_idx,
-            baseline_coeffs, self.transitions_dict, P, T, mf_dict, device=device
-        )
-        spectra_clean = spectra_clean.to(torch.float32)
-
-        if self.with_noise:
-            g = self._make_generator(idx)
-            spectra_noisy = add_noise_variety(spectra_clean, generator=g, **self.noise_profile)
-        else:
-            spectra_noisy = spectra_clean
-
-        # --- ÉCHELLE POUR L'ENTRÉE (noisy) ---
-        #scale_noisy = scale_first_window(spectra_noisy).unsqueeze(1).clamp_min(1e-8)
-        scale_noisy = lowess_max_value(spectra_noisy).unsqueeze(1).clamp_min(1e-8)
-
-        noisy_spectra = spectra_noisy / scale_noisy   # normalisé pour l’encodeur
-
-        # --- MAX SIMPLE SUR LE CLEAN ---
-        max_clean = spectra_clean.amax(dim=1, keepdim=True).clamp_min(1e-8)
-        clean_spectra = spectra_clean / max_clean     # max(clean)=1
-
-        return {
-            'noisy_spectra': noisy_spectra[0].detach(),
-            'clean_spectra': clean_spectra[0].detach(),
-            'params': params_norm,
-            'scale': scale_noisy.squeeze(1).to(torch.float32)[0]
-        }
-
-
 
 # ============================================================
-# 4) Encodeur EfficientNet1D
+# 4) Encodeur EfficientNet1D (baseline, patchable)
 # ============================================================
+
+# ==== TÊTE MLP: helpers ====
+def _make_act(name: str):
+    name = (name or "gelu").lower()
+    if name == "relu": return nn.ReLU()
+    if name == "silu": return nn.SiLU()
+    if name == "tanh": return nn.Tanh()
+    return nn.GELU()  # défaut
+
+def _make_norm(name: str, dim: int):
+    name = (name or "layer").lower()
+    if name == "batch": return nn.BatchNorm1d(dim)
+    if name == "none":  return nn.Identity()
+    return nn.LayerNorm(dim)  # défaut
+
 
 class SiLU(nn.Module):
     def forward(self, x): return x * torch.sigmoid(x)
@@ -493,61 +463,164 @@ class SqueezeExcitation1D(nn.Module):
             nn.Conv1d(reduced_dim, in_channels, 1),
             nn.Sigmoid()
         )
-    def forward(self, x): return x * self.se(x)
+    def forward(self, x):
+        return self.se(x)
 
-class MBConvBlock1D(nn.Module):
-    def __init__(self, in_c, out_c, kernel, stride, expand_ratio, se_ratio=0.25):
+
+class MBConv1DBlock(nn.Module):
+    """
+    MBConv 1D avec SE optionnel appliqué
+    au chemin résiduel F(x) avant l'addition du skip.
+    """
+    def __init__(self, expand, depthwise, se, project, use_skip: bool):
         super().__init__()
-        self.use_residual = in_c == out_c and stride == 1
-        hidden_dim = in_c * expand_ratio
-        reduced_dim = max(1, int(in_c * se_ratio))
-        num_groups = 8
-        layers = []
-        if expand_ratio != 1:
-            layers.append(nn.Sequential(
-                nn.Conv1d(in_c, hidden_dim, 1, bias=False),
-                nn.GroupNorm(num_groups, hidden_dim),
-                SiLU()
-            ))
-        layers.extend([
-            nn.Sequential(
-                nn.Conv1d(hidden_dim, hidden_dim, kernel, stride,
-                          padding=kernel//2, groups=hidden_dim, bias=False),
-                nn.GroupNorm(num_groups, hidden_dim),
-                SiLU()
-            ),
-            SqueezeExcitation1D(hidden_dim, reduced_dim),
-            nn.Conv1d(hidden_dim, out_c, 1, bias=False),
-            nn.GroupNorm(max(1, out_c // num_groups), out_c)
-        ])
-        self.conv = nn.Sequential(*layers)
-    def forward(self, x): return x + self.conv(x) if self.use_residual else self.conv(x)
+        self.expand = expand
+        self.depthwise = depthwise
+        self.se = se
+        self.project = project
+        self.use_skip = use_skip
+
+    def forward(self, x):
+        identity = x
+        x = self.expand(x) if not isinstance(self.expand, nn.Identity) else x
+        x = self.depthwise(x)
+        if self.se is not None:
+            x = x * self.se(x)
+        x = self.project(x)
+        if self.use_skip:
+            x = x + identity
+        return x
 
 class EfficientNetEncoder(nn.Module):
-    def __init__(self, in_channels=1):
+    """
+    Encoder EfficientNet-like 1D avec GroupNorm robuste, SE.
+    Expose .feat_dim et renvoie (features, None) en forward.
+    """
+    def __init__(
+        self,
+        in_channels: int = 1,
+        width_mult: float = 1.0,
+        depth_mult: float = 1.0,
+        se_ratio: float = 0.25,
+        group_norm_groups: int = 16,
+        **kwargs,
+    ):
         super().__init__()
+        import math
+
+        self.in_channels = int(in_channels)
+        self.width_mult = float(width_mult)
+        self.depth_mult = float(depth_mult)
+        self.se_ratio = float(se_ratio)
+        self.group_norm_groups = int(group_norm_groups)
+
+        def round_filters(c):
+            c = int(c * self.width_mult)
+            return max(1, c)
+
+        def round_repeats(r):
+            from math import ceil
+            return max(1, int(ceil(r * self.depth_mult)))
+
+        def GN(channels: int) -> nn.GroupNorm:
+            ch = int(channels)
+            g = math.gcd(max(1, self.group_norm_groups), max(1, ch))
+            if g <= 0: g = 1
+            return nn.GroupNorm(g, ch)
+
+        # Stem
+        stem_out = round_filters(32)
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, 32, 3, 2, 1, bias=False),
-            nn.GroupNorm(8, 32),
-            SiLU()
+            nn.Conv1d(self.in_channels, stem_out, kernel_size=3, stride=2, padding=1, bias=False),
+            GN(stem_out),
+            nn.SiLU(inplace=True),
         )
-        self.block1 = MBConvBlock1D(32, 24, 3, 2, 1)
-        self.block2 = MBConvBlock1D(24, 40, 5, 2, 6)
-        self.block3 = MBConvBlock1D(40, 80, 3, 2, 6)
-        self.block4 = MBConvBlock1D(80, 112, 5, 1, 6)
-        self.block5 = MBConvBlock1D(112, 192, 5, 2, 6)
-        self.feat_dim = 192
+
+        # (expand, c_out, repeats, k, stride, se_ratio)
+        blocks_args = [
+            (1,  16, 1, 3, 1, self.se_ratio),
+            (6,  24, 2, 3, 2, self.se_ratio),
+            (6,  40, 2, 5, 2, self.se_ratio),
+            (6,  80, 3, 3, 2, self.se_ratio),
+            (6, 112, 3, 5, 1, self.se_ratio),
+            (6, 192, 4, 5, 2, self.se_ratio),
+            (6, 320, 1, 3, 1, self.se_ratio),
+        ]
+
+        layers = []
+        in_ch = stem_out
+        for (exp, c_out, repeats, k, s, se) in blocks_args:
+            c_out = round_filters(c_out)
+            repeats = round_repeats(repeats)
+            for i in range(repeats):
+                stride = s if i == 0 else 1
+                mid = round_filters(in_ch * exp)
+
+                # expand 1x1 (sauté si exp==1)
+                expand = nn.Sequential(
+                    nn.Conv1d(in_ch, mid, kernel_size=1, bias=False),
+                    GN(mid),
+                    nn.SiLU(inplace=True),
+                ) if exp != 1 else nn.Identity()
+
+                # depthwise
+                dw_in = mid if exp != 1 else in_ch
+                depthwise = nn.Sequential(
+                    nn.Conv1d(dw_in, dw_in, kernel_size=k, stride=stride, padding=k // 2,
+                              groups=dw_in, bias=False),
+                    GN(dw_in),
+                    nn.SiLU(inplace=True),
+                )
+
+                # SE
+                use_se = (se is not None) and (se > 0.0)
+                if use_se:
+                    se_in = dw_in
+                    se_hidden = max(1, int(se_in * se))
+                    se_block = SqueezeExcitation1D(se_in, se_hidden)
+                else:
+                    se_block = None
+
+                # project 1x1
+                project = nn.Sequential(
+                    nn.Conv1d(dw_in, c_out, kernel_size=1, bias=False),
+                    GN(c_out),
+                )
+
+                use_skip = (stride == 1 and in_ch == c_out)
+
+                layers.append(
+                    MBConv1DBlock(
+                        expand=expand,
+                        depthwise=depthwise,
+                        se=se_block,
+                        project=project,
+                        use_skip=use_skip,
+                    )
+                )
+                in_ch = c_out
+
+        self.blocks = nn.Sequential(*layers)
+
+        # Head
+        head_out = round_filters(1280)
+        self.head = nn.Sequential(
+            nn.Conv1d(in_ch, head_out, kernel_size=1, bias=False),
+            GN(head_out),
+            nn.SiLU(inplace=True),
+        )
+
+        self.feat_dim = head_out  # dimension des features canalisées
+
     def forward(self, x):
+        # x: [B, C=1, N]
         x = self.stem(x)
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.block5(x)
+        x = self.blocks(x)
+        x = self.head(x)
         return x, None
 
 # ============================================================
-# 5) ReLoBRaLo
+# 5) ReLoBRaLo pour pondérer dynamiquement
 # ============================================================
 class ReLoBRaLoLoss:
     def __init__(self, loss_names, alpha=0.9, tau=1.0, history_len=10):
@@ -578,246 +651,286 @@ class ReLoBRaLoLoss:
         return self.weights.to(current_losses.device)
 
 # ============================================================
-# 6) Raffineur type EfficientNet (identique au backbone)
+# 6) Raffineur EfficientNet (identique au backbone)
 # ============================================================
 class EfficientNetRefiner(nn.Module):
-    def __init__(self, m_params: int, cond_dim: int, backbone_feat_dim: int,
-                 delta_scale: float = 0.1):
+
+    """
+    Raffineur qui prend (noisy, resid, params_pred_norm, cond_norm, feat_shared)
+    et renvoie un delta normalisé de taille [B, m_params].
+    Le cœur est un petit EfficientNetEncoder sur 2 canaux (noisy & resid),
+    puis concat avec les features du backbone, la condition FiLM et la prédiction courante.
+    """
+
+    def __init__(
+        self,
+        m_params: int,
+        cond_dim: int,
+        backbone_feat_dim: int,
+        delta_scale: float = 0.1,
+        enc_kwargs: Optional[dict] = None,
+    ):
         super().__init__()
+        enc_kwargs = dict(enc_kwargs or {})
         self.delta_scale = float(delta_scale)
         self.m_params = int(m_params)
         self.cond_dim = int(cond_dim)
+        self.backbone_feat_dim = int(backbone_feat_dim)
         self.use_film = True
 
-        self.encoder = EfficientNetEncoder(in_channels=2)
-        self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
-        D = self.encoder.feat_dim
-        H = max(64, D // 2)
+        # encodeur 1D sur (noisy,resid)
+        self.enc = EfficientNetEncoder(in_channels=2, **enc_kwargs)
 
-        self.shared_head = nn.Sequential(
-            nn.Linear(D, H), nn.LayerNorm(H), nn.GELU(),
-            nn.Linear(H, H), nn.LayerNorm(H), nn.GELU(),
+        # tête MLP sur le vecteur concaténé
+        in_vec = self.enc.feat_dim + self.backbone_feat_dim + self.m_params + self.cond_dim
+        hidden = max(128, in_vec // 2)
+        self.head = nn.Sequential(
+            nn.Linear(in_vec, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, self.m_params),
         )
 
-        self.film = (nn.Sequential(nn.Linear(self.cond_dim, H), nn.Tanh(), nn.Linear(H, 2*H))
-                     if self.cond_dim > 0 else None)
+    def forward(self, noisy: torch.Tensor, resid: torch.Tensor,
+                params_pred_norm: torch.Tensor,
+                cond_norm: Optional[torch.Tensor],
+                feat_shared: torch.Tensor) -> torch.Tensor:
+        """
+        noisy/resid: [B, N]
+        params_pred_norm: [B, m_params]
+        cond_norm: [B, cond_dim] ou None
+        feat_shared: [B, backbone_feat_dim]
+        """
+        # encoder (noisy, resid)
+        x = torch.stack([noisy, resid], dim=1)        # [B,2,N]
+        feat_map, _ = self.enc(x)                     # [B, C', N']
+        pooled = F.adaptive_avg_pool1d(feat_map, 1).squeeze(-1)  # [B, C']
 
-        # ---- (d) Échelles de pas par paramètre ----
-        # Porte par paramètre (dans (0,1) via sigmoid) → borne locale de l’amplitude
-        self.scale_gate = nn.Linear(H, m_params)
+        pieces = [pooled, feat_shared, params_pred_norm]
+        if cond_norm is not None and self.cond_dim > 0:
+            pieces.append(cond_norm)
+        h = torch.cat(pieces, dim=1)                  # [B, in_vec]
 
-        # Head delta standard (pré-activation tanh)
-        self.delta_head = nn.Sequential(
-            nn.Linear(H + backbone_feat_dim + m_params, H),
-            nn.LayerNorm(H), nn.GELU(),
-            nn.Linear(H, m_params)
-        )
-
-    def forward(self, noisy, resid, params_pred_norm, cond_norm, feat_shared):
-        x = torch.stack([noisy, resid], dim=1)  # [B, 2, N]
-        latent, _ = self.encoder(x)
-        feat = self.feature_head(latent)
-        h = self.shared_head(feat)
-
-        if self.film is not None and cond_norm is not None and self.use_film:
-            gb = self.film(cond_norm)        # [B, 2H]
-            Hh = h.shape[1]
-            gamma, beta = gb[:, :Hh], gb[:, Hh:]
-            h = h * (1 + 0.1*gamma) + 0.1*beta
-
-        # ---- portes par paramètre (0..1) ----
-        gate = torch.sigmoid(self.scale_gate(h))           # [B, m_params]
-        scale = self.delta_scale * gate                    # borne max locale
-
-        # Contexte
-        z = torch.cat([h, feat_shared, params_pred_norm], dim=1)
-        raw = self.delta_head(z)                           # [B, m_params]
-
-        # Mise à jour bornée par tanh et modulée par 'scale'
-        delta = torch.tanh(raw) * scale
+        delta = torch.tanh(self.head(h)) * self.delta_scale
         return delta
 
 
+
+
 # ============================================================
-# 7) Modèle principal (+ Baseline Fix) + contrôles de STAGE & FiLM
+# 7) Modèle principal Lightning (Étape A/B générique)
 # ============================================================
 class PhysicallyInformedAE(pl.LightningModule):
-    def __init__(self, n_points: int, param_names: List[str], poly_freq_CH4, transitions_dict,
+    def __init__(self, 
+                 n_points: int, param_names: List[str], poly_freq_CH4, transitions_dict,
                  lr: float = 1e-4, alpha_param: float = 1.0, alpha_phys: float = 1.0,
                  head_mode: str = "multi", predict_params: Optional[List[str]] = None,
                  film_params: Optional[List[str]] = None,
                  refine_steps: int = 1, refine_delta_scale: float = 0.1, refine_target: str = "noisy",
-                 refine_warmup_epochs: int = 30, freeze_base_epochs: int = 20,
-                 base_lr: float = None, refiner_lr: float = None,
-                 stage3_lr_shrink: float = 0.33, stage3_refine_steps: Optional[int] = 2,
-                 stage3_delta_scale: Optional[float] = 0.08, stage3_alpha_phys: Optional[float] = 0.7,
-                 stage3_alpha_param: Optional[float] = 0.3,
-                 baseline_fix_enable: bool = False, baseline_fix_sideband: int = 50,
-                 baseline_fix_degree: int = 2, baseline_fix_weight: float = 1.0,
-                 baseline_fix_in_warmup: bool = False,  recon_max1: bool = False,
-                 corr_mode: str = "savgol",           
-                 corr_savgol_win: int = 11,
-                 corr_savgol_poly: int = 3,
-                 weight_mf: float = 1.0):
-        
+                 refine_warmup_epochs: int = 30, freeze_base_epochs: int = 50,
+                 base_lr: float = None, refiner_lr: float = None, recon_max1: bool = True,
+                 corr_mode: str = "none",  corr_savgol_win: int = 15, corr_savgol_poly: int = 3,
+                 weight_mf: float = 1.0, gas: str = "CH4",
+                 width_mult: float = 1.0, depth_mult: float = 1.0,
+                 ref_width_mult: Optional[float] = None, ref_depth_mult: Optional[float] = None,
+                 se_ratio: float = 0.25, 
+                 group_norm_groups: int = 8,
+                 head_hidden_mult: float = 0.5,
+                 head_hidden_min: int = 128,
+                 head_layers: int = 2,
+                 head_dropout: float = 0.0,
+                 head_activation: str = "gelu",
+                 head_norm: str = "layer"):
+
         super().__init__()
         self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4"])
-        self.param_names = list(param_names); self.n_params = len(self.param_names)
-        self.n_points = n_points
+        self.param_names = list(param_names)
+        self.n_params = len(self.param_names)
+        self.n_points = int(n_points)
         self.poly_freq_CH4 = poly_freq_CH4
         self.transitions_dict = transitions_dict
+        self.gas = gas.upper()
 
+        # pertes
         self.lr = float(lr)
-        self.alpha_param = float(alpha_param); self.alpha_phys = float(alpha_phys)
-        self.refine_steps = int(refine_steps)
-        self.refine_target = refine_target.lower(); assert self.refine_target in {"noisy","clean"}
-
-        self.refine_warmup_epochs = int(refine_warmup_epochs)
-        self.freeze_base_epochs   = int(freeze_base_epochs)
-        self.base_lr    = float(base_lr) if base_lr is not None else self.lr
-        self.refiner_lr = float(refiner_lr) if refiner_lr is not None else self.lr
-        self._froze_base = False
-
-        self.stage3_lr_shrink   = float(stage3_lr_shrink)
-        self.stage3_refine_steps= stage3_refine_steps
-        self.stage3_delta_scale = stage3_delta_scale
-        self.stage3_alpha_phys  = stage3_alpha_phys
-        self.stage3_alpha_param = stage3_alpha_param
-
-        self.baseline_fix_enable   = bool(baseline_fix_enable)
-        self.baseline_fix_sideband = int(baseline_fix_sideband)
-        self.baseline_fix_degree   = int(baseline_fix_degree)
-        self.baseline_fix_weight   = float(baseline_fix_weight)
-        self.baseline_fix_in_warmup = bool(baseline_fix_in_warmup)
-
+        self.base_lr = float(base_lr) if base_lr is not None else float(lr)
+        self.refiner_lr = float(refiner_lr) if refiner_lr is not None else float(lr)
+        self.alpha_param = float(alpha_param)
+        self.alpha_phys = float(alpha_phys)
         self.weight_mf = float(weight_mf)
 
-        self.corr_mode = str(corr_mode).lower()   # "savgol" by default
+        # corr/derivative
+        self.corr_mode = str(corr_mode).lower()
         self.corr_savgol_win = int(corr_savgol_win)
         self.corr_savgol_poly = int(corr_savgol_poly)
 
+        # FiLM
         if predict_params is None:
             predict_params = self.param_names
-        self.predict_params  = list(predict_params)
+        self.predict_params = list(predict_params)
         self.provided_params = [p for p in self.param_names if p not in self.predict_params]
-        unknown = set(self.predict_params) - set(self.param_names)
-        assert not unknown, f"Paramètres inconnus: {unknown}"
-        assert len(self.predict_params) >= 1
+        self.name_to_idx = {n: i for i, n in enumerate(self.param_names)}
+
+        # après self.predict_params etc.
+        self.relobralo_params = ReLoBRaLoLoss(
+            loss_names=self.predict_params,  # même ordre que per_param
+            alpha=0.9,        # lissage EMA
+            tau=1.0,          # température softmax
+            history_len=10,   # fenêtres d’historique
+        )
+
 
         if film_params is None:
             self.film_params = list(self.provided_params)
         else:
             self.film_params = list(film_params)
-        bad = set(self.film_params) - set(self.param_names)
-        assert not bad, f"film_params inconnus: {bad}"
-        not_provided = set(self.film_params) - set(self.provided_params)
-        assert not not_provided, f"film_params doit ⊆ provided_params; conflits: {not_provided}"
 
-        self.name_to_idx = {n:i for i,n in enumerate(self.param_names)}
-        self.predict_idx = [self.name_to_idx[p] for p in self.predict_params]
-        self.provided_idx= [self.name_to_idx[p] for p in self.provided_params]
-
-        self.backbone = EfficientNetEncoder(in_channels=1)
-        self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
-        feat_dim = self.backbone.feat_dim; hidden = feat_dim // 2
-
-        self.shared_head = nn.Sequential(
-            nn.Linear(feat_dim, hidden),
-            nn.LayerNorm(hidden), nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden), nn.GELU(),
+        # ----- backbone EfficientNet-1D (noisy -> features)
+        self.backbone = EfficientNetEncoder(
+            in_channels=1,
+            width_mult=width_mult,
+            depth_mult=depth_mult,
+            se_ratio=se_ratio,
+            group_norm_groups=group_norm_groups,
         )
+        self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
+        feat_dim = self.backbone.feat_dim
 
+        # ----- hyperparamètres de tête (avec défauts raisonnables) -----
+        def _hp(name, default):
+            return getattr(self.hparams, name, default)
+
+        head_mode        = str(_hp("head_mode", "multi")).lower()
+        head_hidden_mult = float(_hp("head_hidden_mult", 0.5))
+        head_hidden_min  = int(_hp("head_hidden_min", 128))
+        head_layers      = int(_hp("head_layers", 2))
+        head_dropout     = float(_hp("head_dropout", 0.0))
+        head_activation  = str(_hp("head_activation", "gelu"))
+        head_norm        = str(_hp("head_norm", "layer"))
+
+        H = max(head_hidden_min, int(round(feat_dim * head_hidden_mult)))
+        act = _make_act(head_activation)
+        def _norm(dim): 
+            return _make_norm(head_norm, dim)
+
+        # ----- shared MLP (profondeur variable) -----
+        blocks = [nn.Linear(feat_dim, H), _norm(H), act]
+        if head_dropout > 0: blocks.append(nn.Dropout(head_dropout))
+        for _ in range(max(0, head_layers - 1)):
+            blocks += [nn.Linear(H, H), _norm(H), act]
+            if head_dropout > 0: blocks.append(nn.Dropout(head_dropout))
+        self.shared_head = nn.Sequential(*blocks)
+
+        # ----- FiLM (recréée ici, avant toute utilisation) -----
         self.cond_dim = len(self.film_params)
-        if self.cond_dim > 0:
-            self.film = nn.Sequential(nn.Linear(self.cond_dim, hidden), nn.Tanh(), nn.Linear(hidden, 2*hidden))
-        else:
-            self.film = None
-
-        # ----- FiLM runtime switches -----
         self.use_film = True
         if self.cond_dim > 0:
+            self.film = nn.Sequential(
+                nn.Linear(self.cond_dim, H), nn.Tanh(), nn.Linear(H, 2 * H)
+            )
+            # masque activable/désactivable par set_film_subset
             self.register_buffer("film_mask", torch.ones(self.cond_dim))
         else:
+            self.film = None
             self.film_mask = None
 
-        self.head_mode = str(head_mode).lower(); assert self.head_mode in {"single","multi"}
+        # ----- sorties -----
+        self.head_mode = head_mode
         if self.head_mode == "single":
-            self.out_head = nn.Linear(hidden, len(self.predict_params))
+            self.out_head = nn.Linear(H, len(self.predict_params))
         else:
-            self.out_heads = nn.ModuleDict({p: nn.Linear(hidden, 1) for p in self.predict_params})
+            self.out_heads = nn.ModuleDict({p: nn.Linear(H, 1) for p in self.predict_params})
 
-        self.refiner = EfficientNetRefiner(
-            m_params=len(self.predict_params),
-            cond_dim=self.cond_dim,
-            backbone_feat_dim=self.backbone.feat_dim,
-            delta_scale=refine_delta_scale
-        )
-        self.loss_names_params = [f"param_{p}" for p in self.predict_params]
-        self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
-        self.loss_names_top = ["phys_mse", "phys_corr", "param_group"]
-        self.relo_top = ReLoBRaLoLoss(self.loss_names_top, alpha=0.9, tau=1.0, history_len=10)
 
-        # ----- Stage override (A/B1/B2) -----
+        # ----- raffineur EfficientNet-1D (noisy,resid -> delta params)
+        if int(refine_steps) <= 0:
+            # Étape A pure : pas de raffineur instancié 
+            self.refiner = None
+        else:
+            ref_wm = ref_width_mult if ref_width_mult is not None else width_mult
+            ref_dm = ref_depth_mult if ref_depth_mult is not None else depth_mult
+            enc_kwargs_ref = dict(
+                width_mult=ref_wm,
+                depth_mult=ref_dm,
+                se_ratio=se_ratio,
+                group_norm_groups=group_norm_groups,
+            )
+            self.refiner = EfficientNetRefiner(
+                m_params=len(self.predict_params),
+                cond_dim=self.cond_dim,
+                backbone_feat_dim=self.backbone.feat_dim,
+                delta_scale=refine_delta_scale,
+                enc_kwargs=enc_kwargs_ref,
+            )
+
+        # stages (A/B)
+        self.refine_steps = int(refine_steps)
+        self.refine_target = str(refine_target).lower()
+        self.refine_warmup_epochs = int(refine_warmup_epochs)
+        self.freeze_base_epochs = int(freeze_base_epochs)
+
+        # autres    
+        self.recon_max1 = bool(recon_max1)
+
+        # overrides stage
         self._override_stage: Optional[str] = None
         self._override_refine_steps: Optional[int] = None
         self._override_delta_scale: Optional[float] = None
 
-    # ==== FiLM runtime control ====
+
+    # ========= helpers / FiLM / stage control =========
     def set_film_usage(self, use: bool = True):
         self.use_film = bool(use)
-        if hasattr(self, "refiner") and hasattr(self.refiner, "use_film"):
-            self.refiner.use_film = self.use_film
+        if hasattr(self, "refiner"):
+            self.refiner.use_film = bool(use)
 
     def set_film_subset(self, names=None):
-        if self.cond_dim == 0 or self.film_mask is None: return
+        if self.cond_dim == 0 or self.film_mask is None:
+            return
         if names is None or names == "all":
-            mask = torch.ones(self.cond_dim, device=self.film_mask.device, dtype=self.film_mask.dtype)
+            mask = torch.ones(self.cond_dim, device=self.film_mask.device)
         else:
-            allowed = set(names)
-            mask = torch.zeros(self.cond_dim, device=self.film_mask.device, dtype=self.film_mask.dtype)
+            names = set(names)
+            mask = torch.zeros(self.cond_dim, device=self.film_mask.device)
             for i, n in enumerate(self.film_params):
-                if n in allowed: mask[i] = 1.0
+                if n in names:
+                    mask[i] = 1.0
         self.film_mask.copy_(mask)
 
-    # ==== Stage override ====
-    def set_stage_mode(self, mode: Optional[str], refine_steps: Optional[int]=None, delta_scale: Optional[float]=None):
-        """
-        mode: None / 'A' / 'B1' / 'B2'
-        """
+    def set_stage_mode(self, mode: Optional[str], refine_steps: Optional[int] = None, delta_scale: Optional[float] = None):
         if mode is not None:
-            mode = mode.upper(); assert mode in {'A','B1','B2'}
+            mode = mode.upper()
+            assert mode in {"A", "B1", "B2"}
         self._override_stage = mode
-        self._override_refine_steps = refine_steps
-        self._override_delta_scale = delta_scale
-        if delta_scale is not None:
-            self.refiner.delta_scale = float(delta_scale)
         if refine_steps is not None:
             self.refine_steps = int(refine_steps)
+        if delta_scale is not None and self.refiner is not None:
+            self.refiner.delta_scale = float(delta_scale)
 
-    # ---- utils tête ----
-    def _predict_params_from_features(self, feat: torch.Tensor, cond_norm: Optional[torch.Tensor]=None) -> torch.Tensor:
+    # ========= feature → params =========
+    def _predict_params_from_features(self, feat: torch.Tensor, cond_norm: Optional[torch.Tensor] = None) -> torch.Tensor:
         h = self.shared_head(feat)
         if self.film is not None and cond_norm is not None and self.use_film:
-            if self.film_mask is not None and self.film_mask.numel() == cond_norm.shape[1]:
-                cond_in = cond_norm * self.film_mask.unsqueeze(0)
-            else:
-                cond_in = cond_norm
-            gb = self.film(cond_in); H = h.shape[1]
+            cm = cond_norm if (self.film_mask is None or self.film_mask.numel() != cond_norm.shape[1]) \
+                 else cond_norm * self.film_mask.unsqueeze(0)
+            gb = self.film(cm)  # [B, 2H]
+            H = h.shape[1]
             gamma, beta = gb[:, :H], gb[:, H:]
-            h = h * (1 + 0.1*gamma) + 0.1*beta
+            h = h * (1 + 0.1 * gamma) + 0.1 * beta
         if self.head_mode == "single":
             y = self.out_head(h)
         else:
             y = torch.cat([self.out_heads[p](h) for p in self.predict_params], dim=1)
-        return torch.sigmoid(y).clamp(1e-4, 1-1e-4)
+        return torch.sigmoid(y).clamp(1e-4, 1 - 1e-4)
 
-    def encode(self, spectra: torch.Tensor, pooled: bool=True, detach: bool=False):
+    def encode(self, spectra: torch.Tensor, pooled: bool = True, detach: bool = False):
         latent, _ = self.backbone(spectra.unsqueeze(1))
         feat = self.feature_head(latent) if pooled else latent
         return feat.detach() if detach else feat
 
-    # ---- (dé)normalisation & physique ----
     def _denorm_params_subset(self, y_norm_subset: torch.Tensor, names: List[str]) -> torch.Tensor:
         cols = [unnorm_param_torch(n, y_norm_subset[:, i]) for i, n in enumerate(names)]
         return torch.stack(cols, dim=1)
@@ -825,213 +938,156 @@ class PhysicallyInformedAE(pl.LightningModule):
     def _compose_full_phys(self, pred_phys: torch.Tensor, provided_phys_tensor: torch.Tensor) -> torch.Tensor:
         B = pred_phys.shape[0]
         full = pred_phys.new_empty((B, self.n_params))
-        for j, idx in enumerate(self.predict_idx):  full[:, idx] = pred_phys[:, j]
-        for j, idx in enumerate(self.provided_idx): full[:, idx] = provided_phys_tensor[:, j]
+        for j, idx in enumerate([self.name_to_idx[p] for p in self.predict_params]):
+            full[:, idx] = pred_phys[:, j]
+        for j, idx in enumerate([self.name_to_idx[p] for p in self.provided_params]):
+            full[:, idx] = provided_phys_tensor[:, j]
         return full
 
-    def _physics_reconstruction(self, y_phys_full: torch.Tensor, device, scale: Optional[torch.Tensor]=None) -> torch.Tensor:
+    def _physics_reconstruction(self, y_phys_full: torch.Tensor, device, scale: Optional[torch.Tensor] = None):
         p = {k: y_phys_full[:, i] for i, k in enumerate(self.param_names)}
         v_grid_idx = torch.arange(self.n_points, dtype=torch.float64, device=device)
-        b0_idx = self.name_to_idx['baseline0']
-        baseline_coeffs = y_phys_full[:, b0_idx:b0_idx+3]
+
+        # --- CHANGEMENT ICI : indices explicites ---
+        bl_names = ['baseline0','baseline1','baseline2']
+        bl_cols  = [self.name_to_idx[n] for n in bl_names]
+        baseline_coeffs = y_phys_full[:, bl_cols]
+
         spectra, _ = batch_physics_forward_multimol_vgrid(
             p['sig0'], p['dsig'], self.poly_freq_CH4, v_grid_idx,
-            baseline_coeffs, self.transitions_dict, p['P'], p['T'], {'CH4': p['mf_CH4']}, device=device
+            baseline_coeffs, self.transitions_dict, p['P'], p['T'], {self.gas: p[f'mf_{self.gas}']}, device=device
         )
         spectra = spectra.to(torch.float32)
-
-        # Max simple sur le reconstruit
-        if getattr(self, "recon_max1", True):
+        if self.recon_max1:
             maxv = spectra.amax(dim=1, keepdim=True).clamp_min(1e-9)
             spectra = spectra / maxv
-
         return spectra
 
-    # ---- FiLM conditions ----
-    def _make_condition_from_norm(self, params_true_norm: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.cond_dim == 0: return None
-        cols = [params_true_norm[:, self.name_to_idx[n]].unsqueeze(1) for n in self.film_params]
-        return torch.cat(cols, dim=1)
 
-    def _make_condition_from_phys(self, provided_phys: dict, device, dtype=torch.float32) -> Optional[torch.Tensor]:
-        if self.cond_dim == 0: return None
-        missing = [n for n in self.film_params if n not in provided_phys]
-        if missing: raise ValueError(f"FiLM: manquants dans provided_phys: {missing}")
-        cols = []
-        for n in self.film_params:
-            v = provided_phys[n].to(device)
-            if v.ndim > 1: v = v.view(-1)
-            cols.append(norm_param_torch(n, v).unsqueeze(1))
-        return torch.cat(cols, dim=1).to(dtype)
-
-    # ---- Baseline-fix utils ----
-    def _fit_residual_baseline_poly(self, resid: torch.Tensor, degree: int, sideband: int) -> torch.Tensor:
-        B, N = resid.shape
-        device = resid.device; dtype = resid.dtype
-        degree = int(max(0, min(2, degree)))
-        sideband = int(max(1, min(N//2, sideband)))
-        mask = torch.zeros(N, dtype=torch.bool, device=device)
-        mask[:sideband] = True; mask[N - sideband:] = True
-        x = torch.arange(N, device=device, dtype=dtype)
-        Xcols = [torch.ones_like(x)]
-        if degree >= 1: Xcols.append(x)
-        if degree >= 2: Xcols.append(x * x)
-        X = torch.stack(Xcols, dim=1)
-        Xm = X[mask]
-        Y  = resid[:, mask]
-        XtX = Xm.T @ Xm
-        XtX_inv = torch.linalg.pinv(XtX)
-        XtY = Xm.T @ Y.T
-        coeffs = (XtX_inv @ XtY).T
-        return coeffs
-
-    def _apply_baseline_coeff_delta_in_norm(self, params_pred_norm: torch.Tensor,
-                                            coeffs_phys: torch.Tensor,
-                                            weight: float = 1.0) -> torch.Tensor:
-        if coeffs_phys is None: 
-            return params_pred_norm
-        name_to_predcol = {n: j for j, n in enumerate(self.predict_params)}
-        updated = params_pred_norm
-        for k in range(coeffs_phys.shape[1]):
-            pname = f"baseline{k}"
-            if pname not in name_to_predcol: continue
-            j = name_to_predcol[pname]
-            vmin, vmax = NORM_PARAMS[pname]
-            delta_norm = (-coeffs_phys[:, k]) / (vmax - vmin)  # signe cohérent avec resid = recon - target
-            updated[:, j] = torch.clamp(updated[:, j] + weight * delta_norm.to(updated.dtype), 1e-4, 1 - 1e-4)
-        return updated
-
-    def _maybe_baseline_fix(
-        self,
-        params_pred_norm: torch.Tensor,
-        noisy: torch.Tensor,
-        target_for_resid: torch.Tensor,
-        provided_phys_tensor: torch.Tensor,
-        scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if not self.baseline_fix_enable:
-            return params_pred_norm
-        # Reconstruction courante (même échelle que la cible)
-        pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
-        y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
-        recon = self._physics_reconstruction(y_phys_full, noisy.device, scale=scale)
-        resid = recon - target_for_resid
-
-        # Fit poly sur bandes latérales du résidu
-        coeffs = self._fit_residual_baseline_poly(
-            resid, degree=self.baseline_fix_degree, sideband=self.baseline_fix_sideband
-        )
-        # Applique delta sur baseline{k} prédits
-        params_new = self._apply_baseline_coeff_delta_in_norm(
-            params_pred_norm, coeffs, weight=self.baseline_fix_weight
-        )
-        return params_new
-
-    # ---- pertes ----
-    # ---------- Savitzky–Golay derivative (torch, no SciPy) ----------
+    # ========= Savitzky–Golay & corr =========
     def _savgol_coeffs(self, window_length: int, polyorder: int, deriv: int = 1, delta: float = 1.0,
                        device=None, dtype=torch.float64) -> torch.Tensor:
-        """
-        Returns 1D convolution coefficients (length W) to estimate the 'deriv' derivative
-        at the window center, for uniform sampling step 'delta'.
-        """
-        assert deriv >= 0
         W = int(window_length)
         P = int(polyorder)
-        if W % 2 == 0: W += 1                  # make odd
-        if W < 3: W = 3
-        if P >= W: P = W - 1
+        if W % 2 == 0: W += 1
+        W = max(3, W)
+        P = min(P, W - 1)
         m = (W - 1) // 2
-
         dev = device or self.device
-        x = torch.arange(-m, m + 1, device=dev, dtype=dtype)  # [-m..m], shape [W]
-        # Design matrix: A[i, j] = x_i^j, shape [W, P+1]
-        A = torch.stack([x**j for j in range(P + 1)], dim=1)  # [W, P+1]
-        pinv = torch.linalg.pinv(A)                            # [P+1, W]
-        # derivative at 0: d! * coefficient of x^d
-        coeff = math.factorial(deriv) * pinv[deriv, :] / (delta ** deriv)  # [W]
+        x = torch.arange(-m, m + 1, device=dev, dtype=dtype)
+        A = torch.stack([x ** j for j in range(P + 1)], dim=1)
+        pinv = torch.linalg.pinv(A)
+        coeff = math.factorial(deriv) * pinv[deriv, :] / (delta ** deriv)
         return coeff.to(dtype=torch.float32)
 
     def _savgol_deriv(self, y: torch.Tensor, window_length: int, polyorder: int, deriv: int = 1) -> torch.Tensor:
-        """
-        Apply SG derivative filter with 'reflect' padding. y: [B, N] -> [B, N]
-        """
         B, N = y.shape
-        # make parameters safe vs N
         W = int(window_length)
         if W % 2 == 0: W += 1
-        if W > N:
-            W = N if (N % 2 == 1) else (N - 1)
-        W = max(W, 3)
+        if W > N: W = N if N % 2 == 1 else (N - 1)
+        W = max(3, W)
         P = min(int(polyorder), W - 1)
-
-        coeff = self._savgol_coeffs(W, P, deriv=deriv, device=y.device, dtype=torch.float64)  # [W]
-        coeff = coeff.view(1, 1, -1)  # [out_ch, in_ch, W]
-
+        coeff = self._savgol_coeffs(W, P, deriv=deriv, device=y.device, dtype=torch.float64).view(1, 1, -1)
         pad = (W - 1) // 2
-        y1 = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect")  # [B,1,N+2*pad]
-        out = F.conv1d(y1, coeff).squeeze(1)                    # [B, N]
-        return out
+        y1 = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect")
+        return F.conv1d(y1, coeff).squeeze(1)
 
     def _dx(self, y: torch.Tensor) -> torch.Tensor:
-        """Central difference derivative, same length via interior points + pad endpoints."""
-        # interior: centered diff
-        d = 0.5 * (y[:, 2:] - y[:, :-2])  # [B, N-2]
-        # pad ends by replication to keep same length
-        left  = d[:, :1]
-        right = d[:, -1:]
-        return torch.cat([left, d, right], dim=1)
+        d = 0.5 * (y[:, 2:] - y[:, :-2])
+        return torch.cat([d[:, :1], d, d[:, -1:]], dim=1)
 
     def _pearson_corr_loss(self, y_hat: torch.Tensor, y: torch.Tensor,
-                           eps: float = 1e-8,
                            derivative: str | bool = False,
-                           savgol_win: int = 11,
-                           savgol_poly: int = 3) -> torch.Tensor:
-        """
-        Pearson correlation loss. If derivative:
-          - "none"/False : on raw signal
-          - True/"central": on central-diff derivative
-          - "savgol": on Savitzky–Golay derivative (window/poly configurable)
-        """
+                           savgol_win: int = 11, savgol_poly: int = 3, eps: float = 1e-8) -> torch.Tensor:
         mode = derivative
-        if isinstance(derivative, bool):
-            mode = "central" if derivative else "none"
+        if isinstance(mode, bool):
+            mode = "central" if mode else "none"
         mode = (mode or "none").lower()
-
         if mode == "central":
-            y_hat = self._dx(y_hat)
-            y     = self._dx(y)
-
+            y_hat = self._dx(y_hat); y = self._dx(y)
         elif mode in ("savgol", "sg", "savitzky_golay", "savitzky-golay"):
-            y_hat = self._savgol_deriv(y_hat, savgol_win, savgol_poly, deriv=1)
-            y     = self._savgol_deriv(y,     savgol_win, savgol_poly, deriv=1)
-        # else "none": raw
-
+            y_hat = self._savgol_deriv(y_hat, savgol_win, savgol_poly, 1)
+            y     = self._savgol_deriv(y,     savgol_win, savgol_poly, 1)
         y_hat = y_hat.float(); y = y.float()
-        y_hat_c = y_hat - y_hat.mean(dim=1, keepdim=True)
-        y_c     = y - y.mean(dim=1, keepdim=True)
-        num = (y_hat_c * y_c).sum(dim=1)
-        den = torch.sqrt((y_hat_c.pow(2).sum(dim=1) + eps) * (y_c.pow(2).sum(dim=1) + eps))
+        yhc = y_hat - y_hat.mean(dim=1, keepdim=True)
+        yc  = y - y.mean(dim=1, keepdim=True)
+        num = (yhc * yc).sum(dim=1)
+        den = torch.sqrt((yhc.pow(2).sum(dim=1) + eps) * (yc.pow(2).sum(dim=1) + eps))
         corr = num / den
         return (1.0 - corr).mean()
 
+    # ========= training / validation =========
+    def _common_step(self, batch, tag: str):
+        dev = self.device
 
-    # ---- training/validation step ----
-    def _common_step(self, batch, step_name: str):
-        noisy, clean, params_true_norm = batch['noisy_spectra'], batch['clean_spectra'], batch['params']
-        scale = batch.get('scale', None)
-        if scale is not None:
-            scale = scale.to(clean.device)
+        # --- 0) Déballage/placement sur device ---
+        params_phys = batch["params_phys"].to(dev, non_blocking=True)   # [B,8] physiques
+        params_true_norm = batch["params"].to(dev, non_blocking=True)   # [B,8] normalisés
+        baseline_coeffs = batch["baseline_coeffs"].to(dev, non_blocking=True)  # [B,3]
+        B = params_phys.size(0)
 
-        # FiLM condition (norm)
-        cond_norm = self._make_condition_from_norm(params_true_norm)
+        # mapping indices cohérent avec self.param_names
+        n2i = self.name_to_idx
+        sig0 = params_phys[:, n2i["sig0"]]
+        dsig = params_phys[:, n2i["dsig"]]
+        P    = params_phys[:, n2i["P"]]
+        T    = params_phys[:, n2i["T"]]
+        mf   = params_phys[:, n2i[f"mf_{self.gas}"]]
 
-        # Encode + prédiction initiale (normée)
+        # grille d'indices
+        N = int(batch["num_points"][0].item())
+        v_grid_idx = torch.arange(N, dtype=torch.float64, device=dev)
+
+        # --- 1) Physique "clean" (vectorisée GPU) ---
+        spectra_clean, _ = batch_physics_forward_multimol_vgrid(
+            sig0.to(torch.float64), dsig.to(torch.float64),
+            self.poly_freq_CH4, v_grid_idx,
+            baseline_coeffs.to(torch.float64),
+            self.transitions_dict, P.to(torch.float64), T.to(torch.float64),
+            {self.gas: mf.to(torch.float64)}, device=dev
+        )
+        spectra_clean = spectra_clean.to(torch.float32)
+
+        # --- 2) Bruit (GPU) ---
+        if tag == "train":
+            with_noise = getattr(self, "with_noise_train", True)
+            noise_profile = getattr(self, "train_noise_profile", {})
+        else:
+            with_noise = getattr(self, "with_noise_val", False)
+            noise_profile = getattr(self, "val_noise_profile", {})
+
+        if with_noise:
+            # bruit *indépendant par sample* (générateur par ligne)
+            seeds = batch["noise_seed"].tolist()
+            noisy_list = []
+            for i in range(B):
+                g = torch.Generator(device=dev)
+                g.manual_seed(int(seeds[i]))
+                noisy_list.append(add_noise_variety(spectra_clean[i:i+1], generator=g, **noise_profile))
+            spectra_noisy = torch.cat(noisy_list, dim=0)
+        else:
+            spectra_noisy = spectra_clean
+
+        # --- 3) Mise à l’échelle d’entrée (comme avant, mais GPU) ---
+        scale_noisy = lowess_firstN_start_value(spectra_noisy, Nwin=20).unsqueeze(1).clamp_min(1e-8)
+        noisy = (spectra_noisy / scale_noisy).to(torch.float32)
+
+        # cible clean normalisée à son max (cohérent)
+        max_clean = spectra_clean.amax(dim=1, keepdim=True).clamp_min(1e-8)
+        clean = (spectra_clean / max_clean).to(torch.float32)
+
+        # --- 4) FiLM cond (à partir des *vraies* valeurs normalisées) ---
+        cond_norm = None
+        if len(self.film_params) > 0:
+            cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.film_params]
+            cond_norm = torch.stack(cols, dim=1)
+
+        # --- 5) Passe A : features + tête(s) ---
         latent, _ = self.backbone(noisy.unsqueeze(1))
         feat_shared = self.feature_head(latent)
-        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
+        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm)
 
-        # Tenseur des paramètres "fournis" (physiques)
+        # --- 6) Paramètres fournis (non prédits) ---
         if len(self.provided_params) > 0:
             provided_cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.provided_params]
             provided_norm_tensor = torch.stack(provided_cols, dim=1)
@@ -1039,382 +1095,435 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             provided_phys_tensor = params_pred_norm.new_zeros((noisy.shape[0], 0))
 
-        # Planning raffinement
+        # --- 7) Étape de raffinement (si actif) ---
         e = self.current_epoch
-        effective_refine_steps = 0 if e < self.refine_warmup_epochs else self.refine_steps
-        if self._override_stage is not None:
-            if self._override_stage == 'A':   effective_refine_steps = 0
-            elif self._override_stage in ('B1', 'B2'): effective_refine_steps = self.refine_steps
-
         target_for_resid = noisy if self.refine_target == "noisy" else clean
+        effective_refine = 0 if e < self.refine_warmup_epochs else self.refine_steps
+        if self._override_stage is not None:
+            effective_refine = 0 if self._override_stage == "A" else self.refine_steps
 
+        if (self.refiner is not None) and (effective_refine > 0):
+            for _ in range(effective_refine):
+                pred_phys  = self._denorm_params_subset(params_pred_norm, self.predict_params)
+                y_full     = self._compose_full_phys(pred_phys, provided_phys_tensor)
+                recon      = self._physics_reconstruction(y_full, clean.device, scale=None)
+                resid      = recon - target_for_resid
+                delta = self.refiner(noisy, resid, params_pred_norm, cond_norm, feat_shared)
+                params_pred_norm = (params_pred_norm + delta).clamp(1e-4, 1 - 1e-4)
 
-        # Baseline-fix éventuel pendant warmup
-        if e < self.refine_warmup_epochs and self.baseline_fix_in_warmup:
-            params_pred_norm = self._maybe_baseline_fix(
-                params_pred_norm, noisy, target_for_resid, provided_phys_tensor, scale=scale
-            )
+        # --- 8) Reconstruction physique finale & pertes ---
+        pred_phys  = self._denorm_params_subset(params_pred_norm, self.predict_params)
+        y_full     = self._compose_full_phys(pred_phys, provided_phys_tensor)
+        recon      = self._physics_reconstruction(y_full, clean.device, scale=None)
 
-        # Boucle de raffinement (avec échelles par-paramètre prises en charge dans le raffineur)
-        spectra_recon = None
-        for s in range(effective_refine_steps):
-            pred_phys  = self._denorm_params_subset(params_pred_norm, self.predict_params)
-            y_phys_full= self._compose_full_phys(pred_phys, provided_phys_tensor)
-            spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
-            resid = spectra_recon - target_for_resid
-
-            # Baseline fix dans l’échelle normalisée
-            params_pred_norm = self._maybe_baseline_fix(
-                params_pred_norm, noisy, target_for_resid, provided_phys_tensor, scale=None
-            )
-
-            # Raffineur → delta par paramètre (bounded + scaled inside)
-            delta = self.refiner(
-                noisy=noisy,
-                resid=resid,
-                params_pred_norm=params_pred_norm,
-                cond_norm=cond_norm,
-                feat_shared=feat_shared
-            )
-            params_pred_norm = (params_pred_norm + delta).clamp(1e-4, 1-1e-4)
-
-        # Reconstruction finale
-        pred_phys   = self._denorm_params_subset(params_pred_norm, self.predict_params)
-        y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
-        spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
-
-        # --- Pertes physiques : MSE + Huber (mélangées) + corrélation dérivée/SG si activée ---
-        loss_phys_mse   = F.mse_loss(spectra_recon, clean)
-        loss_phys_huber = F.smooth_l1_loss(spectra_recon, clean, beta=0.002)  # Huber
-        loss_phys_comb  = 0.5*loss_phys_mse + 0.5*loss_phys_huber
-
-        loss_phys_corr = self._pearson_corr_loss(
-            spectra_recon, clean,
-            derivative=self.corr_mode,
-            savgol_win=self.corr_savgol_win,
-            savgol_poly=self.corr_savgol_poly
+        loss_phys_mse   = F.mse_loss(recon, clean)
+        loss_phys_huber = F.smooth_l1_loss(recon, clean, beta=0.002)
+        loss_phys       = 0.5 * loss_phys_mse + 0.5 * loss_phys_huber
+        loss_corr       = self._pearson_corr_loss(
+            recon, clean,
+            derivative=(self.corr_mode if self.corr_mode != "none" else False),
+            savgol_win=self.corr_savgol_win, savgol_poly=self.corr_savgol_poly
         )
 
-        # --- Pertes paramètres (groupe ReLoBRaLo inchangé) ---
         per_param_losses = []
         for j, name in enumerate(self.predict_params):
             true_j = params_true_norm[:, self.name_to_idx[name]]
-            mult = self.weight_mf if name == "mf_CH4" else 1.0
-            lp = mult * F.mse_loss(params_pred_norm[:, j], true_j)
-            per_param_losses.append(lp)
+            loss_j = F.mse_loss(params_pred_norm[:, j], true_j)
+            if name == f"mf_{self.gas}":
+                loss_j = self.weight_mf * loss_j
+            per_param_losses.append(loss_j)
 
-        if len(per_param_losses) > 0:
-            per_param_tensor = torch.stack(per_param_losses)
-            w_params = self.relo_params.compute_weights(per_param_tensor)
-            w_params_norm = w_params / (w_params.sum() + 1e-12)
-            loss_param_group = torch.sum(w_params_norm * per_param_tensor)
+        if per_param_losses:
+            per_param_losses = torch.stack(per_param_losses)
+            w = self.relobralo_params.compute_weights(per_param_losses.detach())
+            loss_params = (w * per_param_losses).sum() / (w.sum() + 1e-8)
         else:
-            loss_param_group = torch.tensor(0.0, device=clean.device)
+            loss_params = torch.tensor(0.0, device=clean.device)
 
-        # --- Agrégation top (garde 3 têtes pour rester compatible avec self.relo_top) ---
-        top_vec = torch.stack([loss_phys_comb, loss_phys_corr, loss_param_group])  # [phys, corr, params]
-        w_top = self.relo_top.compute_weights(top_vec)
-        priors_top = torch.tensor([self.alpha_phys, self.alpha_phys, self.alpha_param],
-                                device=top_vec.device, dtype=top_vec.dtype)
-        w_top = w_top * priors_top
-        w_top = 3.0 * w_top / (w_top.sum() + 1e-12)
-        loss = torch.sum(w_top * top_vec)
+        loss = self.alpha_phys * (loss_phys + loss_corr) + self.alpha_param * loss_params
 
-        # Logs
-        self.log(f"{step_name}_loss", loss, on_epoch=True)
-        self.log(f"{step_name}_loss_phys",      loss_phys_mse,   on_epoch=True)
-        self.log(f"{step_name}_loss_phys_huber",loss_phys_huber, on_epoch=True)
-        self.log(f"{step_name}_loss_phys_corr", loss_phys_corr,  on_epoch=True)
-        self.log(f"{step_name}_loss_param_group", loss_param_group, on_epoch=True)
-        if len(per_param_losses) > 0:
-            self.log(f"{step_name}_loss_param", torch.stack(per_param_losses).mean(), on_epoch=True)
-        self.log(f"{step_name}_w_top_phys",        w_top[0], on_epoch=True)
-        self.log(f"{step_name}_w_top_phys_corr",   w_top[1], on_epoch=True)
-        self.log(f"{step_name}_w_top_param_group", w_top[2], on_epoch=True)
-        for j, name in enumerate(self.predict_params):
-            self.log(f"{step_name}_loss_param_{name}", per_param_losses[j], on_epoch=True)
-
+        self.log(f"{tag}_loss",   loss,       on_epoch=True, prog_bar=(tag == "val"), sync_dist=True)
+        self.log(f"{tag}_phys",   loss_phys,  on_epoch=True, sync_dist=True)
+        self.log(f"{tag}_corr",   loss_corr,  on_epoch=True, sync_dist=True)
+        self.log(f"{tag}_params", loss_params,on_epoch=True, sync_dist=True)
         return loss
 
 
-    def training_step(self, batch, batch_idx): return self._common_step(batch, "train")
-    def validation_step(self, batch, batch_idx): self._common_step(batch, "val")
+    def training_step(self, batch, _): return self._common_step(batch, "train")
+    def validation_step(self, batch, _): self._common_step(batch, "val")
 
     def on_train_epoch_start(self):
-        # Stage override : si défini, on ignore le scheduler A/B1/B2 basé sur epochs
-        if self._override_stage is not None:
-            stage = self._override_stage
-            if stage == 'A':
-                self._set_requires_grad(self.refiner, False)
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], True)
-            elif stage == 'B1':
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], False)
-                self._set_requires_grad(self.refiner, True)
-            elif stage == 'B2':
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film, self.refiner], True)
+        # Si pas de raffineur du tout → on entraîne toujours le backbone/heads (Stage A pur)
+        if self.refiner is None or self.refine_steps <= 0:
+            for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                    getattr(self, "out_heads", None), self.film]:
+                if m is None: 
+                    continue
+                for p in m.parameters():
+                    p.requires_grad_(True)
             return
 
-        # sinon: plan automatique (optionnel si tu utilises un seul fit)
+        # Raffineur présent : gérer A/B1/B2 + override
+        if self._override_stage == "A":
+            # Stage A (backbone+heads only)
+            for p in self.refiner.parameters():
+                p.requires_grad_(False)
+            for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                    getattr(self, "out_heads", None), self.film]:
+                if m is None: 
+                    continue
+                for p in m.parameters():
+                    p.requires_grad_(True)
+            return
+
+        if self._override_stage in {"B1", "B2"}:
+            # B1: refiner only (A gelé) ; B2: tout trainable
+            if self._override_stage == "B1":
+                for p in self.refiner.parameters():
+                    p.requires_grad_(True)
+                for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                        getattr(self, "out_heads", None), self.film]:
+                    if m is None: 
+                        continue
+                    for p in m.parameters():
+                        p.requires_grad_(False)
+            else:  # B2
+                for p in self.refiner.parameters():
+                    p.requires_grad_(True)
+                for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                        getattr(self, "out_heads", None), self.film]:
+                    if m is None: 
+                        continue
+                    for p in m.parameters():
+                        p.requires_grad_(True)
+            return
+
+        # Pas d’override : scheduler normal (warmup A → B1 → B2)
         e = self.current_epoch
-        stage3_start = self.refine_warmup_epochs + self.freeze_base_epochs
-
         if e < self.refine_warmup_epochs:
-            self._set_requires_grad(self.refiner, False)
-            self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                     getattr(self, "out_heads", None), self.film], True)
-            self._froze_base = False
-        elif e < stage3_start:
-            if not self._froze_base:
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], False)
-                self._set_requires_grad(self.refiner, True)
-                self._froze_base = True
+            # Stage A
+            for p in self.refiner.parameters():
+                p.requires_grad_(False)
+            for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                    getattr(self, "out_heads", None), self.film]:
+                if m is None: 
+                    continue
+                for p in m.parameters():
+                    p.requires_grad_(True)
+        elif e < self.freeze_base_epochs:
+            # Stage B1 (refiner only)
+            for p in self.refiner.parameters():
+                p.requires_grad_(True)
+            for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                    getattr(self, "out_heads", None), self.film]:
+                if m is None: 
+                    continue
+                for p in m.parameters():
+                    p.requires_grad_(False)
         else:
-            self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                     getattr(self, "out_heads", None), self.film, self.refiner], True)
-            if e == stage3_start:
-                if hasattr(self.trainer, "optimizers") and len(self.trainer.optimizers) > 0:
-                    opt = self.trainer.optimizers[0]
-                    for pg in opt.param_groups: pg["lr"] *= self.stage3_lr_shrink
-                if self.stage3_refine_steps is not None: self.refine_steps = int(self.stage3_refine_steps)
-                if self.stage3_delta_scale is not None: self.refiner.delta_scale = float(self.stage3_delta_scale)
-                if self.stage3_alpha_phys is not None:  self.alpha_phys = float(self.stage3_alpha_phys)
-                if self.stage3_alpha_param is not None: self.alpha_param = float(self.stage3_alpha_param)
+            # Stage B2 (joint finetune)
+            for p in self.refiner.parameters():
+                p.requires_grad_(True)
+            for m in [self.backbone, self.shared_head, getattr(self, "out_head", None),
+                    getattr(self, "out_heads", None), self.film]:
+                if m is None: 
+                    continue
+                for p in m.parameters():
+                    p.requires_grad_(True)
 
-    def _set_requires_grad(self, modules, flag: bool):
-        if modules is None: return
-        if not isinstance(modules, (list, tuple)): modules = [modules]
-        for m in modules:
-            if m is None: continue
-            for p in m.parameters(): p.requires_grad_(flag)
+
 
     def configure_optimizers(self):
+        # groupe "base" (toujours)
         base_params = list(self.backbone.parameters()) + list(self.shared_head.parameters())
-        if hasattr(self, "out_head"): base_params += list(self.out_head.parameters())
-        if hasattr(self, "out_heads"): base_params += list(self.out_heads.parameters())
-        if self.film is not None: base_params += list(self.film.parameters())
-        refiner_params = list(self.refiner.parameters())
-        optimizer = torch.optim.AdamW(
-            [{"params": base_params, "lr": self.base_lr},
-             {"params": refiner_params, "lr": self.refiner_lr}],
-            weight_decay=1e-4
+        if hasattr(self, "out_head") and self.out_head is not None:
+            base_params += list(self.out_head.parameters())
+        if hasattr(self, "out_heads") and self.out_heads is not None:
+            base_params += list(self.out_heads.parameters())
+        if getattr(self, "film", None) is not None:
+            base_params += list(self.film.parameters())
+
+        param_groups = [{"params": base_params, "lr": self.base_lr}]
+
+        # groupe "refiner" seulement s’il existe ET doit être entraîné
+        if self.refiner is not None and self.refine_steps > 0:
+            param_groups.append({"params": self.refiner.parameters(), "lr": self.refiner_lr})
+
+        opt = torch.optim.AdamW(param_groups, weight_decay=1e-4)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=(self.trainer.max_epochs if self.trainer is not None else 100), eta_min=1e-8
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs if self.trainer is not None else 100,
-            eta_min=1e-9
-        )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+        return {"optimizer": opt, "lr_scheduler": sch}
 
     @torch.no_grad()
-    def infer(
-        self,
-        spectra: torch.Tensor,
-        provided_phys: dict,
-        *,
-        refine: bool = True,
-        resid_target: str = "input",
-        scale: Optional[torch.Tensor] = None,
-    ):
-        """
-        Inférence cohérente avec la pipeline de normalisation:
-
-        - 'spectra' (noisy) est déjà normalisé en entrée (par fenêtre gaussienne OU LOWESS),
-        on NE le re-normalise PAS ici.
-        - La reconstruction physique est renvoyée avec max(recon)=1 (cf. self.recon_max1=True).
-        - Le résidu utilisé par le raffineur est: recon(max=1) - spectra(normalisé).
-
-        Args:
-            spectra        : [B, N] (noisy déjà normalisé au chargement des données)
-            provided_phys  : dict des paramètres fournis (doit couvrir self.provided_params)
-            refine         : active le raffineur si True
-            resid_target   : "input"/"noisy" => cible du résidu = 'spectra' tel quel ; autre => pas de raffinage
-            scale          : ignoré ici (compat), conservé pour rétro-compatibilité
-
-        Returns:
-            dict:
-                - "params_pred_norm": [B, len(predict_params)] (dans [0,1])
-                - "y_phys_full"    : [B, len(PARAMS)] (physiques dénormalisés)
-                - "spectra_recon"  : [B, N] (reconstruction physique à max=1)
-                - "norm_scale"     : [B]    échelle d'entrée estimée (info/log uniquement)
-        """
+    def infer(self, spectra: torch.Tensor, provided_phys: dict, *, refine: bool = True, resid_target: str = "input"):
         self.eval()
         device = spectra.device
         B = spectra.shape[0]
 
-        # 1) Vérif couverture des paramètres fournis
-        missing = [n for n in self.provided_params if n not in provided_phys]
-        assert not missing, f"Manque des paramètres fournis: {missing}"
+        # condition FiLM
+        if len(self.film_params) > 0:
+            cols = [norm_param_torch(n, provided_phys[n].to(device)).unsqueeze(1) for n in self.film_params]
+            cond_norm = torch.cat(cols, dim=1).to(torch.float32)
+        else:
+            cond_norm = None
 
-        # 2) Condition FiLM (normalisée) depuis 'provided_phys'
-        cond_norm = self._make_condition_from_phys(provided_phys, device, dtype=torch.float32)
-
-        # 3) Prédiction initiale (normée) depuis l'encodeur
+        # passe A
         latent, _ = self.backbone(spectra.unsqueeze(1))
         feat_shared = self.feature_head(latent)
-        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
+        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm)
 
-        # 4) Tensor des paramètres fournis (physiques)
+        # phys fournis (non prédits)
         if len(self.provided_params) > 0:
             provided_list = [provided_phys[n].to(device) for n in self.provided_params]
             provided_phys_tensor = torch.stack(provided_list, dim=1)
         else:
             provided_phys_tensor = params_pred_norm.new_zeros((B, 0))
 
-        # 5) Cible du résidu: on prend 'spectra' tel quel (déjà normalisé en amont)
         spectra_target = spectra if resid_target in ("input", "noisy") else None
 
-        # 6) Estimation d'échelle d'entrée (info/log) avec le MÊME estimateur que le dataset
-        #    → par défaut, fenêtre gaussienne (scale_first_window). Si tu utilises LOWESS au dataset,
-        #      remplace par: scale_est = lowess_max_value(spectra).to(spectra.dtype)
-        scale_est = scale_first_window(spectra).to(spectra.dtype)
-
-        # 7) Boucle de raffinement optionnelle
-        if refine and self.refine_steps > 0:
+        # raffinement optionnel
+        if refine and (self.refiner is not None) and (self.refine_steps > 0):
             for _ in range(self.refine_steps):
                 pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
                 y_full    = self._compose_full_phys(pred_phys, provided_phys_tensor)
-                recon     = self._physics_reconstruction(y_full, device, scale=None)  # max=1
-
+                recon     = self._physics_reconstruction(y_full, device, None)
                 if spectra_target is None:
                     break
+                resid = recon - spectra_target
+                delta = self.refiner(spectra, resid, params_pred_norm, cond_norm, feat_shared)
+                params_pred_norm = params_pred_norm.add(delta).clamp(1e-4, 1-1e-4)
 
-                resid = recon - spectra_target  # résidu dans le repère cohérent
-
-                # Baseline-fix (dans l'échelle normalisée)
-                params_pred_norm = self._maybe_baseline_fix(
-                    params_pred_norm, spectra, spectra_target, provided_phys_tensor, scale=None
-                )
-
-                # Raffineur → mise à jour bornée
-                delta = self.refiner(
-                    noisy=spectra,
-                    resid=resid,
-                    params_pred_norm=params_pred_norm,
-                    cond_norm=cond_norm,
-                    feat_shared=feat_shared
-                )
-                params_pred_norm = params_pred_norm.add(delta).clamp(1e-4, 1 - 1e-4)
-
-        # 8) Passage final par la physique
         pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
         y_full    = self._compose_full_phys(pred_phys, provided_phys_tensor)
-        recon     = self._physics_reconstruction(y_full, device, scale=None)  # max=1
+        recon     = self._physics_reconstruction(y_full, device, None)
+        return {"params_pred_norm": params_pred_norm, "y_phys_full": y_full, "spectra_recon": recon}
+
+
+# ============================================================
+# 8) Dataset synthétique + bruit
+# ============================================================
+class SpectraDataset(Dataset):
+    """
+    Il échantillonne des paramètres physiques (non normalisés), calcule leurs
+    versions normalisées pour la supervision, et fournit un seed de bruit.
+    Tout le gros calcul (physique + bruit) est fait sur GPU dans training_step.
+    """
+    def __init__(self, *, n_samples: int, num_points: int, gas: str,
+                 poly_freq: List[float], transitions_dict: Dict[str, list],
+                 sample_ranges: Dict[str, Tuple[float, float]],
+                 with_noise: bool, noise_profile: dict,
+                 freeze_noise: bool = False):
+        super().__init__()
+        self.n_samples = int(n_samples)
+        self.num_points = int(num_points)
+        self.gas = gas.upper()
+        self.poly_freq = list(poly_freq)
+        self.transitions_dict = transitions_dict   # laissé pour compat
+        self.sample_ranges = dict(sample_ranges)
+        self.with_noise = bool(with_noise)
+        self.noise_profile = dict(noise_profile or {})
+        self.freeze_noise = bool(freeze_noise)
+        self.epoch = 0
+
+        # cohérence bornes
+        for k, (a, b) in self.sample_ranges.items():
+            aa, bb = NORM_PARAMS[k]
+            if not (aa <= a <= b <= bb):
+                raise ValueError(f"sample_ranges[{k}]={a,b} hors de NORM_PARAMS={aa,bb}")
+
+        # ordre de sortie (cohérent avec param_names du modèle)
+        self.param_names = ['sig0', 'dsig', f'mf_{self.gas}', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
+
+    def set_epoch(self, e: int):
+        self.epoch = int(e)
+
+    def _seed_for(self, idx: int) -> int:
+        # seed stable par (epoch, idx) si freeze_noise=False ; fixe si True
+        base = 1337 if self.freeze_noise else (torch.initial_seed() & 0x7FFFFFFFFFFFFFFF)
+        return int((base + 1_000_003 * self.epoch + 97 * idx) % (2**63 - 1))
+
+    def __len__(self): return self.n_samples
+
+    def __getitem__(self, idx: int):
+        # 1) échantillonne params physiques (CPU)
+        vals = {k: random.uniform(*self.sample_ranges[k]) for k in self.param_names}
+
+        # 2) versions torch (physiques) dans l'ordre PARAMS (CPU)
+        params_phys = torch.tensor([vals[k] for k in self.param_names], dtype=torch.float32)  # [8]
+
+        # 3) normalisés [0,1] pour la tête
+        params_norm = torch.tensor(
+            [norm_param_value(k, vals[k]) for k in self.param_names],
+            dtype=torch.float32
+        )
+
+        # 4) baseline coeffs (CPU)
+        baseline_coeffs = torch.tensor([vals['baseline0'], vals['baseline1'], vals['baseline2']], dtype=torch.float32)
+
+        # 5) seed de bruit par sample
+        noise_seed = torch.tensor(self._seed_for(idx), dtype=torch.int64)
 
         return {
-            "params_pred_norm": params_pred_norm,
-            "y_phys_full": y_full,
-            "spectra_recon": recon,
-            "norm_scale": scale_est,
+            # POUR GPU STEP
+            "params_phys": params_phys,           # [8] physiques (sig0, dsig, mf, b0,b1,b2,P,T)
+            "params": params_norm,                # [8] normalisés (supervision)
+            "baseline_coeffs": baseline_coeffs,   # [3]
+            "noise_seed": noise_seed,             # int64
+            # méta
+            "num_points": torch.tensor(self.num_points, dtype=torch.int32),
         }
 
+def collate_fn(samples):
+    # collate simple, CPU-only
+    keys = samples[0].keys()
+    out = {}
+    for k in keys:
+        out[k] = torch.utils.data.default_collate([s[k] for s in samples])
+    return out
+
+
+# --- constants (au début de ton fichier) ---
+ALL_TARGETS: tuple[str, ...] = (
+    "sig0", "dsig", "mf_CH4", "P", "T", "baseline1", "baseline2"
+)
+
+def get_predict_list_A(cfg: dict | None = None) -> list[str]:
+    pl = list(cfg.get("predict_list") or ALL_TARGETS)
+    film_list = set(cfg.get("film_list") or [])
+    pl = [p for p in pl if p not in film_list]
+    return pl
+
 
 # ============================================================
-# 8) Callbacks visu & epoch sync dataset
+# 9) Callbacks utilitaires & évaluation
 # ============================================================
-class PlotAndMetricsCallback(Callback):
-    def __init__(self, val_loader, param_names, num_examples: int = 1, display_id: str = "phys_viz"):
-        super().__init__()
-        self.val_loader = val_loader
-        self.param_names = list(param_names)
-        self.num_examples = num_examples
-        self.display_id = display_id
-        self._first = True
-
-    @torch.no_grad()
-    def on_validation_epoch_end(self, trainer, pl_module):
-        pl_module.eval()
-        device = pl_module.device
-        batch = next(iter(self.val_loader))
-        noisy  = batch['noisy_spectra'][:self.num_examples].to(device)
-        clean  = batch['clean_spectra'][:self.num_examples].to(device)
-        params_true_norm = batch['params'][:self.num_examples].to(device)
-
-        provided_phys = {}
-        for name in getattr(pl_module, "provided_params", []):
-            idx = pl_module.name_to_idx[name]
-            v_norm = params_true_norm[:, idx]
-            v_phys = pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
-            provided_phys[name] = v_phys
-
-        out = pl_module.infer(noisy, provided_phys=provided_phys, refine=True, resid_target="input")
-        spectra_recon = out["spectra_recon"].cpu()
-
-        noisy, clean = noisy.cpu(), clean.cpu()
-        x = np.arange(clean.shape[1])
-
-        m = trainer.callback_metrics
-        def get_metric(name, default="-"):
-            v = m.get(name, None)
-            try: return f"{float(v):.6g}"
-            except Exception: return default
-
-        val_loss   = get_metric("val_loss")
-        val_phys   = get_metric("val_loss_phys")
-        val_param  = get_metric("val_loss_param")
-        val_phys_corr = get_metric("val_loss_phys_corr")
-        train_loss = get_metric("train_loss")
-
-        per_param_lines = []
-        for p in getattr(pl_module, "predict_params", self.param_names):
-            per_param_lines.append(f"{p:10s} : {get_metric(f'val_loss_param_{p}')}")
-        per_param_text = "\n".join(per_param_lines)
-
-        # 🔧 passe en constrained layout (remplace tight_layout)
-        fig = plt.figure(figsize=(11, 6), constrained_layout=True)
-        gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1.8], height_ratios=[3, 1], hspace=0.25, wspace=0.3)
-        ax_spec = fig.add_subplot(gs[0, 0])
-        ax_res  = fig.add_subplot(gs[1, 0], sharex=ax_spec)
-        ax_tbl  = fig.add_subplot(gs[:, 1]); ax_tbl.axis("off")
-
-        i = 0
-        ax_spec.plot(x, noisy[i],         label="Noisy",       lw=1, alpha=0.7)
-        ax_spec.plot(x, clean[i],         label="Clean (réel)",lw=1.5)
-        ax_spec.plot(x, spectra_recon[i], label="Reconstruit", lw=1.2, ls="--")
-        ax_spec.set_ylabel("Transmission")
-        ax_spec.set_title(f"Epoch {trainer.current_epoch}")
-        ax_spec.legend(frameon=False, fontsize=9)
-
-        resid_clean = spectra_recon[i] - clean[i]
-        resid_noisy = spectra_recon[i] - noisy[i]
-        ax_res.plot(x, resid_noisy, lw=1,   label="Reconstruit - Noisy")
-        ax_res.plot(x, resid_clean, lw=1.2, label="Reconstruit - Clean")
-        ax_res.axhline(0, ls=":", lw=0.8)
-        ax_res.set_xlabel("Points spectraux"); ax_res.set_ylabel("Résidu")
-        ax_res.legend(frameon=False, fontsize=9)
-
-        # (Retire l’emoji si tu veux éviter toute dépendance de police)
-        header = f"Metriques (epoch {trainer.current_epoch})"
-        lines  = [f"train_loss : {train_loss}", f"val_loss   : {val_loss}",
-                f"val_phys   : {val_phys}", f"val_corr   : {val_phys_corr}",
-                f"val_param  : {val_param}", "", "Pertes par paramètre (val) :", per_param_text]
-        ax_tbl.text(0.02, 0.98, header, va="top", ha="left", fontsize=12, fontweight="bold")
-        ax_tbl.text(0.02, 0.90, "\n".join(lines), va="top", ha="left", fontsize=10, family="monospace")
-
-        for ax in (ax_spec, ax_res): ax.grid(alpha=0.25)
-
-        # ⚠️ ne pas appeler fig.tight_layout() ici
-        if getattr(self, "_first", True):
-            display(fig, display_id=self.display_id); self._first = False
-        else:
-            update_display(fig, display_id=self.display_id)
-        plt.close(fig)
-
-
 class UpdateEpochInDataset(pl.Callback):
     def on_train_epoch_start(self, trainer, pl_module):
-        ds = trainer.train_dataloaders.dataset if hasattr(trainer, "train_dataloaders") else trainer.train_dataloader.dataset
-        if hasattr(ds, "set_epoch"): ds.set_epoch(trainer.current_epoch)
+        try:
+            ds = trainer.train_dataloader.dataset
+        except Exception:
+            ds = None
+        if hasattr(ds, "set_epoch"):
+            ds.set_epoch(trainer.current_epoch)
+
+@torch.no_grad()
+def evaluate_and_plot(
+    model: PhysicallyInformedAE,
+    loader: DataLoader,
+    n_show: int = 3,
+    *,
+    outdir: str = "runs/quick_plots",
+    save: bool = True,
+    show: bool = False,
+    dpi: int = 150,
+):
+    """
+    Evaluates the model and (optionally) saves a few example plots.
+    Returns a dict of per-parameter relative error stats.
+
+    Arguments
+    ---------
+    model : PhysicallyInformedAE
+    loader : DataLoader
+    n_show : int            # how many figures to save/show
+    outdir : str            # directory to save PNGs
+    save : bool             # save PNGs to outdir
+    show : bool             # call plt.show() (usually False on headless)
+    dpi : int               # PNG resolution
+    """
+    import os
+    import numpy as np
+    import torch
+    import matplotlib.pyplot as plt
+
+    model.eval()
+    device = model.device
+    pred_names = list(getattr(model, "predict_params", []))
+    if not pred_names:
+        print("Aucun paramètre à évaluer."); return {}
+
+    if save:
+        os.makedirs(outdir, exist_ok=True)
+
+    per_param_err = {p: [] for p in pred_names}
+    shown = 0
+
+    for batch in loader:
+        noisy  = batch["noisy_spectra"].to(device)
+        clean  = batch["clean_spectra"].to(device)
+        p_norm = batch["params"].to(device)
+
+        # provided (non-predicted) phys for inference
+        provided = {}
+        for name in getattr(model, "provided_params", []):
+            idx = model.name_to_idx[name]
+            v_phys = unnorm_param_torch(name, p_norm[:, idx])
+            provided[name] = v_phys
+
+        out   = model.infer(noisy, provided_phys=provided, refine=True, resid_target="input")
+        recon = out["spectra_recon"]
+        yfull = out["y_phys_full"]
+
+        # relative errors (%)
+        true_cols = [unnorm_param_torch(n, p_norm[:, model.name_to_idx[n]]) for n in pred_names]
+        true_phys = torch.stack(true_cols, dim=1)
+        pred_phys = torch.stack([yfull[:, model.name_to_idx[n]] for n in pred_names], dim=1)
+        eps = 1e-12
+        denom = torch.clamp(true_phys.abs(), min=eps)
+        err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
+        for j, name in enumerate(pred_names):
+            per_param_err[name].append(err_pct[:, j].detach().cpu())
+
+        # quick viz
+        if shown < n_show:
+            i = 0
+            x = np.arange(clean.shape[1])
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 4), sharex=True)
+            ax1.plot(x, noisy[i].detach().cpu(),  lw=0.9, alpha=0.7, label="Noisy")
+            ax1.plot(x, clean[i].detach().cpu(),  lw=1.2, label="Clean")
+            ax1.plot(x, recon[i].detach().cpu(),  lw=1.0, ls="--", label="Recon")
+            ax1.legend(frameon=False, fontsize=9); ax1.grid(alpha=0.25)
+            ax2.plot(x, (recon[i]-noisy[i]).detach().cpu(), lw=0.9, label="Recon - Noisy")
+            ax2.plot(x, (recon[i]-clean[i]).detach().cpu(), lw=0.9, label="Recon - Clean")
+            ax2.axhline(0, ls=":", lw=0.7); ax2.legend(frameon=False, fontsize=9); ax2.grid(alpha=0.25)
+            ax2.set_xlabel("Index spectral")
+            plt.tight_layout()
+
+            if save:
+                path = os.path.join(outdir, f"val_example_{shown}.png")
+                fig.savefig(path, dpi=dpi, bbox_inches="tight")
+                print(f"💾 saved {path}")
+            if show:
+                plt.show()
+            plt.close(fig)
+            shown += 1
+
+    # aggregate stats
+    stats = {}
+    for name in pred_names:
+        if len(per_param_err[name]) == 0:
+            continue
+        v = torch.cat(per_param_err[name])
+        stats[name] = {
+            "mean_%": float(v.mean()),
+            "median_%": float(v.median()),
+            "p90_%": float(torch.quantile(v, torch.tensor(0.90))),
+            "p95_%": float(torch.quantile(v, torch.tensor(0.95))),
+        }
+
+    print("\n=== Erreurs relatives (%) ===")
+    for k, s in stats.items():
+        print(f"{k:>10s} | mean {s['mean_%']:.3f} | median {s['median_%']:.3f} | p90 {s['p90_%']:.3f} | p95 {s['p95_%']:.3f}")
+    return stats
+
 
 # ============================================================
-# 9) Helpers ranges
+# 10) Helpers bornes & utils
 # ============================================================
 def expand_interval(a, b, factor):
-    c = 0.5*(a+b); half = 0.5*(b-a)*float(factor)
-    return float(c-half), float(c+half)
+    c = 0.5 * (a + b); half = 0.5 * (b - a) * float(factor)
+    return float(c - half), float(c + half)
 
 def map_ranges(base: dict, fn, per_param: dict | None = None) -> dict:
     out = {}
@@ -1423,479 +1532,974 @@ def map_ranges(base: dict, fn, per_param: dict | None = None) -> dict:
         out[k] = fn(a, b, f)
     return out
 
-def assert_subset(child: dict, parent: dict, name_child="child", name_parent="parent"):
-    bad = [k for k in child if not (parent[k][0] <= child[k][0] and child[k][1] <= parent[k][1])]
-    if bad:
-        raise ValueError(f"{name_child} ⊄ {name_parent} pour: {bad}")
+def set_seed(seed: int):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); pl.seed_everything(seed, workers=True)
 
-# ============================================================
-# 10) Stages d'entraînement (A / B1 / B2), contrôle fin
-# ============================================================
-def _freeze_all(model: PhysicallyInformedAE):
-    for p in model.parameters(): p.requires_grad_(False)
+def ensure_dir(p: str):
+    if p: os.makedirs(p, exist_ok=True)
+    return p or "."
 
-def _set_trainable_heads(model: PhysicallyInformedAE, names: Optional[List[str]]):
-    if model.head_mode == "single":
-        # on ne sait pas geler par colonne proprement → tout ON
-        for p in model.out_head.parameters(): p.requires_grad_(True)
-        return
-    # multi-head : on active uniquement les heads désirés
-    want = set(names) if names is not None else set(model.predict_params)
-    for n, head in model.out_heads.items():
-        req = (n in want)
-        for p in head.parameters(): p.requires_grad_(req)
+def save_json(obj: dict, path: str):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
 
-def _apply_stage_freeze(model: PhysicallyInformedAE,
-                        train_base: bool, train_heads: bool, train_film: bool, train_refiner: bool,
-                        heads_subset: Optional[List[str]]):
-    # tout OFF
-    _freeze_all(model)
-    # backbone + shared head
-    if train_base:
-        for p in model.backbone.parameters(): p.requires_grad_(True)
-        for p in model.shared_head.parameters(): p.requires_grad_(True)
-    # heads
-    if model.head_mode == "single":
-        if train_heads:
-            for p in model.out_head.parameters(): p.requires_grad_(True)
-    else:
-        _set_trainable_heads(model, heads_subset if train_heads else [])
-    # FiLM
-    if model.film is not None and train_film:
-        for p in model.film.parameters(): p.requires_grad_(True)
-    # refiner
-    if train_refiner:
-        for p in model.refiner.parameters(): p.requires_grad_(True)
+def load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def _load_weights_if_any(model: PhysicallyInformedAE, ckpt_in: Optional[str]):
-    if ckpt_in:
-        sd = torch.load(ckpt_in, map_location="cpu")
-        # compatibilité PL (state_dict ou full checkpoint)
-        state_dict = sd["state_dict"] if "state_dict" in sd else sd
-        model.load_state_dict(state_dict, strict=False)
-        print(f"✓ weights chargés depuis: {ckpt_in}")
+# ==== A coller dans 10_PIAE.py (près de ton objective / sampling) ====
+import json
+from typing import Optional, List
+import optuna
 
-def _save_checkpoint(trainer: pl.Trainer, ckpt_out: Optional[str]):
-    if ckpt_out:
-        trainer.save_checkpoint(ckpt_out)
-        print(f"✓ checkpoint sauvegardé: {ckpt_out}")
+def suggest_predict_list(trial: "optuna.trial.Trial") -> Optional[List[str]]:
+    """
+    Propose un choix pour 'predict_list' compatible avec la persistance Optuna.
+    Retourne une vraie liste Python ou None.
+    NOTE: on versionne le nom du param pour ne pas casser une étude existante.
+    """
+    def enc(x): 
+        return json.dumps(x, sort_keys=True)
 
-def train_stage_custom(
-    model: PhysicallyInformedAE,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    *,
-    stage_name: str,
-    epochs: int,
-    base_lr: float,
-    refiner_lr: float,
-    train_base: bool,
-    train_heads: bool,
-    train_film: bool,
-    train_refiner: bool,
-    refine_steps: int,
-    delta_scale: float,
-    use_film: Optional[bool] = None,
-    film_subset: Optional[List[str]] = None,
-    heads_subset: Optional[List[str]] = None,
-    baseline_fix_enable: Optional[bool] = None,
-    callbacks: Optional[list] = None,
-    accelerator: Optional[str] = None,
-    ckpt_in: Optional[str] = None,
-    ckpt_out: Optional[str] = None,
-    enable_progress_bar: bool = False,
-):
-    print(f"\n===== Stage {stage_name} =====")
-    _load_weights_if_any(model, ckpt_in)
-
-    try:
-        from pytorch_lightning.callbacks.progress import TQDMProgressBar
-        if callbacks is not None and enable_progress_bar is False:
-            callbacks = [cb for cb in callbacks if not isinstance(cb, TQDMProgressBar)]
-    except Exception:
-        pass
-
-    # overrides runtime
-    model.base_lr = float(base_lr); model.refiner_lr = float(refiner_lr)
-    model.set_stage_mode(stage_name, refine_steps=refine_steps, delta_scale=delta_scale)
-    if use_film is not None: model.set_film_usage(bool(use_film))
-    if film_subset is not None: model.set_film_subset(film_subset)
-    if baseline_fix_enable is not None: model.baseline_fix_enable = bool(baseline_fix_enable)
-
-    _apply_stage_freeze(model,
-                        train_base=train_base, train_heads=train_heads, train_film=train_film, train_refiner=train_refiner,
-                        heads_subset=heads_subset)
-
-    trainer = pl.Trainer(
-        max_epochs=epochs,
-        accelerator=accelerator or ("gpu" if torch.cuda.is_available() else "cpu"),
-        enable_progress_bar=enable_progress_bar,
-        log_every_n_steps=1,
-        callbacks=callbacks or []
+    choices = (
+        "none",
+        enc(["sig0", "dsig", "mf_CH4", "baseline1", "baseline2"]),
+        enc(["sig0", "dsig", "mf_CH4"]),
+        enc(["sig0", "dsig", "baseline1", "baseline2"]),
     )
-    trainer.fit(model, train_loader, val_loader)
-    _save_checkpoint(trainer, ckpt_out)
-    return model
-
-# Facades conviviales
-def train_stage_A(model, train_loader, val_loader, **kw):
-    # A = base + heads (+/- FiLM), pas de raffineur
-    defaults = dict(
-        stage_name="A", epochs=20,
-        base_lr=2e-4, refiner_lr=1e-6,
-        train_base=True, train_heads=True, train_film=False, train_refiner=False,
-        refine_steps=0, delta_scale=0.1,
-        use_film=False, film_subset=None, heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
-
-def train_stage_B1(model, train_loader, val_loader, **kw):
-    # B1 = raffineur seul
-    defaults = dict(
-        stage_name="B1", epochs=12,
-        base_lr=1e-6, refiner_lr=1e-5,
-        train_base=False, train_heads=False, train_film=False, train_refiner=True,
-        refine_steps=2, delta_scale=0.12,
-        use_film=True, film_subset=["T"], heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
-
-def train_stage_B2(model, train_loader, val_loader, **kw):
-    # B2 = fine-tune global (petits LR), raffinement ON
-    defaults = dict(
-        stage_name="B2", epochs=15,
-        base_lr=3e-5, refiner_lr=3e-6,
-        train_base=True, train_heads=True, train_film=True, train_refiner=True,
-        refine_steps=2, delta_scale=0.08,
-        use_film=True, film_subset=["P","T"], heads_subset=None,
-        baseline_fix_enable=False, enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+    key = trial.suggest_categorical("predict_list_v2", choices)
+    if key == "none":
+        return None
+    return json.loads(key)
 
 # ============================================================
-# 11) Évaluation + refit baseline (bords)
+# 11) Construction data+modèle (config gaz & normalisation)
 # ============================================================
-import pandas as pd
 
-@torch.no_grad()
-def _baseline_refit_edges(
-    model: PhysicallyInformedAE,
-    y_full_pred: torch.Tensor,     # [B, len(PARAMS)] — modifié in-place
-    recon: torch.Tensor,           # [B, N] (normalisé)
-    target: torch.Tensor,          # [B, N] (normalisé de préférence)
-    edge_pts: int = 50,
-    deg: int = 2,
-    iters: int = 1,
-):
-    assert edge_pts > 0
-    B, N = recon.shape
-    dev = recon.device
-    dtype = torch.float64
+def build_from_args(cfg: dict):
+    gas = cfg.get("gas", "CH4").upper()
 
-    # Échelle = max LOWESS pour rester dans le même repère
-    scale_est = lowess_max_value(target, frac=0.08, iters=2, n_eval=64).to(recon.dtype)
-    scale_est = torch.clamp(scale_est, min=torch.tensor(1e-6, dtype=scale_est.dtype, device=scale_est.device))
+    # --- POLYNÔME DE FRÉQUENCE (obligatoire, inline ou chemin JSON) ---
+    poly = cfg.get("poly_inline") or cfg.get("poly_freq")
+    if isinstance(poly, str) and poly:
+        s = poly.strip()
+        if s.startswith("["):                  # JSON inline: "[a,b,c]"
+            poly = json.loads(s)
+        elif "," in s:                         # CSV inline: "a,b,c"
+            poly = [float(x.strip()) for x in s.split(",") if x.strip()]
+        else:                                  # chemin vers JSON {"poly_freq":[...]}
+            poly = load_json(s)["poly_freq"]
+    if not poly:
+        raise ValueError("poly_inline/poly_freq requis: fournis les coefficients du polynôme de fréquence.")
+    poly = list(map(float, poly))
 
-    deg = int(max(0, min(2, deg)))
-    used_cols = deg + 1
-    assert 2 * edge_pts < N, "edge_pts trop grand par rapport à N"
+    # --- TRANSITIONS (obligatoires, inline CSV ou chemin CSV) ---
+    trans_inline = cfg.get("transitions_inline", "")
+    trans_path   = cfg.get("transitions_csv", "")
+    if trans_inline:
+        transitions = parse_csv_transitions(trans_inline)
+    elif trans_path:
+        with open(trans_path, "r", encoding="utf-8") as f:
+            transitions = parse_csv_transitions(f.read())
+    else:
+        raise ValueError("transitions_inline/transitions_csv requis: fournis les transitions (pas de défaut).")
 
-    x = torch.arange(N, device=dev, dtype=dtype)
-    A = torch.stack([x**k for k in range(used_cols)], dim=1).T
-    idx_edge = torch.cat([torch.arange(edge_pts, device=dev),
-                          torch.arange(N - edge_pts, N, device=dev)])
-    A_edge = A[:, idx_edge].T
-
-    b0 = model.name_to_idx['baseline0']
-
-    for _ in range(max(1, iters)):
-        resid = (target - recon).to(dtype)
-        r_edge = resid[:, idx_edge]
-
-        for b in range(B):
-            sol = torch.linalg.lstsq(A_edge, r_edge[b].unsqueeze(-1)).solution
-            delta = sol.view(-1)
-            y_full_pred[b, b0:b0+used_cols] = (y_full_pred[b, b0:b0+used_cols].to(dtype) + delta).to(y_full_pred.dtype)
-
-        # Recalcul en conservant l’échelle normalisée
-        recon = model._physics_reconstruction(y_full_pred, dev, scale=scale_est)
-
-    return y_full_pred, recon
+    transitions_dict = {gas: transitions}
+    dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    transitions_dict = preprocess_transitions(transitions_dict, device=dev, dtype=torch.float64)
 
 
-@torch.no_grad()
-def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: int = 5,
-                      refine: bool = True, robust_smape: bool = False, eps: float = 1e-12, seed: int = 123,
-                      baseline_correction: dict | None = None):
-    model.eval()
-    device = model.device
-    rng = random.Random(seed)
 
-    pred_names = list(getattr(model, "predict_params", []))
-    if not pred_names:
-        raise RuntimeError("Aucun paramètre à évaluer.")
-
-    bc = baseline_correction or {}
-    bc_enabled = bool(bc.get("enabled", False))
-    bc_edge    = int(bc.get("edge_pts", 50))
-    bc_deg     = int(bc.get("deg", 2))
-    bc_iters   = int(bc.get("iters", 1))
-
-    per_param_err = {p: [] for p in pred_names}
-    show_examples = []
-
-    for batch in loader:
-        noisy  = batch["noisy_spectra"].to(device)
-        clean  = batch["clean_spectra"].to(device)
-        p_norm = batch["params"].to(device)
-        B = noisy.size(0)
-
-        provided_phys = {}
-        if len(model.provided_params) > 0:
-            cols = [p_norm[:, model.name_to_idx[n]] for n in model.provided_params]
-            provided_norm_tensor = torch.stack(cols, dim=1)
-            provided_phys_tensor = model._denorm_params_subset(provided_norm_tensor, model.provided_params)
-            for j, name in enumerate(model.provided_params):
-                provided_phys[name] = provided_phys_tensor[:, j]
-
-        out = model.infer(noisy, provided_phys=provided_phys, refine=refine, resid_target="input")
-        recon = out["spectra_recon"]
-        y_full_pred = out["y_phys_full"].clone()
-
-        if bc_enabled:
-            y_full_pred, recon = _baseline_refit_edges(
-                model, y_full_pred, recon, target=noisy, edge_pts=bc_edge, deg=bc_deg, iters=bc_iters
-            )
-
-        true_cols = [p_norm[:, model.name_to_idx[n]] for n in pred_names]
-        true_norm_tensor = torch.stack(true_cols, dim=1)
-        true_phys = model._denorm_params_subset(true_norm_tensor, pred_names)
-        pred_phys = torch.stack([y_full_pred[:, model.name_to_idx[n]] for n in pred_names], dim=1)
-
-        if robust_smape:
-            denom = pred_phys.abs() + true_phys.abs() + eps
-            err_pct = 100.0 * 2.0 * (pred_phys - true_phys).abs() / denom
-        else:
-            denom = torch.clamp(true_phys.abs(), min=eps)
-            err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
-
-        for j, name in enumerate(pred_names):
-            per_param_err[name].append(err_pct[:, j].detach().cpu())
-
-        for i in range(B):
-            if len(show_examples) < n_show:
-                show_examples.append({
-                    "noisy":  noisy[i].detach().cpu(),
-                    "clean":  clean[i].detach().cpu(),
-                    "recon":  recon[i].detach().cpu(),
-                    "pred":   {name: float(pred_phys[i, j]) for j, name in enumerate(pred_names)},
-                    "true":   {name: float(true_phys[i, j]) for j, name in enumerate(pred_names)},
-                    "errpct": {name: float(err_pct[i, j])   for j, name in enumerate(pred_names)},
-                })
-        if len(show_examples) >= n_show: break
-
-    rows = []
-    for name in pred_names:
-        if len(per_param_err[name]) == 0: continue
-        v = torch.cat(per_param_err[name])
-        mean = v.mean().item(); med  = v.median().item()
-        try:
-            p90  = torch.quantile(v, torch.tensor(0.90)).item()
-            p95  = torch.quantile(v, torch.tensor(0.95)).item()
-        except Exception:
-            vv = v.numpy(); p90 = float(np.quantile(vv, 0.90)); p95 = float(np.quantile(vv, 0.95))
-        rows.append({"param": name, "mean_%": mean, "median_%": med, "p90_%": p90, "p95_%": p95})
-    df = pd.DataFrame(rows).set_index("param").sort_index()
-    print("\n=== Erreurs en % (globales, sur le loader) ==="); print(df.round(4))
-
-    if len(show_examples) > 0:
-        R = len(show_examples)
-        fig, axes = plt.subplots(R, 2, figsize=(12, 2.8*R), sharex=False)
-        if R == 1: axes = np.array([axes])
-        for r, ex in enumerate(show_examples):
-            x = np.arange(ex["clean"].numel()); ax1, ax2 = axes[r, 0], axes[r, 1]
-            ax1.plot(x, ex["noisy"],  lw=0.9, alpha=0.7, label="Noisy")
-            ax1.plot(x, ex["clean"],  lw=1.2,              label="Clean")
-            ax1.plot(x, ex["recon"],  lw=1.0, ls="--",     label="Recon")
-            ax1.set_ylabel("Transmission")
-            lbl_bc = " (+baseline refit)" if bc_enabled else ""
-            err_txt = ", ".join([f"{k}: {ex['errpct'][k]:.2f}%" for k in pred_names])
-            ax1.set_title(f"Exemple {r+1}{lbl_bc} — erreurs % : {err_txt}", fontsize=10)
-            ax1.legend(frameon=False, fontsize=8)
-
-            ax2.plot(x, ex["recon"] - ex["noisy"], lw=0.9, label="Recon - Noisy")
-            ax2.plot(x, ex["recon"] - ex["clean"], lw=0.9, label="Recon - Clean")
-            ax2.axhline(0, color="k", ls=":", lw=0.7)
-            ax2.set_ylabel("Résidu"); ax2.legend(frameon=False, fontsize=8)
-        axes[-1, 0].set_xlabel("Index spectral"); axes[-1, 1].set_xlabel("Index spectral")
-        for axrow in axes:
-            for ax in axrow: ax.grid(alpha=0.25)
-        fig.tight_layout(); plt.show()
-    return df
-
-# ============================================================
-# 12) Build data & modèle (exemple par défaut)
-# ============================================================
-def build_data_and_model(
-    *, seed=42, n_points=800, n_train=50000, n_val=5000, batch_size=16,
-    train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
-    predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
-):
-    pl.seed_everything(seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    is_windows = sys.platform == "win32"
-    num_workers = 0 if is_windows else 4
-
-    poly_freq_CH4 = [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
-    transitions_ch4_str = """6;1;3085.861015;1.013E-19;0.06;0.078;219.9411;0.73;-0.00712;0.0;0.0221;0.96;0.584;1.12
-6;1;3085.832038;1.693E-19;0.0597;0.078;219.9451;0.73;-0.00712;0.0;0.0222;0.91;0.173;1.11
-6;1;3085.893769;1.011E-19;0.0602;0.078;219.9366;0.73;-0.00711;0.0;0.0184;1.14;-0.516;1.37
-6;1;3086.030985;1.659E-19;0.0595;0.078;219.9197;0.73;-0.00711;0.0;0.0193;1.17;-0.204;0.97
-6;1;3086.071879;1.000E-19;0.0585;0.078;219.9149;0.73;-0.00703;0.0;0.0232;1.09;-0.0689;0.82
-6;1;3086.085994;6.671E-20;0.055;0.078;219.9133;0.70;-0.00610;0.0;0.0300;0.54;0.00;0.0"""
-    transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str)}
-
-    # Ranges par défaut
+    # --------------------------
+    # 2) Bornes & normalisation
+    # --------------------------
+    LOG_FLOOR_LOCAL = LOG_FLOOR
     default_val = {
         'sig0': (3085.43, 3085.46),
         'dsig': (0.001521, 0.00154),
-        'mf_CH4': (2e-6, 20e-6),
+        f'mf_{gas}': (max(LOG_FLOOR_LOCAL, 2e-6), max(LOG_FLOOR_LOCAL*10, 20e-6)),
         'baseline0': (0.99, 1.01),
         'baseline1': (-0.0004, -0.0003),
         'baseline2': (-4.0565E-08, -3.07117E-08),
         'P': (400, 600),
         'T': (273.15 + 30, 273.15 + 40),
     }
-    expand_factors = {"_default": 1.0, 'sig0': 5.0, 'dsig': 7.0, 'mf_CH4': 2.0,
-                      "baseline0": 1, "baseline1": 3.0, "baseline2": 8.0, "P": 2.0, "T": 2.0}
-    default_train = map_ranges(default_val, expand_interval, per_param=expand_factors)
+    expand_factors = {
+        "_default": 1.0,
+        'sig0': 5.0, 'dsig': 7.0, f'mf_{gas}': 2.0,
+        "baseline0": 1.0, "baseline1": 3.0, "baseline2": 8.0, "P": 2.0, "T": 2.0
+    }
 
-    # Plancher log
-    lo, hi = default_train['mf_CH4']; default_train['mf_CH4'] = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
-    lo, hi = default_val['mf_CH4'];   default_val['mf_CH4']   = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
+    train_ranges = cfg.get("train_ranges")
+    val_ranges   = cfg.get("val_ranges")
 
-    global NORM_PARAMS
-    VAL_RANGES = val_ranges or default_val
-    TRAIN_RANGES = train_ranges or default_train
-    assert_subset(VAL_RANGES, TRAIN_RANGES, "VAL", "TRAIN")
-    NORM_PARAMS = TRAIN_RANGES
+    # permettre fichiers/JSON inline pour ranges
+    def _maybe_load_ranges(r):
+        if isinstance(r, str) and r:
+            s = r.strip()
+            if os.path.exists(s):
+                return load_json(s)
+            if s[0] in "{[":
+                return json.loads(s)
+        return r
 
-    NOISE_TRAIN = noise_train or dict(
-        std_add_range=(0, 1e-2), std_mult_range=(0, 1e-2),
-        p_drift=0.1, drift_sigma_range=(10.0, 120.0), drift_amp_range=(0.004, 0.05),
-        p_fringes=0.1, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
-        p_spikes=0.1, spikes_count_range=(1, 6), spike_amp_range=(0.002, 1), spike_width_range=(1.0, 20.0),
-        clip=(0.0, 1.2),
+    train_ranges = _maybe_load_ranges(train_ranges)
+    val_ranges   = _maybe_load_ranges(val_ranges)
+
+    if not train_ranges:
+        def _expand_interval(a, b, factor):
+            c = 0.5 * (a + b); half = 0.5 * (b - a) * float(factor)
+            return float(c - half), float(c + half)
+        def _map_ranges(base: dict, fn, per_param: dict | None = None) -> dict:
+            out = {}
+            for k, (a, b) in base.items():
+                f = per_param.get(k, per_param.get("_default", 1.0)) if per_param else 1.0
+                out[k] = fn(a, b, f)
+            return out
+        train_ranges = _map_ranges(default_val, _expand_interval, per_param=expand_factors)
+        lo, hi = train_ranges[f'mf_{gas}']
+        train_ranges[f'mf_{gas}'] = (max(lo, LOG_FLOOR_LOCAL), max(hi, LOG_FLOOR_LOCAL*10))
+
+    if not val_ranges:
+        val_ranges = default_val
+
+    # renseigne la normalisation globale
+    global PARAMS, PARAM_TO_IDX, LOG_SCALE_PARAMS, NORM_PARAMS
+    PARAMS = ['sig0', 'dsig', f'mf_{gas}', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
+    PARAM_TO_IDX = {n: i for i, n in enumerate(PARAMS)}
+    LOG_SCALE_PARAMS = {f'mf_{gas}'}
+    NORM_PARAMS = train_ranges
+
+    # --------------------------
+    # 3) Jeux de données
+    # --------------------------
+    ds_train = SpectraDataset(
+        n_samples=int(cfg.get("n_train", 1000)),
+        num_points=int(cfg.get("n_points", 800)),
+        gas=gas, poly_freq=poly, transitions_dict=transitions_dict,
+        sample_ranges=train_ranges, with_noise=True,
+        noise_profile=cfg.get("noise_train") or dict(
+            std_add_range=(0, 0.08), std_mult_range=(0, 1e-2),
+            p_drift=0.2, drift_sigma_range=(10.0, 120.0), drift_amp_range=(0.004, 0.05),
+            p_fringes=0.2, n_fringes_range=(1, 3), fringe_freq_range=(0.05, 50.0), fringe_amp_range=(0.001, 0.015),
+            p_spikes=0.2, spikes_count_range=(1, 6), spike_amp_range=(0.002, 2), spike_width_range=(1.0, 100.0),
+            clip=(0.0, 1.2),
+        ),
+        freeze_noise=False
     )
-    NOISE_VAL = noise_val or dict(
-        std_add_range=(0, 1e-5), std_mult_range=(0, 1e-5),
-        p_drift=0, drift_sigma_range=(20.0, 120.0), drift_amp_range=(0.0, 0.01),
-        p_fringes=0, n_fringes_range=(1, 2), fringe_freq_range=(0.5, 10.0), fringe_amp_range=(0.0, 0.004),
-        p_spikes=0.0, spikes_count_range=(1, 2), spike_amp_range=(0.0, 0.01), spike_width_range=(1.0, 3.0),
-        clip=(0.0, 1.2),
+    ds_val = SpectraDataset(
+        n_samples=int(cfg.get("n_val", 2000)),
+        num_points=int(cfg.get("n_points", 800)),
+        gas=gas, poly_freq=poly, transitions_dict=transitions_dict,
+        sample_ranges=val_ranges, with_noise=True,
+        noise_profile=cfg.get("noise_val") or dict(
+            std_add_range=(0, 1e-5), std_mult_range=(0, 1e-5),
+            p_drift=0, drift_sigma_range=(20.0, 120.0), drift_amp_range=(0.0, 0.01),
+            p_fringes=0, n_fringes_range=(1, 2), fringe_freq_range=(0.5, 10.0), fringe_amp_range=(0.0, 0.004),
+            p_spikes=0.0, spikes_count_range=(1, 2), spike_amp_range=(0.0, 0.01), spike_width_range=(1.0, 3.0),
+            clip=(0.0, 1.2),
+        ),
+        freeze_noise=True
     )
 
-    dataset_train = SpectraDataset(n_samples=n_train, num_points=n_points,
-                                   poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-                                   sample_ranges=TRAIN_RANGES, strict_check=True,
-                                   with_noise=True, noise_profile=NOISE_TRAIN, freeze_noise=False)
-    dataset_val = SpectraDataset(n_samples=n_val, num_points=n_points,
-                                 poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-                                 sample_ranges=VAL_RANGES, strict_check=True,
-                                 with_noise=True, noise_profile=NOISE_VAL, freeze_noise=True)
+    # --------------------------
+    # 4) DataLoaders
+    # --------------------------
 
-    train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=(device=='cuda'))
-    val_loader   = DataLoader(dataset_val,   batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=(device=='cuda'))
+    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    num_workers = 2 if os.name == "nt" else 4       # workers légers suffisent
+    common = dict(
+        num_workers=num_workers,
+        pin_memory=(device == 'cuda'),
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=(2 if num_workers > 0 else None),
+        collate_fn=collate_fn,
+    )
+    train_loader = DataLoader(ds_train, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, drop_last=True, **common)
+    val_loader   = DataLoader(ds_val,   batch_size=int(cfg.get("batch_size", 32)), shuffle=False, drop_last=False, **common)
 
-    # baseline0 n'est PAS prédit (normalisation via max LOWESS)
-    predict_list = predict_list or ["sig0","dsig","mf_CH4","P","T","baseline1","baseline2"]
-    film_list    = []
+
+    # --------------------------
+    # 5) Modèle
+    # --------------------------
+    predict_list = cfg.get("predict_list") or ['sig0', 'dsig', f'mf_{gas}', 'baseline1', 'baseline2']
+    film_list    = cfg.get("film_list")    or ['P', 'T']
 
     model = PhysicallyInformedAE(
-        n_points=n_points, param_names=PARAMS, poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
-        lr=lrs[0], alpha_param=0.3, alpha_phys=0.7, head_mode="multi",
-        predict_params=predict_list, film_params=film_list,
-        refine_steps=1, refine_delta_scale=0.1, refine_target="noisy",
-        refine_warmup_epochs=30, freeze_base_epochs=20,
-        base_lr=lrs[0], refiner_lr=lrs[1],
-        baseline_fix_enable=False, baseline_fix_sideband=50, baseline_fix_degree=2,
-        baseline_fix_weight=1.0, baseline_fix_in_warmup=False,
+        gas=gas, n_points=int(cfg.get("n_points", 800)), param_names=PARAMS,
+        poly_freq_CH4=poly, transitions_dict=transitions_dict,
+        lr=float(cfg.get("base_lr", 1e-4)),
+        alpha_param=float(cfg.get("alpha_param", 0.3)),
+        alpha_phys=float(cfg.get("alpha_phys", 0.7)),
+        head_mode="multi", predict_params=predict_list, film_params=film_list,
+        refine_steps=int(cfg.get("refine_steps", 0)),
+        refine_delta_scale=float(cfg.get("refine_delta_scale", 0.1)),
+        refine_target=str(cfg.get("refine_target", "noisy")),
+        refine_warmup_epochs=int(cfg.get("refine_warmup_epochs", 30)),
+        freeze_base_epochs=int(cfg.get("freeze_base_epochs", 20)),
+        base_lr=float(cfg.get("base_lr", 1e-4)),
+        refiner_lr=float(cfg.get("refiner_lr", 1e-5)),
         recon_max1=True,
-        corr_mode="none",
-        corr_savgol_win= 15,   
-        corr_savgol_poly=3 
+        corr_mode=str(cfg.get("corr_mode", "none")),
+        corr_savgol_win=int(cfg.get("sg_win", 15)),
+        corr_savgol_poly=int(cfg.get("sg_poly", 3)),
+        weight_mf=float(cfg.get("weight_mf", 1.0)),
+        # EfficientNet scaling
+        width_mult=float(cfg.get("width_mult", 1.0)),
+        depth_mult=float(cfg.get("depth_mult", 1.0)),
+        ref_width_mult=(float(cfg["ref_width_mult"]) if cfg.get("ref_width_mult") is not None else None),
+        ref_depth_mult=(float(cfg["ref_depth_mult"]) if cfg.get("ref_depth_mult") is not None else None),
+        se_ratio=float(cfg.get("se_ratio", 0.25)),
+        group_norm_groups=int(cfg.get("group_norm_groups", 8)),
+        # HP de tête
+        head_hidden_mult=float(cfg.get("head_hidden_mult", 0.5)),
+        head_hidden_min=int(cfg.get("head_hidden_min", 128)),
+        head_layers=int(cfg.get("head_layers", 2)),
+        head_dropout=float(cfg.get("head_dropout", 0.0)),
+        head_activation=str(cfg.get("head_activation", "gelu")),
+        head_norm=str(cfg.get("head_norm", "layer")),
     )
+
+        # exposer les profils de bruit au module
+    model.train_noise_profile = dict(ds_train.noise_profile)
+    model.val_noise_profile   = dict(ds_val.noise_profile)
+    model.with_noise_train    = bool(ds_train.with_noise)
+    model.with_noise_val      = bool(ds_val.with_noise)
+
+
+    # -- appliquer un override de stage (A/B1/B2) si demandé dans cfg
+    if cfg.get("stage_override"):
+        st = str(cfg["stage_override"]).upper()
+        if st == "B":   # compat arrière
+            st = "B1"
+        model.set_stage_mode(st)
+
     return model, train_loader, val_loader
 
+# ---------------------------
+# CSV logger & early stop Optuna (identiques à ton 2e script)
+# ---------------------------
+class CSVLoggerCallback:
+    HEADER = [
+        "trial",
+        "base_lr","refiner_lr","batch_size","width_mult","depth_mult",
+        "se_ratio","group_norm_groups","alpha_phys","alpha_param",
+        "refine_steps","refine_delta_scale","corr_mode","sg_win","sg_poly",
+        "film","predict_list",
+        "head_hidden_mult","head_hidden_min","head_layers","head_dropout","head_activation","head_norm",
+        "val_loss","val_phys","val_corr","val_params"
+    ]
+
+    def __init__(self, csv_file="optuna_results.csv", force_header_if_empty=True):
+        self.csv_file = csv_file
+        self._wrote_header = False
+        if force_header_if_empty:
+            # Écrit l'entête si fichier absent ou vide
+            need_header = (not os.path.exists(self.csv_file)) or (os.path.getsize(self.csv_file) == 0)
+            if need_header:
+                os.makedirs(os.path.dirname(self.csv_file) or ".", exist_ok=True)
+                with open(self.csv_file, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(self.HEADER)
+                self._wrote_header = True
+
+    def __call__(self, study, trial):
+        # Sécurité: si quelqu’un a effacé le fichier entre-temps, on remet l'entête
+        if (not os.path.exists(self.csv_file)) or (os.path.getsize(self.csv_file) == 0):
+            with open(self.csv_file, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.HEADER)
+            self._wrote_header = True
+
+        p = trial.params
+        with open(self.csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                trial.number,
+                p.get("base_lr"), p.get("refiner_lr"), p.get("batch_size"),
+                p.get("width_mult"), p.get("depth_mult"),
+                p.get("se_ratio"), p.get("group_norm_groups"),
+                p.get("alpha_phys"), p.get("alpha_param"),
+                p.get("refine_steps"), p.get("refine_delta_scale"),
+                p.get("corr_mode"), p.get("sg_win"), p.get("sg_poly"),
+                p.get("film"), json.dumps(p.get("predict_list")),
+                p.get("head_hidden_mult"), p.get("head_hidden_min"),
+                p.get("head_layers"), p.get("head_dropout"),
+                p.get("head_activation"), p.get("head_norm"),
+                trial.user_attrs.get("val_loss"),
+                trial.user_attrs.get("val_phys"),
+                trial.user_attrs.get("val_corr"),
+                trial.user_attrs.get("val_params"),
+            ])
+
+
+class StopAfterNTrials:
+    def __init__(self, max_trials): self.max_trials = max_trials
+    def __call__(self, study: optuna.Study, trial: optuna.trial.FrozenTrial):
+        done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        if len(done) >= self.max_trials:
+            print(f"> Arrêt forcé après {self.max_trials} trials complétés.")
+            study.stop()
+
+# ---------------------------
+# Utilitaires
+# ---------------------------
+def _odd(x: int) -> int:
+    return x if x % 2 == 1 else (x + 1)
+
+def _auto_devices():
+    if torch.cuda.is_available():
+        return ("gpu", 1, "32-true")   # TF32 OK sur Ampere+
+    if torch.backends.mps.is_available():
+        return ("mps", 1, "32")        # pas de TF32 sur MPS
+    return ("cpu", 1, "32")            # CPU standard
+
+
+
+def set_all_seeds(seed: int = 42):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); pl.seed_everything(seed, workers=True)
+
+class OptunaPruneCallback(pl.Callback):
+    def __init__(self, trial, monitor: str = "val_loss"):
+        super().__init__()
+        self.trial = trial
+        self.monitor = monitor
+
+    def on_validation_end(self, trainer, pl_module):
+        metric = trainer.callback_metrics.get(self.monitor)
+        if metric is None:
+            return
+        self.trial.report(float(metric), step=trainer.current_epoch)
+        if self.trial.should_prune():
+            # Optionnel: limiter au rank 0 si DDP
+            if getattr(trainer, "is_global_zero", True):
+                raise optuna.exceptions.TrialPruned()
+            
+# ===== Optuna viz — version robuste (Axes vs Figure, polices HPC, filtres) =====
+# ===== Optuna viz — suppression des warnings & layout robuste =====
+import os, json, warnings, matplotlib as mpl
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
+
+def _to_figure(obj):
+    import numpy as np
+    import matplotlib.pyplot as plt
+    if hasattr(obj, "figure"):          # Axes
+        return obj.figure
+    if hasattr(obj, "get_figure"):      # Axes
+        return obj.get_figure()
+    if hasattr(obj, "savefig"):         # Figure
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return _to_figure(obj[0])
+    if isinstance(obj, np.ndarray):
+        return _to_figure(obj.flat[0])
+    raise TypeError(f"Objet non pris en charge pour savefig: {type(obj)}")
+
+def _save_fig(obj, path, dpi=150):
+    import matplotlib.pyplot as plt  
+    fig = _to_figure(obj)
+    fig.canvas.draw()
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+def save_optuna_figures(study: "optuna.Study", outdir: str, *, save_html: bool = False, dpi: int = 150):
+    """
+    Crée des PNG (et HTML optionnels) des visualisations Optuna…
+    …en ignorant les hyperparams constants (évite 'unique value length < 2').
+    """
+    from optuna.visualization.matplotlib import (
+        plot_optimization_history, plot_intermediate_values, plot_slice,
+        plot_param_importances, plot_parallel_coordinate, plot_contour, plot_edf
+    )
+    os.makedirs(outdir, exist_ok=True)
+
+    complete = [t for t in study.trials if t.state.name == "COMPLETE"]
+    varied_params = set()
+    if complete:
+        all_params = {k for t in complete for k in t.params.keys()}
+        for p in sorted(all_params):
+            vals = [t.params.get(p) for t in complete if p in t.params]
+            if len(set(vals)) >= 2:
+                varied_params.add(p)
+    varied_list = sorted(varied_params)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module=r"optuna(\.visualization(\.matplotlib)?)?")
+        warnings.filterwarnings("ignore", message=r"Param .* unique value length is less than 2")
+        warnings.filterwarnings("ignore", message=r"Output figures of this Matplotlib-based .*plot_contour.*")
+        warnings.filterwarnings("ignore", message=r"Tight layout not applied.*")
+        with mpl.rc_context({"font.family": ["DejaVu Sans", "sans-serif"], "axes.unicode_minus": False}):
+            figs = []
+            try: figs.append(("optimization_history.png",  plot_optimization_history(study)))
+            except Exception as e: print(f"[viz] optimization_history: {e}")
+            try: figs.append(("intermediate_values.png",  plot_intermediate_values(study)))
+            except Exception as e: print(f"[viz] intermediate_values: {e}")
+            if varied_list:
+                try: figs.append(("slice.png",             plot_slice(study, params=varied_list)))
+                except Exception as e: print(f"[viz] slice: {e}")
+                try: figs.append(("param_importances.png", plot_param_importances(study, params=varied_list)))
+                except Exception as e: print(f"[viz] param_importances: {e}")
+                if len(varied_list) >= 2:
+                    try: figs.append(("parallel_coordinate.png", plot_parallel_coordinate(study, params=varied_list)))
+                    except Exception as e: print(f"[viz] parallel_coordinate: {e}")
+                    try: figs.append(("contour.png", plot_contour(study, params=varied_list)))
+                    except Exception as e: print(f"[viz] contour: {e}")
+            try: figs.append(("edf.png", plot_edf(study)))
+            except Exception as e: print(f"[viz] edf: {e}")
+            for fname, obj in figs:
+                try: _save_fig(obj, os.path.join(outdir, fname), dpi=dpi)
+                except Exception as e: print(f"[viz] save {fname}: {e}")
+
+    # Résumé JSON
+    try:
+        best = study.best_trial
+        summary = {
+            "best_trial": best.number,
+            "best_value": study.best_value,
+            "n_trials": len(study.trials),
+            "params": best.params,
+            "user_attrs": {k: best.user_attrs.get(k) for k in ("val_loss","val_phys","val_corr","val_params")},
+        }
+        with open(os.path.join(outdir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[viz] summary.json: {e}")
+
+    # HTML (Plotly) optionnel
+    if save_html:
+        try:
+            import optuna.visualization as vz
+            charts = {
+                "optimization_history.html": vz.plot_optimization_history(study),
+                "intermediate_values.html":  vz.plot_intermediate_values(study),
+                "edf.html":                  vz.plot_edf(study),
+            }
+            if varied_list:
+                charts["slice.html"] = vz.plot_slice(study, params=varied_list)
+                charts["param_importances.html"] = vz.plot_param_importances(study, params=varied_list)
+                if len(varied_list) >= 2:
+                    charts["parallel_coordinate.html"] = vz.plot_parallel_coordinate(study, params=varied_list)
+                    charts["contour.html"] = vz.plot_contour(study, params=varied_list)
+            for fname, fig in charts.items():
+                if fig is not None:
+                    fig.write_html(os.path.join(outdir, fname), include_plotlyjs="cdn")
+        except Exception as e:
+            print(f"[viz] HTML ignoré: {e}")
+
+def finalize_optuna_run(
+    study: "optuna.Study",
+    study_dir: str,
+    *,
+    figdir: str | None = None,
+    save_html: bool = False,
+    viz_dpi: int = 150,
+    topk: int = 15,
+):
+    """
+    Post-traitement d'une étude Optuna:
+      - écrit best.json + topK.csv
+      - exporte des figures Matplotlib (et HTML optionnel)
+    """
+    os.makedirs(study_dir, exist_ok=True)
+    figdir = figdir or os.path.join(study_dir, "figs")
+    os.makedirs(figdir, exist_ok=True)
+
+    # 1) Fichiers récap
+    try:
+        best = study.best_trial
+        best_payload = {
+            "best_trial": best.number,
+            "best_value": study.best_value,
+            "params": best.params,
+            "user_attrs": {
+                "val_loss": best.user_attrs.get("val_loss"),
+                "val_phys": best.user_attrs.get("val_phys"),
+                "val_corr": best.user_attrs.get("val_corr"),
+                "val_params": best.user_attrs.get("val_params"),
+                "refine_target": best.user_attrs.get("refine_target"),
+                "predict_list": best.user_attrs.get("predict_list"),
+                "film": best.user_attrs.get("film"),
+            },
+            "state": best.state.name,
+        }
+        with open(os.path.join(study_dir, "best.json"), "w", encoding="utf-8") as f:
+            json.dump(best_payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[finalize] best.json: {e}")
+
+    # 2) Top-K CSV
+    try:
+        import csv
+        complete = [t for t in study.trials if t.state.name == "COMPLETE"]
+        complete.sort(key=lambda t: t.value)
+        rows = []
+        for t in complete[:topk]:
+            rows.append({
+                "trial": t.number,
+                "value": t.value,
+                **{f"p:{k}": v for k, v in t.params.items()},
+                **{f"ua:{k}": t.user_attrs.get(k) for k in ("val_loss","val_phys","val_corr","val_params")},
+            })
+        csv_path = os.path.join(study_dir, f"top{topk}.csv")
+        if rows:
+            keys = sorted({k for r in rows for k in r.keys()}, key=lambda x: (not x.startswith("p:"), x))
+            with open(csv_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=keys)
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+        else:
+            # au moins créer un CSV vide avec header minimal
+            with open(csv_path, "w", newline="") as f:
+                w = csv.writer(f); w.writerow(["trial","value"])
+    except Exception as e:
+        print(f"[finalize] topK.csv: {e}")
+
+    # 3) Figures
+    try:
+        save_optuna_figures(study, figdir, save_html=save_html, dpi=viz_dpi)
+    except Exception as e:
+        print(f"[finalize] figures: {e}")
+
+    print(f"[finalize] OK → study_dir={study_dir}  |  figs={figdir}")
+
+# ---------------------------
+# OBJECTIVE OPTUNA
+# ---------------------------
+def make_objective(args):
+    # Charge la config de base (fichier ou JSON inline)
+    if args.cfg and os.path.exists(args.cfg):
+        base_cfg = json.load(open(args.cfg, "r", encoding="utf-8"))
+    elif args.cfg and args.cfg.strip().startswith("{"):
+        base_cfg = json.loads(args.cfg)
+    else:
+        raise RuntimeError("--cfg requis (chemin fichier JSON ou JSON inline).")
+
+    GAS = base_cfg.get("gas", "CH4").upper()
+    MF_KEY = f"mf_{GAS}"
+
+    def objective(trial: optuna.trial.Trial) -> float:
+        # ===== (1) Choix “de base” =====
+        batch_size = trial.suggest_categorical("batch_size", [16, 24, 32, 48, 64])
+
+        # Archi backbone
+        width_mult = trial.suggest_float("width_mult", 0.75, 1.9)
+        depth_mult = trial.suggest_float("depth_mult", 0.6, 1.6)
+        group_norm_groups = trial.suggest_categorical("group_norm_groups", [8, 16, 32])
+        se_ratio = trial.suggest_float("se_ratio", 0.10, 0.45)
+
+        # Raffineur
+        refine_steps = trial.suggest_int("refine_steps", 0, 2)
+        if refine_steps > 0:
+            ref_width_mult     = trial.suggest_float("ref_width_mult", 0.75, 1.9)
+            ref_depth_mult     = trial.suggest_float("ref_depth_mult", 0.6, 1.6)
+            refine_delta_scale = trial.suggest_float("refine_delta_scale", 0.05, 0.30)
+        else:
+            ref_width_mult = None
+            ref_depth_mult = None
+            refine_delta_scale = 0.1
+
+        # ===== (1b) Valeurs FIXES (pas optimisées) lues depuis la cfg =====
+        refine_target = base_cfg.get("refine_target", "noisy")
+        predict_list = get_predict_list_A(base_cfg)
+
+        # FiLM (pris depuis la cfg pour rester déterministe vis-à-vis d'Optuna)
+        film = bool(base_cfg.get("film", False))
+
+        # Optim
+        base_lr    = trial.suggest_float("base_lr", 1e-5, 5e-4, log=True)
+        refiner_lr = trial.suggest_float("refiner_lr", 5e-7, 2e-4, log=True)
+
+        # Pertes
+        alpha_phys  = trial.suggest_float("alpha_phys", 0.3, 1.5)
+        alpha_param = trial.suggest_float("alpha_param", 0.0, 1.0)
+
+        predicts_mf = (predict_list is None) or (MF_KEY in (predict_list or []))
+        weight_mf = trial.suggest_float("weight_mf", 0.5, 5.0, log=True) if predicts_mf else 1.0
+
+        # Staging/warmup
+        refine_warmup_epochs = trial.suggest_int("refine_warmup_epochs", 10, 60)
+        freeze_base_epochs   = trial.suggest_int(
+            "freeze_base_epochs",
+            refine_warmup_epochs + 5,
+            max(refine_warmup_epochs + 5, 80)
+        )
+
+        # Corr / dérivées
+        corr_mode = trial.suggest_categorical("corr_mode", ["savgol"])
+        if corr_mode == "savgol":
+            sg_win  = _odd(trial.suggest_int("sg_win", 7, 61))
+            sg_poly = trial.suggest_int("sg_poly", 2, 5)
+        else:
+            sg_win, sg_poly = 15, 3  # (ne devrait pas arriver ici)
+
+        # ===== (2) TÊTE MLP =====
+        head_hidden_mult = trial.suggest_float("head_hidden_mult", 0.35, 1.5)
+        head_hidden_min  = trial.suggest_categorical("head_hidden_min", [64, 96, 128, 160, 192, 256])
+        head_layers      = trial.suggest_int("head_layers", 1, 4)
+        head_dropout     = trial.suggest_float("head_dropout", 0.0, 0.35)
+        head_activation  = trial.suggest_categorical("head_activation", ["gelu", "silu", "relu", "tanh"])
+        head_norm        = trial.suggest_categorical("head_norm", ["layer", "batch", "none"])
+
+        # ===== (3) Composer la cfg pour build =====
+        cfg = dict(base_cfg)
+        cfg.update({
+            "batch_size": batch_size,
+            "width_mult": width_mult, "depth_mult": depth_mult,
+            "group_norm_groups": group_norm_groups,
+            "se_ratio": se_ratio, 
+            "base_lr": base_lr, "refiner_lr": refiner_lr,
+            "alpha_phys": alpha_phys, "alpha_param": alpha_param,
+            "weight_mf": weight_mf,
+            "predict_list": predict_list,          # fixé depuis la cfg (et/ou ALL_TARGETS)
+            "refine_steps": refine_steps, "refine_delta_scale": refine_delta_scale,
+            "refine_target": refine_target,        # fixé depuis la cfg
+            "refine_warmup_epochs": refine_warmup_epochs, "freeze_base_epochs": freeze_base_epochs,
+            "corr_mode": corr_mode, "sg_win": sg_win, "sg_poly": sg_poly,
+            "head_hidden_mult": head_hidden_mult,
+            "head_hidden_min": head_hidden_min,
+            "head_layers": head_layers,
+            "head_dropout": head_dropout,
+            "head_activation": head_activation,
+            "head_norm": head_norm,
+        })
+        if refine_steps > 0:
+            cfg["ref_width_mult"] = ref_width_mult
+            cfg["ref_depth_mult"] = ref_depth_mult
+        else:
+            cfg["ref_width_mult"] = None
+            cfg["ref_depth_mult"] = None
+
+        # Active/désactive FiLM via la liste de conditions
+        cfg["film_list"] = (base_cfg.get("film_list") or ['P', 'T']) if film else []
+
+        # (optionnel) tracer les valeurs fixes dans l'étude
+        trial.set_user_attr("refine_target", refine_target)
+        trial.set_user_attr("predict_list", json.dumps(predict_list))
+        trial.set_user_attr("film", film)
+
+        # ===== (4) Build + court entraînement =====
+        set_all_seeds(1337 + trial.number)
+        model, train_loader, val_loader = build_from_args(cfg)
+        model.set_film_usage(film)
+
+        accelerator, devices, precision = _auto_devices()
+
+        prune_cb = OptunaPruneCallback(trial, monitor="val_loss")
+        
+        trainer = pl.Trainer(
+            max_epochs=args.max_epochs,
+            accelerator=accelerator, devices=devices,
+            precision=precision,
+            logger=False, enable_progress_bar=False, enable_checkpointing=False,
+            callbacks=[UpdateEpochInDataset(),prune_cb],
+        )
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+        val_loss   = trainer.callback_metrics.get("val_loss")
+        val_phys   = trainer.callback_metrics.get("val_phys")
+        val_corr   = trainer.callback_metrics.get("val_corr")
+        val_params = trainer.callback_metrics.get("val_params")
+        if val_loss is None:
+            raise RuntimeError("val_loss introuvable dans callback_metrics.")
+
+        trial.set_user_attr("val_loss", float(val_loss))
+        if val_phys is not None:   trial.set_user_attr("val_phys", float(val_phys))
+        if val_corr is not None:   trial.set_user_attr("val_corr", float(val_corr))
+        if val_params is not None: trial.set_user_attr("val_params", float(val_params))
+        return float(val_loss)
+
+    return objective
+
+def _is_master():
+    import os
+    # Rang "0" pour torch/SLURM; fallback=maître si non défini
+    for k in ("SLURM_PROCID", "RANK", "LOCAL_RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v) == 0
+            except Exception:
+                pass
+    return True
+
+# ---------------------------
+# MAIN (run | optuna)
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Entraînement ou HPO Optuna pour PhysicallyInformedAE")
+    parser.add_argument("mode", choices=["run","optuna"], help="run = entraînement classique, optuna = HPO")
+    parser.add_argument("--cfg", type=str, required=True,
+                        help="Chemin vers un JSON (ou JSON inline) pour build_from_args (poly/transitions/ranges).")
+    parser.add_argument("--max-epochs", type=int, default=100)
+
+    # options mode run (hyperparamètres fixes, écrasent le cfg)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--width-mult", type=float, default=None)
+    parser.add_argument("--depth-mult", type=float, default=None)
+    parser.add_argument("--se-ratio", type=float, default=None)
+    parser.add_argument("--base-lr", type=float, default=None)
+    parser.add_argument("--refiner-lr", type=float, default=None)
+    parser.add_argument("--alpha-phys", type=float, default=None)
+    parser.add_argument("--alpha-param", type=float, default=None)
+    parser.add_argument("--refine-steps", type=int, default=None)
+    parser.add_argument("--refine-delta-scale", type=float, default=None)
+    parser.add_argument("--corr-mode", choices=["none","central","savgol"], default=None)
+    parser.add_argument("--sg-win", type=int, default=None)
+    parser.add_argument("--sg-poly", type=int, default=None)
+    parser.add_argument("--film", action="store_true", help="Active FiLM (utilise film_list du cfg ou ['P','T']).")
+    parser.add_argument("--no-film", action="store_true", help="Désactive FiLM.")
+
+    # nouveaux flags: stage & I/O des blocs
+    parser.add_argument("--stage-override", choices=["A","B","B1","B2"], default=None,
+                        help="Force le stage: A=backbone+heads only, B/B1=refiner only (A gelé), B2=finetune conjoint.")
+    parser.add_argument("--load-a", type=str, default=None, help="Chemin A_only.pth à charger avant entraînement.")
+    parser.add_argument("--load-refiner", type=str, default=None, help="Chemin refiner_only_*.pth à charger avant entraînement.")
+    parser.add_argument("--export-a", type=str, default=None, help="Chemin pour exporter A_only après l'entraînement.")
+    parser.add_argument("--export-refiner", type=str, default=None, help="Chemin pour exporter Refiner_only après l'entraînement.")
+
+    # options Optuna
+    parser.add_argument("--n-trials", type=int, default=50)
+    parser.add_argument("--study-name", type=str, default="PIAE_HPO")
+    parser.add_argument("--storage", type=str, default=None,
+                        help="Ex: 'journal:optuna_runs/PIAE/optuna_journal.log'. Si None, créé auto.")
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Chemin CSV résultats. Si None, créé auto à côté du journal.")
+    args = parser.parse_args()
+
+    if args.mode == "run":
+        # charge & écrase le cfg
+        cfg = json.load(open(args.cfg, "r", encoding="utf-8")) if os.path.exists(args.cfg) else json.loads(args.cfg)
+
+        def _maybe_set(key, val):
+            if val is not None:
+                cfg[key] = val
+
+        _maybe_set("batch_size", args.batch_size)
+        _maybe_set("width_mult", args.width_mult)
+        _maybe_set("depth_mult", args.depth_mult)
+        _maybe_set("se_ratio", args.se_ratio)
+        _maybe_set("base_lr", args.base_lr)
+        _maybe_set("refiner_lr", args.refiner_lr)
+        _maybe_set("alpha_phys", args.alpha_phys)
+        _maybe_set("alpha_param", args.alpha_param)
+        _maybe_set("refine_steps", args.refine_steps)
+        _maybe_set("refine_delta_scale", args.refine_delta_scale)
+        _maybe_set("corr_mode", args.corr_mode)
+        if args.sg_win is not None:
+            cfg["sg_win"] = _odd(args.sg_win)
+        if args.sg_poly is not None:
+            cfg["sg_poly"] = int(args.sg_poly)
+
+        # FiLM on/off depuis la CLI
+        if args.film and not args.no_film:
+            cfg["film_list"] = cfg.get("film_list") or ['P', 'T']
+        if args.no_film:
+            cfg["film_list"] = []
+
+        # stage override (A/B/B1/B2) si demandé → mis en cfg et appliqué dans build_from_args()
+        if args.stage_override is not None:
+            st = args.stage_override.upper()
+            if st == "B":  # compat
+                st = "B1"
+            cfg["stage_override"] = st
+
+        set_all_seeds(42)
+        model, train_loader, val_loader = build_from_args(cfg)
+        model.set_film_usage(len(cfg.get("film_list", [])) > 0)
+
+        # chargements optionnels des blocs (avant entraînement)
+        if args.load_a:
+            print(f"↪️  Chargement A_only depuis {args.load_a}")
+            load_block_A_only(model, args.load_a, strict=False)
+        if args.load_refiner:
+            print(f"↪️  Chargement Refiner_only depuis {args.load_refiner}")
+            load_block_refiner_only(model, args.load_refiner, strict=False)
+
+        accelerator, devices, precision = _auto_devices()
+        ckpt_dir = os.path.join("runs", "single_run")
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        trainer = pl.Trainer(
+            max_epochs=args.max_epochs,
+            accelerator=accelerator,
+            devices=devices,
+            precision=precision,
+            default_root_dir=ckpt_dir,
+            callbacks=[UpdateEpochInDataset()],
+        )
+        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+        print("✅ Fin d'entraînement. Dernier val_loss:",
+              float(trainer.callback_metrics.get("val_loss", float("nan"))))
+
+        # exports optionnels après entraînement
+        if args.export_a:
+            save_block_A_only(model, args.export_a)
+            print(f"💾 A_only sauvegardé → {args.export_a}")
+        if args.export_refiner:
+            save_block_refiner_only(model, args.export_refiner)
+            print(f"💾 Refiner_only sauvegardé → {args.export_refiner}")
+        return
+
+    # ---- Mode OPTUNA ----
+    root = "optuna_runs"
+    os.makedirs(root, exist_ok=True)
+    study_dir = os.path.join(root, args.study_name)
+    os.makedirs(study_dir, exist_ok=True)
+    journal_path = args.storage.split("journal:")[1] if (args.storage and args.storage.startswith("journal:")) \
+                   else os.path.join(study_dir, "optuna_journal.log")
+    csv_path = args.csv or os.path.join(study_dir, "optuna_results.csv")
+
+    storage = JournalStorage(JournalFileBackend(journal_path))
+    study = optuna.create_study(
+        study_name=args.study_name,
+        storage=storage,
+        direction="minimize",
+        load_if_exists=True,
+        sampler=optuna.samplers.TPESampler(multivariate=True, group=True),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+    )
+
+    csv_cb = CSVLoggerCallback(csv_path)
+    stop_cb = StopAfterNTrials(args.n_trials)
+
+    objective = make_objective(args)
+    study.optimize(objective, n_trials=args.n_trials, callbacks=[csv_cb, stop_cb])
+    # après study.optimize(...)
+    if _is_master():
+        finalize_optuna_run(
+            study, study_dir,
+            figdir=os.path.join(study_dir, "figs"),
+            save_html=bool(getattr(args, "html", False)),
+            viz_dpi=150
+        )
+
+    print(f"🥇 Best trial #{study.best_trial.number} → val_loss={study.best_value:.6f}")
+    print(f"📂 Journal: {journal_path}")
+    print(f"📄 CSV:     {csv_path}")
+
 # ============================================================
-# 13) EXEMPLES D’APPEL (décommente pour exécuter)
+# 10.b) I/O poids: A_only et Refiner_only
 # ============================================================
+def extract_state_dict_A_only(model: "PhysicallyInformedAE") -> dict:
+    sd = {}
+    sd["backbone"] = model.backbone.state_dict()
+    sd["shared_head"] = model.shared_head.state_dict()
+    if hasattr(model, "out_head") and model.out_head is not None:
+        sd["out_head"] = model.out_head.state_dict()
+    if hasattr(model, "out_heads") and model.out_heads is not None:
+        sd["out_heads"] = {k: v.state_dict() for k, v in model.out_heads.items()}
+    if getattr(model, "film", None) is not None:
+        sd["film"] = model.film.state_dict()
+        # film_mask est un buffer -> sauvé pour cohérence
+        sd["film_mask"] = getattr(model, "film_mask", None)
+    sd["_meta"] = {
+        "param_names": getattr(model, "param_names", None),
+        "predict_params": getattr(model, "predict_params", None),
+        "film_params": getattr(model, "film_params", None),
+        "feat_dim": int(model.backbone.feat_dim),
+    }
+    return sd
+
+def load_block_A_only(model: "PhysicallyInformedAE", path: str, strict: bool = False):
+    pkg = torch.load(path, map_location="cpu")
+    if "backbone" in pkg: model.backbone.load_state_dict(pkg["backbone"], strict=strict)
+    if "shared_head" in pkg: model.shared_head.load_state_dict(pkg["shared_head"], strict=strict)
+    if "out_head" in pkg and hasattr(model, "out_head"):
+        model.out_head.load_state_dict(pkg["out_head"], strict=strict)
+    if "out_heads" in pkg and hasattr(model, "out_heads"):
+        for k, sd in pkg["out_heads"].items():
+            if k in model.out_heads:
+                model.out_heads[k].load_state_dict(sd, strict=strict)
+    if "film" in pkg and getattr(model, "film", None) is not None:
+        model.film.load_state_dict(pkg["film"], strict=strict)
+    # film_mask : copier seulement si shape compatible
+    saved_mask = pkg.get("film_mask", None)
+    if isinstance(saved_mask, torch.Tensor) and hasattr(model, "film_mask") and model.film_mask is not None:
+        if saved_mask.numel() == model.film_mask.numel():
+            with torch.no_grad():
+                model.film_mask.copy_(saved_mask.to(model.film_mask.device, dtype=model.film_mask.dtype))
+        else:
+            print(f"[load_block_A_only] film_mask ignoré (shape incompatibles: saved {tuple(saved_mask.shape)} vs "
+                  f"model {tuple(model.film_mask.shape)})")
+    return model
+
+def save_block_A_only(model: "PhysicallyInformedAE", path: str):
+    ensure_dir(os.path.dirname(path))
+    torch.save(extract_state_dict_A_only(model), path)
+
+def extract_state_dict_refiner_only(model: "PhysicallyInformedAE") -> dict:
+    return {
+        "refiner": model.refiner.state_dict(),
+        "_meta": {
+            "m_params": int(model.refiner.m_params),
+            "cond_dim": int(model.refiner.cond_dim),
+            "backbone_feat_dim": int(model.refiner.backbone_feat_dim),
+            "delta_scale": float(model.refiner.delta_scale),
+        }
+    }
+
+def load_block_refiner_only(model: "PhysicallyInformedAE", path: str, strict: bool = False):
+    pkg = torch.load(path, map_location="cpu")
+    model.refiner.load_state_dict(pkg["refiner"], strict=strict)
+    # on peut aussi remettre le delta_scale du paquet (pratique si différent)
+    if "_meta" in pkg and "delta_scale" in pkg["_meta"]:
+        model.refiner.delta_scale = float(pkg["_meta"]["delta_scale"])
+    return model
+
+def save_block_refiner_only(model: "PhysicallyInformedAE", path: str):
+    ensure_dir(os.path.dirname(path))
+    torch.save(extract_state_dict_refiner_only(model), path)
+
+@torch.no_grad()
+def cascade_infer(model: "PhysicallyInformedAE",
+                  spectra: torch.Tensor,
+                  provided_phys: dict,
+                  refiner_weight_paths: List[str]) -> dict:
+    """
+    Applique A puis une séquence de raffineurs (B1,B2,...) donnés par leurs poids.
+    Chaque raffineur met à jour params_pred_norm avant le suivant.
+    """
+    model.eval()
+    device = spectra.device
+    B = spectra.shape[0]
+
+    # condition FiLM
+    if len(model.film_params) > 0:
+        cols = [norm_param_torch(n, provided_phys[n].to(device)).unsqueeze(1) for n in model.film_params]
+        cond_norm = torch.cat(cols, dim=1).to(torch.float32)
+    else:
+        cond_norm = None
+
+    # passe A
+    latent, _ = model.backbone(spectra.unsqueeze(1))
+    feat_shared = model.feature_head(latent)
+    params_pred_norm = model._predict_params_from_features(feat_shared, cond_norm)
+
+    # phys fournis (non prédits)
+    if len(model.provided_params) > 0:
+        provided_list = [provided_phys[n].to(device) for n in model.provided_params]
+        provided_phys_tensor = torch.stack(provided_list, dim=1)
+    else:
+        provided_phys_tensor = params_pred_norm.new_zeros((B, 0))
+
+    # cascade des raffineurs
+    for wpath in refiner_weight_paths or []:
+        load_block_refiner_only(model, wpath, strict=False)
+        pred_phys  = model._denorm_params_subset(params_pred_norm, model.predict_params)
+        y_full     = model._compose_full_phys(pred_phys, provided_phys_tensor)
+        recon      = model._physics_reconstruction(y_full, device, None)
+        resid      = recon - spectra
+        delta      = model.refiner(spectra, resid, params_pred_norm, cond_norm, feat_shared)
+        params_pred_norm = params_pred_norm.add(delta).clamp(1e-4, 1-1e-4)
+
+    pred_phys_final = model._denorm_params_subset(params_pred_norm, model.predict_params)
+    y_full_final    = model._compose_full_phys(pred_phys_final, provided_phys_tensor)
+    recon_final     = model._physics_reconstruction(y_full_final, device, None)
+    return {"params_pred_norm": params_pred_norm, "y_phys_full": y_full_final, "spectra_recon": recon_final}
+
 if __name__ == "__main__":
-    model, train_loader, val_loader = build_data_and_model()
-    cb = [PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1), UpdateEpochInDataset()] 
-
-    #--- Étape A (base + heads). Ici on ACTIVE FiLM dès A (optionnel).
-    train_stage_A(
-        model, train_loader, val_loader,
-        epochs=50,
-        base_lr=1e-4,
-        train_film=False,   
-        use_film=False,     
-        film_subset=[],
-        heads_subset=["sig0","dsig", "P","T","mf_CH4","baseline1","baseline2"],
-        callbacks=cb,
-        ckpt_out="stage_A_PT.ckpt"
-    )
-
-    # --- Évaluation (avec option refit baseline aux bords)
-    df = evaluate_and_plot(
-        model, val_loader, n_show=5, refine=True, robust_smape=False,
-        baseline_correction={"enabled": False, "edge_pts": 50, "deg": 2, "iters": 1}
-    )
-
-    # --- Étape B1 : raffineur seul (on repart de A) — mêmes callbacks/figures que A
-    model = train_stage_B1(
-        model, train_loader, val_loader,
-        epochs=40,
-        base_lr=1e-4,
-        refiner_lr=1e-4,
-        refine_steps=1,
-        delta_scale=0.3,
-        use_film=False,
-        train_film=False,  
-        film_subset=[],
-        heads_subset=["sig0","dsig", "P","T","mf_CH4","baseline1","baseline2"],
-        callbacks=cb,  
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        ckpt_in="stage_A_PT.ckpt",
-        ckpt_out="stage_B1_PT.ckpt",
-        enable_progress_bar=False,  
-    )
-
-    _ = evaluate_and_plot(
-        model, val_loader, n_show=5, refine=True, robust_smape=False,
-        baseline_correction={"enabled": False, "edge_pts": 50, "deg": 2, "iters": 1}
-    )
-
-# en repartant du checkpoint de A (facultatif mais conseillé)
-    model = train_stage_B2(
-        model, train_loader, val_loader,
-        epochs=15,                 # 10–30 selon taille de tes données
-        base_lr=1e-6,              # petit LR pour éviter d’écraser l’étape A
-        refiner_lr=1e-6,           # un cran plus petit que base
-        refine_steps=1,            # raffinement itératif
-        delta_scale=0.08,          # doux pour la stabilité
-        use_film=False,             # FiLM activé
-        train_film=False,  
-        film_subset=[],     # ou "all" si tu veux tout conditionner
-        callbacks=cb,
-        heads_subset=["sig0","dsig", "P","T","mf_CH4","baseline1","baseline2"],
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        ckpt_in="stage_B1_PT.ckpt",    # ← charge A
-        ckpt_out="stage_B2_PT.ckpt",  # ← sauvegarde B2
-        enable_progress_bar=False,
-    )
+    main()
