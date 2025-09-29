@@ -1440,6 +1440,66 @@ class UpdateEpochInDataset(pl.Callback):
         if hasattr(ds, "set_epoch"):
             ds.set_epoch(trainer.current_epoch)
 
+
+class EpochMetricsLogger(pl.Callback):
+    """Callback Lightning pour logguer métriques d'époque dans un fichier ``.out``."""
+
+    def __init__(self, log_path: str, *, rank_zero_only: bool = True):
+        super().__init__()
+        self.log_path = log_path
+        self.rank_zero_only = rank_zero_only
+        self._file_initialized = False
+
+    def _is_allowed(self, trainer) -> bool:
+        if not self.rank_zero_only:
+            return True
+        return getattr(trainer, "is_global_zero", True)
+
+    def _prepare_file(self):
+        if not self._file_initialized:
+            ensure_dir(os.path.dirname(self.log_path))
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write("epoch,stage,metric,value\n")
+            self._file_initialized = True
+
+    @staticmethod
+    def _to_float(val):
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, torch.Tensor):
+            if val.numel() == 1:
+                return float(val.detach().cpu())
+        return None
+
+    def _log_stage(self, trainer, stage: str):
+        if not self._is_allowed(trainer):
+            return
+
+        prefix = f"{stage}_"
+        rows = []
+        for name, value in trainer.callback_metrics.items():
+            if not name.startswith(prefix):
+                continue
+            scalar = self._to_float(value)
+            if scalar is None or not math.isfinite(scalar):
+                continue
+            rows.append((name, scalar))
+
+        if not rows:
+            return
+
+        self._prepare_file()
+        epoch = trainer.current_epoch
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            for name, scalar in rows:
+                f.write(f"{epoch},{stage},{name},{scalar:.8f}\n")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self._log_stage(trainer, "train")
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self._log_stage(trainer, "val")
+
 @torch.no_grad()
 def evaluate_and_plot(
     model: PhysicallyInformedAE,
@@ -1450,6 +1510,7 @@ def evaluate_and_plot(
     save: bool = True,
     show: bool = False,
     dpi: int = 150,
+    filename_prefix: str = "val_example",
 ):
     """
     Evaluates the model and (optionally) saves a few example plots.
@@ -1524,7 +1585,7 @@ def evaluate_and_plot(
             plt.tight_layout()
 
             if save:
-                path = os.path.join(outdir, f"val_example_{shown}.png")
+                path = os.path.join(outdir, f"{filename_prefix}_{shown}.png")
                 fig.savefig(path, dpi=dpi, bbox_inches="tight")
                 print(f"💾 saved {path}")
             if show:
@@ -1549,6 +1610,26 @@ def evaluate_and_plot(
     for k, s in stats.items():
         print(f"{k:>10s} | mean {s['mean_%']:.3f} | median {s['median_%']:.3f} | p90 {s['p90_%']:.3f} | p95 {s['p95_%']:.3f}")
     return stats
+
+
+def save_error_table(stats: dict[str, dict[str, float]], path: str):
+    """Enregistre un tableau CSV des erreurs relatives par paramètre."""
+    if not stats:
+        return
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["param", "mean_pct", "median_pct", "p90_pct", "p95_pct"])
+        for name in sorted(stats.keys()):
+            vals = stats[name]
+            writer.writerow([
+                name,
+                f"{vals.get('mean_%', float('nan')):.6f}",
+                f"{vals.get('median_%', float('nan')):.6f}",
+                f"{vals.get('p90_%', float('nan')):.6f}",
+                f"{vals.get('p95_%', float('nan')):.6f}",
+            ])
+
 
 
 # ============================================================
@@ -2304,10 +2385,22 @@ def make_objective(args):
         trial.set_user_attr("predict_list", json.dumps(predict_list))
         trial.set_user_attr("film", film)
 
+        trial_root = getattr(
+            args,
+            "_trials_root",
+            os.path.join(args.io_root or "optuna_runs", args.study_name, "trials")
+        )
+        trial_dir = os.path.join(trial_root, f"trial_{trial.number:04d}")
+        ensure_dir(trial_dir)
+        save_json(cfg, os.path.join(trial_dir, "cfg_used.json"))
+        save_json({"trial": trial.number, "params": dict(trial.params)}, os.path.join(trial_dir, "trial_params.json"))
+        trial.set_user_attr("artifact_dir", trial_dir)
+        metrics_logger = EpochMetricsLogger(os.path.join(trial_dir, "metrics.out"))
+
         # ===== (4) Build + court entraînement =====
         set_all_seeds(1337 + trial.number)
         model, train_loader, val_loader = build_from_args(cfg)
-        model.set_film_usage(film)
+        model.set_film_usage(len(cfg.get("film_list", [])) > 0)
 
         device_cfg = _auto_devices()
 
@@ -2317,9 +2410,28 @@ def make_objective(args):
             max_epochs=args.max_epochs,
             **device_cfg.to_trainer_kwargs(),
             logger=False, enable_progress_bar=False, enable_checkpointing=False,
-            callbacks=[UpdateEpochInDataset(),prune_cb],
+            default_root_dir=trial_dir,
+            callbacks=[UpdateEpochInDataset(), metrics_logger, prune_cb],
         )
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        try:
+            trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        except optuna.exceptions.TrialPruned:
+            raise
+        else:
+            if _is_master() and val_loader is not None:
+                figs_dir = os.path.join(trial_dir, "figures")
+                stats = evaluate_and_plot(
+                    model,
+                    val_loader,
+                    n_show=1,
+                    outdir=figs_dir,
+                    save=True,
+                    show=False,
+                    dpi=200,
+                    filename_prefix=f"trial{trial.number:04d}",
+                )
+                save_error_table(stats, os.path.join(trial_dir, "val_errors.csv"))
+                save_json(stats, os.path.join(trial_dir, "val_errors.json"))
 
         val_loss   = trainer.callback_metrics.get("val_loss")
         val_phys   = trainer.callback_metrics.get("val_phys")
@@ -2382,6 +2494,8 @@ def main():
     parser.add_argument("--load-refiner", type=str, default=None, help="Chemin refiner_only_*.pth à charger avant entraînement.")
     parser.add_argument("--export-a", type=str, default=None, help="Chemin pour exporter A_only après l'entraînement.")
     parser.add_argument("--export-refiner", type=str, default=None, help="Chemin pour exporter Refiner_only après l'entraînement.")
+    parser.add_argument("--io-root", type=str, default=None,
+                        help="Répertoire racine où stocker les entrées/sorties générées (cfg, métriques, figures).")
 
     # options Optuna
     parser.add_argument("--n-trials", type=int, default=50)
@@ -2429,6 +2543,16 @@ def main():
                 st = "B1"
             cfg["stage_override"] = st
 
+        run_root = ensure_dir(args.io_root or os.path.join("runs", "single_run"))
+        save_json(cfg, os.path.join(run_root, "cfg_used.json"))
+        if args.cfg and not args.cfg.strip().startswith("{") and os.path.exists(args.cfg):
+            try:
+                # copie du fichier de config d'origine pour traçabilité
+                import shutil
+                shutil.copy2(args.cfg, os.path.join(run_root, "cfg_source.json"))
+            except Exception as e:
+                print(f"[warn] Impossible de copier la cfg source: {e}")
+
         set_all_seeds(42)
         model, train_loader, val_loader = build_from_args(cfg)
         model.set_film_usage(len(cfg.get("film_list", [])) > 0)
@@ -2442,19 +2566,34 @@ def main():
             load_block_refiner_only(model, args.load_refiner, strict=False)
 
         device_cfg = _auto_devices()
-        ckpt_dir = os.path.join("runs", "single_run")
-        os.makedirs(ckpt_dir, exist_ok=True)
+        metrics_logger = EpochMetricsLogger(os.path.join(run_root, "metrics.out"))
 
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
             **device_cfg.to_trainer_kwargs(),
-            default_root_dir=ckpt_dir,
-            callbacks=[UpdateEpochInDataset()],
+            default_root_dir=run_root,
+            callbacks=[UpdateEpochInDataset(), metrics_logger],
         )
         trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
         print("✅ Fin d'entraînement. Dernier val_loss:",
               float(trainer.callback_metrics.get("val_loss", float("nan"))))
+
+        if _is_master() and val_loader is not None:
+            figs_dir = os.path.join(run_root, "figures")
+            stats = evaluate_and_plot(
+                model,
+                val_loader,
+                n_show=1,
+                outdir=figs_dir,
+                save=True,
+                show=False,
+                dpi=200,
+                filename_prefix="run",
+            )
+            save_error_table(stats, os.path.join(run_root, "val_errors.csv"))
+            save_json(stats, os.path.join(run_root, "val_errors.json"))
+            print(f"📊 Statistiques validation enregistrées dans {run_root}")
 
         # exports optionnels après entraînement
         if args.export_a:
@@ -2466,10 +2605,14 @@ def main():
         return
 
     # ---- Mode OPTUNA ----
-    root = "optuna_runs"
+    root = args.io_root or "optuna_runs"
     os.makedirs(root, exist_ok=True)
     study_dir = os.path.join(root, args.study_name)
     os.makedirs(study_dir, exist_ok=True)
+    trials_root = os.path.join(study_dir, "trials")
+    os.makedirs(trials_root, exist_ok=True)
+    args._study_dir = study_dir
+    args._trials_root = trials_root
     journal_path = args.storage.split("journal:")[1] if (args.storage and args.storage.startswith("journal:")) \
                    else os.path.join(study_dir, "optuna_journal.log")
     csv_path = args.csv or os.path.join(study_dir, "optuna_results.csv")
