@@ -79,6 +79,39 @@ def unnorm_param_torch(name: str, val_norm_t: torch.Tensor) -> torch.Tensor:
 # === NEW ===
 from functools import lru_cache
 
+
+@dataclass(frozen=True)
+class TrainerDeviceConfig:
+    """Configuration compacte pour instancier un ``pl.Trainer`` multi-device."""
+
+    accelerator: str
+    devices: int
+    precision: str
+    num_nodes: int = 1
+    strategy: Optional[str] = None
+
+    @property
+    def world_size(self) -> int:
+        return max(1, int(self.devices) * max(1, int(self.num_nodes)))
+
+    @property
+    def distributed(self) -> bool:
+        return self.world_size > 1
+
+    def to_trainer_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "accelerator": self.accelerator,
+            "devices": self.devices,
+            "num_nodes": self.num_nodes,
+            "precision": self.precision,
+        }
+        if self.strategy:
+            kwargs["strategy"] = self.strategy
+        if self.accelerator == "gpu" and self.distributed:
+            # SyncBatchNorm est essentiel pour la convergence multi-GPU
+            kwargs.setdefault("sync_batchnorm", True)
+        return kwargs
+
 def preprocess_transitions(transitions_dict: Dict[str, list],
                            device: torch.device | str = "cpu",
                            dtype: torch.dtype = torch.float64) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -1606,7 +1639,8 @@ def build_from_args(cfg: dict):
         raise ValueError("transitions_inline/transitions_csv requis: fournis les transitions (pas de défaut).")
 
     transitions_dict = {gas: transitions}
-    dev = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
+    device_cfg = _auto_devices()
+    dev = "cuda" if device_cfg.accelerator == "gpu" else ("mps" if device_cfg.accelerator == "mps" else "cpu")
     transitions_dict = preprocess_transitions(transitions_dict, device=dev, dtype=torch.float64)
 
 
@@ -1707,15 +1741,30 @@ def build_from_args(cfg: dict):
     # 4) DataLoaders
     # --------------------------
 
-    device = 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu')
-    num_workers = 2 if os.name == "nt" else 4       # workers légers suffisent
+    env_workers = os.environ.get("PHYS_NUM_WORKERS") or cfg.get("num_workers")
+    if env_workers is not None:
+        try:
+            num_workers = max(0, int(env_workers))
+        except (TypeError, ValueError):
+            raise ValueError(f"num_workers invalide: {env_workers}")
+    else:
+        cpu_total = max(1, os.cpu_count() or 1)
+        denom = max(1, device_cfg.world_size)
+        num_workers = max(1, min(8, cpu_total // denom)) if cpu_total > 1 else 0
+    pin_memory = device_cfg.accelerator == "gpu"
     common = dict(
         num_workers=num_workers,
-        pin_memory=(device == 'cuda'),
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=(2 if num_workers > 0 else None),
         collate_fn=collate_fn,
     )
+    if num_workers > 0:
+        pf = cfg.get("prefetch_factor", 2)
+        try:
+            pf_int = max(1, int(pf))
+        except (TypeError, ValueError):
+            raise ValueError(f"prefetch_factor invalide: {pf}")
+        common["prefetch_factor"] = pf_int
     train_loader = DataLoader(ds_train, batch_size=int(cfg.get("batch_size", 32)), shuffle=True, drop_last=True, **common)
     val_loader   = DataLoader(ds_val,   batch_size=int(cfg.get("batch_size", 32)), shuffle=False, drop_last=False, **common)
 
@@ -1848,12 +1897,87 @@ class StopAfterNTrials:
 def _odd(x: int) -> int:
     return x if x % 2 == 1 else (x + 1)
 
-def _auto_devices():
+def _env_int(*keys: str) -> Optional[int]:
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            cleaned = raw.replace(" ", "")
+            if "," in cleaned:
+                for part in cleaned.split(","):
+                    if part.isdigit():
+                        return int(part)
+            if "(" in cleaned:
+                prefix = cleaned.split("(", 1)[0]
+                if prefix.isdigit():
+                    return int(prefix)
+    return None
+
+
+def _count_visible_cuda_devices() -> int:
+    spec = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if spec is None or spec.strip() == "":
+        return torch.cuda.device_count()
+    tokens = [t.strip() for t in spec.split(",") if t.strip() not in {"", "-1"}]
+    return len(tokens)
+
+
+def _auto_devices() -> TrainerDeviceConfig:
     if torch.cuda.is_available():
-        return ("gpu", 1, "32-true")   # TF32 OK sur Ampere+
-    if torch.backends.mps.is_available():
-        return ("mps", 1, "32")        # pas de TF32 sur MPS
-    return ("cpu", 1, "32")            # CPU standard
+        accelerator = "gpu"
+        precision = "32-true" if torch.cuda.get_device_capability(0)[0] >= 8 else "32"
+        local_default = max(1, _count_visible_cuda_devices())
+        requested_local = _env_int("LOCAL_WORLD_SIZE", "SLURM_GPUS_ON_NODE", "MPI_LOCALNRANKS")
+        devices_per_node = max(1, min(local_default, requested_local or local_default))
+    elif torch.backends.mps.is_available():
+        accelerator = "mps"
+        precision = "32"
+        local_default = 1
+        devices_per_node = 1
+    else:
+        accelerator = "cpu"
+        precision = "32"
+        cpu_total = max(1, os.cpu_count() or 1)
+        requested_local = _env_int("LOCAL_WORLD_SIZE", "SLURM_TASKS_PER_NODE", "OMP_NUM_THREADS")
+        if requested_local is None or requested_local <= 0:
+            requested_local = min(cpu_total, max(1, cpu_total // 2))
+        devices_per_node = max(1, min(cpu_total, requested_local))
+
+    world_env = _env_int("WORLD_SIZE", "SLURM_NTASKS", "PMI_SIZE", "OMPI_COMM_WORLD_SIZE")
+    nodes_env = _env_int("SLURM_NNODES", "SLURM_JOB_NUM_NODES", "NNODES", "OMPI_COMM_WORLD_NUM_NODES")
+    num_nodes = max(1, nodes_env or 1)
+
+    if world_env and world_env > 0:
+        if nodes_env:
+            num_nodes = max(1, nodes_env)
+            per_node = max(1, math.ceil(world_env / num_nodes))
+            devices_per_node = max(1, min(devices_per_node, per_node))
+        else:
+            num_nodes = max(1, math.ceil(world_env / devices_per_node))
+        total_slots = max(1, devices_per_node * num_nodes)
+        if total_slots > world_env:
+            per_node = max(1, math.ceil(world_env / num_nodes))
+            devices_per_node = max(1, min(devices_per_node, per_node))
+        if accelerator == "gpu":
+            devices_per_node = max(1, min(devices_per_node, _count_visible_cuda_devices()))
+        else:
+            if accelerator == "cpu":
+                devices_per_node = max(1, min(devices_per_node, os.cpu_count() or devices_per_node))
+
+    strategy_env = os.environ.get("PL_TRAINER_STRATEGY") or os.environ.get("PHYS_TRAINER_STRATEGY")
+    use_ddp = (devices_per_node > 1) or (num_nodes > 1)
+    strategy = strategy_env or ("ddp" if use_ddp else None)
+
+    return TrainerDeviceConfig(
+        accelerator=accelerator,
+        devices=int(devices_per_node),
+        precision=precision,
+        num_nodes=int(num_nodes),
+        strategy=strategy,
+    )
 
 
 
@@ -2185,14 +2309,13 @@ def make_objective(args):
         model, train_loader, val_loader = build_from_args(cfg)
         model.set_film_usage(film)
 
-        accelerator, devices, precision = _auto_devices()
+        device_cfg = _auto_devices()
 
         prune_cb = OptunaPruneCallback(trial, monitor="val_loss")
-        
+
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
-            accelerator=accelerator, devices=devices,
-            precision=precision,
+            **device_cfg.to_trainer_kwargs(),
             logger=False, enable_progress_bar=False, enable_checkpointing=False,
             callbacks=[UpdateEpochInDataset(),prune_cb],
         )
@@ -2318,15 +2441,13 @@ def main():
             print(f"↪️  Chargement Refiner_only depuis {args.load_refiner}")
             load_block_refiner_only(model, args.load_refiner, strict=False)
 
-        accelerator, devices, precision = _auto_devices()
+        device_cfg = _auto_devices()
         ckpt_dir = os.path.join("runs", "single_run")
         os.makedirs(ckpt_dir, exist_ok=True)
 
         trainer = pl.Trainer(
             max_epochs=args.max_epochs,
-            accelerator=accelerator,
-            devices=devices,
-            precision=precision,
+            **device_cfg.to_trainer_kwargs(),
             default_root_dir=ckpt_dir,
             callbacks=[UpdateEpochInDataset()],
         )
