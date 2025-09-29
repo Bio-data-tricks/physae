@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+#SBATCH --account=R240011
+#SBATCH --job-name=physae-optuna-debug
+#SBATCH --time=3-00:00:00
+#SBATCH --constraint=armgpu
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=4          # 4 tâches par nœud
+#SBATCH --gpus-per-node=4            # 1 GPU par tâche
+#SBATCH --cpus-per-task=10
+#SBATCH --mem=50G
+#SBATCH --output=%x.%j.out
+#SBATCH --error=%x.%j.err
+
+set -euo pipefail
+set -x
+
+LOGDIR="${PWD}/logs"
+RUNDIR="${PWD}/runs"
+mkdir -p "$LOGDIR" "$RUNDIR"
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_DEBUG=WARN
+
+echo "=== ENV ==="
+echo "HOSTNAME=${HOSTNAME:-unknown}"
+echo "JOBID=${SLURM_JOB_ID:-NA} NODELIST=${SLURM_JOB_NODELIST:-NA}"
+echo "NTASKS=${SLURM_NTASKS:-NA} NODES=${SLURM_JOB_NUM_NODES:-NA}"
+
+# --- environnement cluster ---
+romeo_load_armgpu_env
+spack load python@3.13.0/gzl2pkh cuda@12.6.2
+source /home/cosmic_86/envs/pytorch_arm_test/bin/activate
+
+echo "=== BINARIES ==="
+which python3 || true
+python3 -V || true
+which nvidia-smi || true
+nvidia-smi || true
+
+# ------------ transitions: écrire dans un fichier -----------
+TRANS_FILE="$(mktemp -p "$RUNDIR" transitions_XXXX.csv)"
+cat > "$TRANS_FILE" <<'CSV'
+6;1;3085.861015;1.013E-19;0.06;0.078;219.9411;0.73;-0.00712;0.0;0.0221;0.96;0.584;1.12
+6;1;3085.832038;1.693E-19;0.0597;0.078;219.9451;0.73;-0.00712;0.0;0.0222;0.91;0.173;1.11
+6;1;3085.893769;1.011E-19;0.0602;0.078;219.9366;0.73;-0.00711;0.0;0.0184;1.14;-0.516;1.37
+6;1;3086.030985;1.659E-19;0.0595;0.078;219.9197;0.73;-0.00711;0.0;0.0193;1.17;-0.204;0.97
+6;1;3086.071879;1.000E-19;0.0585;0.078;219.9149;0.73;-0.00703;0.0;0.0232;1.09;-0.0689;0.82
+6;1;3086.085994;6.671E-20;0.055;0.078;219.9133;0.70;-0.00610;0.0;0.0300;0.54;0.00;0.0
+CSV
+
+# ------------ cfg JSON écrit sur disque -----------
+CFG_FILE="${RUNDIR}/cfg_stageA.json"
+jq -n \
+  --arg trans "$TRANS_FILE" \
+  '{
+    gas:"CH4",
+    n_points:800,
+    n_train:5000,
+    n_val:500,
+    poly_inline:"[-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]",
+    transitions_csv:$trans,
+    predict_list:["sig0","dsig","P","T","mf_CH4","baseline1","baseline2"],
+    film_list:[]
+  }' > "$CFG_FILE"
+
+
+
+# Journal Optuna partagé (un seul pour toute l’étude)
+STUDY_NAME="stageA_opt"
+STUDY_DIR="${RUNDIR}/optuna_${STUDY_NAME}"
+mkdir -p "$STUDY_DIR"
+STORAGE="journal:${STUDY_DIR}/optuna_journal.log"
+CSV_OUT="${STUDY_DIR}/optuna_results.csv"
+
+# Nombre total de trials 
+TOTAL_TRIALS=10
+MAX_EPOCHS=5
+
+echo "=== LAUNCH OPTUNA (concurrent workers) ==="
+# On lance UN worker par tâche/GPU. Tous pointent vers le même storage & study.
+# Chaque worker démarre avec --n-trials=$TOTAL_TRIALS, mais l’étude s’arrêtera
+# globalement grâce au callback StopAfterNTrials dès que TOTAL_TRIALS sont complétés.
+
+srun -l -u \
+  --kill-on-bad-exit=1 \
+  --cpu-bind=none \
+  --gpus-per-task=1 \
+  python3 /home/cosmic_86/CODES/scripts/10_PIAE.py optuna \
+    --cfg "$CFG_FILE" \
+    --study-name "$STUDY_NAME" \
+    --n-trials "$TOTAL_TRIALS" \
+    --max-epochs "$MAX_EPOCHS" \
+    --storage "$STORAGE" \
+    --csv "$CSV_OUT"
