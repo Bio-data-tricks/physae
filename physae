@@ -884,8 +884,9 @@ class PhysicallyInformedAE(pl.LightningModule):
     # ========= helpers / FiLM / stage control =========
     def set_film_usage(self, use: bool = True):
         self.use_film = bool(use)
-        if hasattr(self, "refiner"):
-            self.refiner.use_film = bool(use)
+        refiner = getattr(self, "refiner", None)
+        if refiner is not None:
+            refiner.use_film = bool(use)
 
     def set_film_subset(self, names=None):
         if self.cond_dim == 0 or self.film_mask is None:
