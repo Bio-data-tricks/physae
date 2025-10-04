@@ -1,5 +1,6 @@
 import math, random, sys, os
-from typing import Optional, List, Dict
+import shutil
+from typing import Optional, List, Dict, Union
 import os
 import csv
 import socket
@@ -2682,6 +2683,25 @@ def _cleanup_trial_checkpoint(path: Union[str, Path]):
         pass
 
 
+def _cleanup_trial_dir(root: Union[str, Path]):
+    if not root:
+        return
+
+    root = Path(root)
+    try:
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        pass
+
+    parent = root.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        pass
+
+
 def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[str], best_score: float,
                          direction: str = "min") -> str:
     if not best_path:
@@ -2748,7 +2768,8 @@ def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
 
 # ===================== OBJECTIVE: STAGE A =====================
 
-def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int) -> float:
+def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
+                      n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
     # --- Search space ---
     base_lr = trial.suggest_float("base_lr", 1e-5, 5e-4, log=True)
     backbone_variant = trial.suggest_categorical("backbone_variant", ["s"])  # compacité vs capacité
@@ -2766,6 +2787,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     # Construire data + modèle avec HPs trial
     model, train_loader, val_loader = build_data_and_model(
         seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
         batch_size=batch_size,
         huber_beta=huber_beta,
         backbone_variant=backbone_variant,
@@ -2800,6 +2823,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
 
     trial.set_user_attr("best_ckpt_A", global_ckpt)
     trial.set_user_attr("best_val_A", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
     return best_score
 
 
@@ -2807,7 +2832,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
 
 # ===================== OBJECTIVE: STAGE B1 =====================
 
-def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str) -> float:
+def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str,
+                       n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
     # --- Search space (refiner-centric) ---
     refiner_lr = trial.suggest_float("refiner_lr", 1e-6, 3e-4, log=True)
     refine_steps = trial.suggest_int("refine_steps", 1, 1)
@@ -2827,6 +2853,8 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
     # IMPORTANT: reconstruit le modèle avec les HP refiner (le backbone peut rester celui du meilleur A)
     model, train_loader, val_loader = build_data_and_model(
         seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
         batch_size=batch_size,
         refiner_variant=refiner_variant,
         refiner_width_mult=refiner_width_mult,
@@ -2863,13 +2891,16 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
 
     trial.set_user_attr("best_ckpt_B1", global_ckpt)
     trial.set_user_attr("best_val_B1", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
     return best_score
 
 
 
 # ===================== RUNNERS =====================
 
-def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, float, dict]:
+def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
+                       n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
     run_dir = Path(make_run_dir())
     stage_dir = get_stage_dir(run_dir, "A")
     optuna_dir = stage_dir / "optuna"
@@ -2887,7 +2918,14 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, floa
     )
 
     def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_A(trial, run_dir=run_dir, epochs=epochs, seed=seed)
+        return objective_stage_A(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
+        )
 
     csv_logger = OptunaCSVLogger(stage_dir, stage="A")
     study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
@@ -2909,7 +2947,8 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, floa
     print(f"✓ A_opt prêt: {dest_ckpt}")
     return str(dest_ckpt), float(best.value), dict(best.params)
 
-def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str) -> tuple[str, float, dict]:
+def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
+                        n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
     run_dir = Path(make_run_dir())
     stage_dir = get_stage_dir(run_dir, "B")
     optuna_dir = stage_dir / "optuna"
@@ -2927,7 +2966,15 @@ def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str)
     )
 
     def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_B1(trial, run_dir=run_dir, epochs=epochs, seed=seed, ckpt_A=ckpt_A_path)
+        return objective_stage_B1(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            ckpt_A=ckpt_A_path,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
+        )
 
     csv_logger = OptunaCSVLogger(stage_dir, stage="B")
     study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
@@ -3192,6 +3239,12 @@ if __name__ == "__main__":
     parser.add_argument("--epochs-a", type=int, default=50, help="Epochs par essai pour A")
     parser.add_argument("--epochs-b", type=int, default=50, help="Epochs par essai pour B1")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-samples", type=int, default=100_000,
+                        help="Nombre d'échantillons synthétiques pour chaque essai (train)")
+    parser.add_argument("--val-samples", type=int, default=500,
+                        help="Nombre d'échantillons synthétiques pour la validation des essais")
+    parser.add_argument("--retrain-samples", type=int, default=1_000_000,
+                        help="Nombre d'échantillons synthétiques pour les ré-entraînements finaux")
     # Par défaut on NE lance PAS B2 ; pour l'activer, passer --run-b2
     parser.add_argument("--run-b2", action="store_true", help="Lancer le fine-tune B2 final")
     args = parser.parse_args()
@@ -3209,7 +3262,11 @@ if __name__ == "__main__":
     if on_rank_zero():
         print(f"[stage A] essais totaux demandés={args.trials_a} → par worker={trials_a_each}")
     a_ckpt, a_best, a_params = run_optuna_stage_A(
-        n_trials=trials_a_each, epochs=args.epochs_a, seed=args.seed
+        n_trials=trials_a_each,
+        epochs=args.epochs_a,
+        seed=args.seed,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
     )
 
     # S'assure que le meilleur ckpt A est bien écrit (cas multi-workers)
@@ -3218,7 +3275,12 @@ if __name__ == "__main__":
     if on_rank_zero():
         print(f"[stage B] essais totaux demandés={args.trials_b} → par worker={trials_b_each}")
     b_ckpt, b_best, b_params = run_optuna_stage_B1(
-        n_trials=trials_b_each, epochs=args.epochs_b, seed=args.seed, ckpt_A_path=a_ckpt
+        n_trials=trials_b_each,
+        epochs=args.epochs_b,
+        seed=args.seed,
+        ckpt_A_path=a_ckpt,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
     )
 
     wait_for_file(b_ckpt)
@@ -3226,19 +3288,19 @@ if __name__ == "__main__":
     if on_rank_zero():
         print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
         a_re_ckpt, a_re_score = retrain_stage_A(
-            a_params, epochs=50, seed=args.seed, n_train=1_000_000
+            a_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(a_re_ckpt)
 
         print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
         b_re_ckpt, b_re_score = retrain_stage_B(
-            b_params, a_params, a_re_ckpt, epochs=50, seed=args.seed, n_train=1_000_000
+            b_params, a_params, a_re_ckpt, epochs=50, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(b_re_ckpt)
 
         print("\n========== FINE-TUNE ENSEMBLE ==========")
         ensemble_ckpt, ensemble_score = finetune_ensemble(
-            b_re_ckpt, a_params, b_params, epochs=50, seed=args.seed, n_train=1_000_000
+            b_re_ckpt, a_params, b_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(ensemble_ckpt)
 
@@ -3272,7 +3334,7 @@ if __name__ == "__main__":
                     "ckpt": a_re_ckpt,
                     "best_val_loss": a_re_score,
                     "epochs": 50,
-                    "n_train": 1_000_000,
+                    "n_train": args.retrain_samples,
                 },
                 "trials_csv": str(stage_dir_A / "trials.csv"),
                 "top5_params": str(stage_dir_A / "top5.json"),
@@ -3288,7 +3350,7 @@ if __name__ == "__main__":
                     "ckpt": b_re_ckpt,
                     "best_val_loss": b_re_score,
                     "epochs": 50,
-                    "n_train": 1_000_000,
+                    "n_train": args.retrain_samples,
                 },
                 "trials_csv": str(stage_dir_B / "trials.csv"),
                 "top5_params": str(stage_dir_B / "top5.json"),
@@ -3298,7 +3360,7 @@ if __name__ == "__main__":
                 "ckpt": ensemble_ckpt,
                 "best_val_loss": ensemble_score,
                 "epochs": 50,
-                "n_train": 1_000_000,
+                "n_train": args.retrain_samples,
             },
         }
 
