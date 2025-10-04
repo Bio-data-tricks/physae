@@ -25,6 +25,8 @@ Options:
   --train-samples <int>    Taille du dataset synthétique d'entraînement (défaut: 100000)
   --val-samples <int>      Taille du dataset synthétique de validation (défaut: 500)
   --retrain-samples <int>  Taille du dataset synthétique pour les ré-entraînements finaux (défaut: 1000000)
+  --seed <int>             Graine pseudo-aléatoire pour les essais et ré-entraînements (défaut: 42)
+  --run-b2                 Active le fine-tune final du stage B2
   -h, --help               Affiche cette aide
 USAGE
 }
@@ -36,6 +38,8 @@ EPOCHS_B=50
 TRAIN_SAMPLES=100000
 VAL_SAMPLES=500
 RETRAIN_SAMPLES=1000000
+SEED=42
+RUN_B2=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +71,12 @@ while [[ $# -gt 0 ]]; do
       RETRAIN_SAMPLES="$2"; shift 2 ;;
     --retrain-samples=*)
       RETRAIN_SAMPLES="${1#*=}"; shift ;;
+    --seed)
+      SEED="$2"; shift 2 ;;
+    --seed=*)
+      SEED="${1#*=}"; shift ;;
+    --run-b2)
+      RUN_B2=true; shift ;;
     -h|--help)
       show_help
       exit 0 ;;
@@ -86,7 +96,8 @@ source /home/cosmic_86/envs/pytorch_arm_test/bin/activate
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-PYTHON_SCRIPT="/home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2_opt.py"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_SCRIPT="${SCRIPT_DIR}/physae"
 
 cat <<EOM
 Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
@@ -97,14 +108,25 @@ Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
   train samples  : ${TRAIN_SAMPLES}
   val samples    : ${VAL_SAMPLES}
   retrain samples: ${RETRAIN_SAMPLES}
+  seed           : ${SEED}
+  run B2         : ${RUN_B2}
 EOM
+
+SRUN_ARGS=(
+  --trials-a "${TRIALS_A}"
+  --trials-b "${TRIALS_B}"
+  --epochs-a "${EPOCHS_A}"
+  --epochs-b "${EPOCHS_B}"
+  --train-samples "${TRAIN_SAMPLES}"
+  --val-samples "${VAL_SAMPLES}"
+  --retrain-samples "${RETRAIN_SAMPLES}"
+  --seed "${SEED}"
+)
+
+if [[ "${RUN_B2}" == true ]]; then
+  SRUN_ARGS+=(--run-b2)
+fi
 
 srun --cpu-bind=cores \
      python -u "${PYTHON_SCRIPT}" \
-        --trials-a "${TRIALS_A}" \
-        --trials-b "${TRIALS_B}" \
-        --epochs-a "${EPOCHS_A}" \
-        --epochs-b "${EPOCHS_B}" \
-        --train-samples "${TRAIN_SAMPLES}" \
-        --val-samples "${VAL_SAMPLES}" \
-        --retrain-samples "${RETRAIN_SAMPLES}"
+        "${SRUN_ARGS[@]}"

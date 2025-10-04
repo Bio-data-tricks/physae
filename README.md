@@ -16,8 +16,11 @@ sbatch soumission.txt \
   --epochs-b 30 \
   --train-samples 200000 \
   --val-samples 1000 \
-  --retrain-samples 1500000
+  --retrain-samples 1500000 \
+  --seed 123 \
+  --run-b2
 ```
 
 Utilisez `sbatch soumission.txt --help` pour afficher la liste complète des
-options disponibles et leurs valeurs par défaut.
+options disponibles et leurs valeurs par défaut (notamment la graine et
+l'activation optionnelle du fine-tune B2).
