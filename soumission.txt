@@ -28,6 +28,12 @@ Options:
   --seed <int>             Graine pseudo-aléatoire pour les essais et ré-entraînements (défaut: 42)
   --run-b2                 Active le fine-tune final du stage B2
   -h, --help               Affiche cette aide
+
+Variables d'environnement:
+  SCRIPT_OVERRIDE          Chemin vers le script Python à exécuter. Les chemins
+                           relatifs sont cherchés d'abord par rapport à
+                           $SLURM_SUBMIT_DIR (ou au dossier d'envoi), puis par
+                           rapport au dossier contenant ce fichier.
 USAGE
 }
 
@@ -97,7 +103,25 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="${SCRIPT_DIR}/physae.py"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$SCRIPT_DIR}"
+
+if [[ -n "${SCRIPT_OVERRIDE:-}" ]]; then
+  if [[ "${SCRIPT_OVERRIDE}" = /* ]]; then
+    PYTHON_SCRIPT="${SCRIPT_OVERRIDE}"
+  else
+    if [[ -f "${SUBMIT_DIR}/${SCRIPT_OVERRIDE}" ]]; then
+      PYTHON_SCRIPT="${SUBMIT_DIR}/${SCRIPT_OVERRIDE}"
+    elif [[ -f "${SCRIPT_DIR}/${SCRIPT_OVERRIDE}" ]]; then
+      PYTHON_SCRIPT="${SCRIPT_DIR}/${SCRIPT_OVERRIDE}"
+    else
+      echo "Erreur: SCRIPT_OVERRIDE='${SCRIPT_OVERRIDE}' introuvable (cherché dans ${SUBMIT_DIR} puis ${SCRIPT_DIR})." >&2
+      echo "Pour les chemins relatifs, la résolution se fait d'abord par rapport à ${SUBMIT_DIR}, puis par rapport au dossier contenant soumission.txt (${SCRIPT_DIR})." >&2
+      exit 1
+    fi
+  fi
+else
+  PYTHON_SCRIPT="${SCRIPT_DIR}/physae.py"
+fi
 cat <<EOM
 Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
   trials A       : ${TRIALS_A}
