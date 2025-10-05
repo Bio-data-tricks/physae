@@ -2279,6 +2279,22 @@ def _env_as_int(*keys: str, default: Optional[int] = None) -> Optional[int]:
     return default
 
 
+def _env_flag(*keys: str, default: bool = False) -> bool:
+    """Return True if any of the provided environment variables is truthy."""
+    truthy = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+    falsy = {"0", "false", "FALSE", "no", "NO", "off", "OFF"}
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw = str(raw).strip()
+        if raw in truthy:
+            return True
+        if raw in falsy:
+            return False
+    return bool(default)
+
+
 def get_master_addr_and_port(default_port=12910):
     # MASTER_ADDR pour SLURM : 1er hostname de la nodelist
     master_addr = os.environ.get("MASTER_ADDR")
@@ -2347,6 +2363,9 @@ def trainer_common_kwargs():
     num_nodes = 1
     strategy: Union[str, "pl.strategies.Strategy"] = "auto"
 
+    force_ddp = _env_flag("PHYS_AE_FORCE_DDP")
+    disable_ddp = _env_flag("PHYS_AE_DISABLE_DDP")
+
     if accelerator == "gpu":
         visible_devices = max(1, torch.cuda.device_count())
         requested_devices = _env_as_int("PHYS_AE_DEVICES")
@@ -2362,11 +2381,30 @@ def trainer_common_kwargs():
             requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
         num_nodes = max(1, requested_nodes) if requested_nodes else 1
 
-        world_size = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
-        if world_size is None:
-            world_size = devices * num_nodes
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
 
-        if world_size > 1:
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1:
+                if world_size_env is None or world_size_env == expected_world:
+                    should_enable_ddp = True
+                else:
+                    if on_rank_zero():
+                        print(
+                            f"[INFO] WORLD_SIZE={world_size_env} != devices*num_nodes={expected_world}; "
+                            "skipping automatic DDP initialisation."
+                        )
+            elif world_size_env and world_size_env > 1:
+                if on_rank_zero():
+                    print(
+                        f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device setup; "
+                        "not enabling DDP automatically."
+                    )
+
+        if should_enable_ddp:
             get_master_addr_and_port()
             try:
                 from pytorch_lightning.strategies import DDPStrategy
@@ -2379,8 +2417,22 @@ def trainer_common_kwargs():
         if requested_nodes is None:
             requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
         num_nodes = max(1, requested_nodes) if requested_nodes else 1
-        world_size = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
-        if world_size and world_size > 1:
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
+
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1 and (world_size_env is None or world_size_env == expected_world):
+                should_enable_ddp = True
+            elif world_size_env and world_size_env > 1 and on_rank_zero():
+                print(
+                    f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device CPU setup; "
+                    "not enabling DDP automatically."
+                )
+
+        if should_enable_ddp:
             strategy = "ddp"
 
     return dict(
