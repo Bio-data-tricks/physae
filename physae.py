@@ -4,6 +4,7 @@ from typing import Optional, List, Dict, Union, Iterable
 import os
 import csv
 import socket
+import re
 from pathlib import Path
 import torch
 import pytorch_lightning as pl
@@ -18,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import Callback
 from datetime import datetime
 import json, yaml  # pip install pyyaml si besoin
-from lion_pytorch import Lion  
+from lion_pytorch import Lion
 
 
 # --- Matplotlib: backend non interactif + polices ---
@@ -2258,6 +2259,26 @@ def build_data_and_model(
     return model, train_loader, val_loader
 
 # ------------- Utilitaires HPC -------------
+
+def _env_as_int(*keys: str, default: Optional[int] = None) -> Optional[int]:
+    """Parse first integer value from a list of environment variable keys."""
+    for key in keys:
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        raw = str(raw).strip()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            match = re.search(r"\d+", raw)
+            if match:
+                try:
+                    return int(match.group(0))
+                except ValueError:
+                    continue
+    return default
+
+
 def get_master_addr_and_port(default_port=12910):
     # MASTER_ADDR pour SLURM : 1er hostname de la nodelist
     master_addr = os.environ.get("MASTER_ADDR")
@@ -2318,16 +2339,49 @@ def trainer_common_kwargs():
     import pytorch_lightning as pl
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
 
-    # ► Trials mono-GPU seulement (1 tâche = 1 GPU)
-    devices = 1
-    num_nodes = 1
-
     precision = choose_precision()
     default_dir = os.environ.get("SLURM_JOB_ID", "runs_local")
     default_root_dir = f"./lightning_logs/{default_dir}"
 
-    # ► Pas de DDP pour les trials mono-GPU
-    strategy = "auto"
+    devices = 1
+    num_nodes = 1
+    strategy: Union[str, "pl.strategies.Strategy"] = "auto"
+
+    if accelerator == "gpu":
+        visible_devices = max(1, torch.cuda.device_count())
+        requested_devices = _env_as_int("PHYS_AE_DEVICES")
+        if requested_devices is None:
+            requested_devices = _env_as_int("LOCAL_WORLD_SIZE", "SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE")
+        if requested_devices is not None:
+            devices = max(1, min(visible_devices, requested_devices))
+        else:
+            devices = visible_devices
+
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+
+        world_size = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        if world_size is None:
+            world_size = devices * num_nodes
+
+        if world_size > 1:
+            get_master_addr_and_port()
+            try:
+                from pytorch_lightning.strategies import DDPStrategy
+                strategy = DDPStrategy(find_unused_parameters=False)
+            except Exception:
+                strategy = "ddp_find_unused_parameters_false"
+    else:
+        devices = 1
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+        world_size = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        if world_size and world_size > 1:
+            strategy = "ddp"
 
     return dict(
         accelerator=accelerator,
@@ -2815,6 +2869,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     # Trainer kwargs (on force 1 device pour éviter des essais multi-GPU par trial)
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
     # Callbacks
@@ -2881,6 +2937,8 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
     # Trainer kwargs
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
     callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
@@ -3224,6 +3282,8 @@ def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
 
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     ft_dir = Path(run_dir) / "finetune"
     tkw["default_root_dir"] = str(ft_dir / "logs")
 
