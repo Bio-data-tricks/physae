@@ -6,14 +6,24 @@
 #SBATCH --gpus-per-task=1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=64G
-#SBATCH --output=logs/optuna_%j.out
-#SBATCH --error=logs/optuna_%j.err
+#SBATCH --output=logs/%x_%j.log
+#SBATCH --error=logs/%x_%j.log
 ## Optionnel : lancer N workers via un job array
 ## #SBATCH --array=0-7
 
 set -euo pipefail
 
 mkdir -p logs
+
+# Valeurs optionnelles configurables directement depuis le script / l'environnement.
+# Par exemple :
+#   N_TRAIN=50000 STAGEA_EPOCHS=10 MAX_TRIALS=20 sbatch bash_optuna.sh
+N_TRAIN=${N_TRAIN:-}
+N_VAL=${N_VAL:-}
+N_POINTS=${N_POINTS:-}
+STAGEA_EPOCHS=${STAGEA_EPOCHS:-}
+STAGEB1_EPOCHS=${STAGEB1_EPOCHS:-}
+STAGEB2_EPOCHS=${STAGEB2_EPOCHS:-}
 
 # --- Préparation de l'environnement logiciel (adapter à votre cluster) ---
 # module load cuda/12.1
@@ -58,6 +68,26 @@ if [[ "${TIMEOUT_SECONDS:-0}" -gt 0 ]]; then
 fi
 if [[ -n "${OPTUNA_LOG_LEVEL:-}" ]]; then
   ARGS+=(--log-level "${OPTUNA_LOG_LEVEL}")
+fi
+
+if [[ -n "${N_TRAIN}" ]]; then
+  ARGS+=(--n-train "${N_TRAIN}")
+fi
+if [[ -n "${N_VAL}" ]]; then
+  ARGS+=(--n-val "${N_VAL}")
+fi
+if [[ -n "${N_POINTS}" ]]; then
+  ARGS+=(--n-points "${N_POINTS}")
+fi
+
+if [[ -n "${STAGEA_EPOCHS}" ]]; then
+  ARGS+=(--stageA-epochs "${STAGEA_EPOCHS}")
+fi
+if [[ -n "${STAGEB1_EPOCHS}" ]]; then
+  ARGS+=(--stageB1-epochs "${STAGEB1_EPOCHS}")
+fi
+if [[ -n "${STAGEB2_EPOCHS}" ]]; then
+  ARGS+=(--stageB2-epochs "${STAGEB2_EPOCHS}")
 fi
 
 srun --cpu-bind=cores python -u optuna_phisae.py "${ARGS[@]}"

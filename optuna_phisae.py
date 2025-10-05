@@ -281,6 +281,12 @@ def _run_single_trial(
 
     build_params = dict(hparams["build"])
     build_params.setdefault("seed", seed_base)
+    if args.n_train is not None:
+        build_params["n_train"] = int(args.n_train)
+    if args.n_val is not None:
+        build_params["n_val"] = int(args.n_val)
+    if args.n_points is not None:
+        build_params["n_points"] = int(args.n_points)
 
     trial.set_user_attr("hyperparameters", _to_jsonable(hparams))
 
@@ -399,6 +405,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING, ...)")
     parser.add_argument("--sleep-on-error", type=float, default=5.0,
                         help="Seconds to sleep before retrying after recoverable errors")
+    parser.add_argument("--n-train", type=int, default=None,
+                        help="Override the number of training samples (default from physae_train)")
+    parser.add_argument("--n-val", type=int, default=None,
+                        help="Override the number of validation samples")
+    parser.add_argument("--n-points", type=int, default=None,
+                        help="Override the number of spectral points per sample")
+    parser.add_argument("--stageA-epochs", type=int, default=None,
+                        help="Force the number of epochs for stage A")
+    parser.add_argument("--stageB1-epochs", type=int, default=None,
+                        help="Force the number of epochs for stage B1")
+    parser.add_argument("--stageB2-epochs", type=int, default=None,
+                        help="Force the number of epochs for stage B2")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -445,6 +463,12 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     def _objective(trial: optuna.trial.Trial) -> float:
         _ensure_no_termination()
         params = _suggest_hyperparameters(trial)
+        if args.stageA_epochs is not None:
+            params["stage_A"]["epochs"] = int(args.stageA_epochs)
+        if args.stageB1_epochs is not None:
+            params["stage_B1"]["epochs"] = int(args.stageB1_epochs)
+        if args.stageB2_epochs is not None:
+            params["stage_B2"]["epochs"] = int(args.stageB2_epochs)
         try:
             return _run_single_trial(trial, args, logger, params)
         except optuna.TrialPruned:
