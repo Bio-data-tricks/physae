@@ -101,8 +101,18 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 # --- Définition du script à exécuter ---
-# MODIFICATION ICI : On utilise le chemin absolu directement.
-PYTHON_SCRIPT="/home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2_opt.py"
+# On autorise un override via la variable d'environnement SCRIPT_OVERRIDE
+if [[ -n "${SCRIPT_OVERRIDE:-}" ]]; then
+  PYTHON_SCRIPT="${SCRIPT_OVERRIDE}"
+else
+  # MODIFICATION ICI : On utilise le chemin absolu directement.
+  PYTHON_SCRIPT="/home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2_opt.py"
+fi
+
+# Si un chemin relatif est fourni, on le résout à partir du dossier du script
+if [[ "${PYTHON_SCRIPT}" != /* ]]; then
+  PYTHON_SCRIPT="$(readlink -f "${PYTHON_SCRIPT}")"
+fi
 
 # On vérifie que le fichier existe avant de continuer
 if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
@@ -123,18 +133,49 @@ Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
   run B2         : ${RUN_B2}
 EOM
 
-SRUN_ARGS=(
-  --trials-a "${TRIALS_A}"
-  --trials-b "${TRIALS_B}"
-  --epochs-a "${EPOCHS_A}"
-  --epochs-b "${EPOCHS_B}"
-  --train-samples "${TRAIN_SAMPLES}"
-  --val-samples "${VAL_SAMPLES}"
-  --retrain-samples "${RETRAIN_SAMPLES}"
-  --seed "${SEED}"
-)
+supports_option() {
+  local option="$1"
+  python - "$PYTHON_SCRIPT" "$option" <<'PY' || return 1
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+option = sys.argv[2]
+try:
+    text = path.read_text()
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if option in text else 1)
+PY
+}
+
+declare -a SRUN_ARGS
+
+maybe_add_option() {
+  local option="$1"
+  local value="$2"
+  if supports_option "$option"; then
+    if [[ -n "$value" ]]; then
+      SRUN_ARGS+=("$option" "$value")
+    else
+      SRUN_ARGS+=("$option")
+    fi
+  else
+    echo "[info] Option ${option} non supportée par ${PYTHON_SCRIPT}, elle sera ignorée." >&2
+  fi
+}
+
+maybe_add_option --trials-a "${TRIALS_A}"
+maybe_add_option --trials-b "${TRIALS_B}"
+maybe_add_option --epochs-a "${EPOCHS_A}"
+maybe_add_option --epochs-b "${EPOCHS_B}"
+maybe_add_option --train-samples "${TRAIN_SAMPLES}"
+maybe_add_option --val-samples "${VAL_SAMPLES}"
+maybe_add_option --retrain-samples "${RETRAIN_SAMPLES}"
+maybe_add_option --seed "${SEED}"
 if [[ "${RUN_B2}" == true ]]; then
-  SRUN_ARGS+=(--run-b2)
+  maybe_add_option --run-b2 ""
 fi
 
 srun --cpu-bind=cores \
