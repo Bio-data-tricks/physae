@@ -27,6 +27,7 @@ Options:
   --retrain-samples <int>  Taille du dataset synthétique pour les ré-entraînements finaux (défaut: 1000000)
   --seed <int>             Graine pseudo-aléatoire pour les essais et ré-entraînements (défaut: 42)
   --run-b2                 Active le fine-tune final du stage B2
+  --script <path>          Chemin (absolu ou relatif au répertoire de soumission) vers le script Python
   -h, --help               Affiche cette aide
 USAGE
 }
@@ -40,6 +41,7 @@ VAL_SAMPLES=500
 RETRAIN_SAMPLES=1000000
 SEED=42
 RUN_B2=false
+SCRIPT_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -77,6 +79,10 @@ while [[ $# -gt 0 ]]; do
       SEED="${1#*=}"; shift ;;
     --run-b2)
       RUN_B2=true; shift ;;
+    --script)
+      SCRIPT_OVERRIDE="$2"; shift 2 ;;
+    --script=*)
+      SCRIPT_OVERRIDE="${1#*=}"; shift ;;
     -h|--help)
       show_help
       exit 0 ;;
@@ -96,8 +102,23 @@ source /home/cosmic_86/envs/pytorch_arm_test/bin/activate
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="${SCRIPT_DIR}/physae.py"
+SUBMIT_DIR="${SLURM_SUBMIT_DIR:-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"}"
+
+if [[ -n "${SCRIPT_OVERRIDE}" ]]; then
+  if [[ "${SCRIPT_OVERRIDE}" = /* ]]; then
+    PYTHON_SCRIPT="${SCRIPT_OVERRIDE}"
+  else
+    PYTHON_SCRIPT="${SUBMIT_DIR}/${SCRIPT_OVERRIDE}"
+  fi
+else
+  PYTHON_SCRIPT="${SUBMIT_DIR}/physae.py"
+fi
+
+if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
+  echo "Erreur: script Python introuvable à l'emplacement ${PYTHON_SCRIPT}" >&2
+  exit 1
+fi
+
 cat <<EOM
 Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
   trials A       : ${TRIALS_A}
