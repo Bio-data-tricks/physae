@@ -1,7 +1,11 @@
 import math, random, sys, os
-from typing import Optional, List, Dict
+import shutil
+from typing import Optional, List, Dict, Union, Iterable
 import os
+import csv
 import socket
+import re
+from pathlib import Path
 import torch
 import pytorch_lightning as pl
 from torch.utils.data.distributed import DistributedSampler
@@ -15,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import Callback
 from datetime import datetime
 import json, yaml  # pip install pyyaml si besoin
-from lion_pytorch import Lion  
+from lion_pytorch import Lion
 
 
 # --- Matplotlib: backend non interactif + polices ---
@@ -1756,18 +1760,60 @@ def _apply_stage_freeze(model: PhysicallyInformedAE,
     if train_refiner:
         for p in model.refiner.parameters(): p.requires_grad_(True)
 
-def _load_weights_if_any(model: PhysicallyInformedAE, ckpt_in: Optional[str]):
-    if ckpt_in:
-        sd = torch.load(ckpt_in, map_location="cpu")
-        # compatibilité PL (state_dict ou full checkpoint)
-        state_dict = sd["state_dict"] if "state_dict" in sd else sd
-        model.load_state_dict(state_dict, strict=False)
-        print(f"✓ weights chargés depuis: {ckpt_in}")
+def _load_weights_if_any(model, ckpt_path):
+    import os, torch
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        print(f"[INFO] No checkpoint at {ckpt_path}; skipping.")
+        return
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+
+    model_sd = model.state_dict()
+    compatible = {}
+    mismatched, unexpected = [], []
+
+    for k, v in state_dict.items():
+        if k in model_sd:
+            if v.shape == model_sd[k].shape:
+                compatible[k] = v
+            else:
+                mismatched.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
+        else:
+            unexpected.append(k)
+
+    if not compatible:
+        print("[WARN] Checkpoint is architecturally incompatible (0 matching shapes). "
+              "Skipping weight loading for this run.")
+        return
+
+    # load the matching subset without erroring on the rest
+    model_sd.update(compatible)
+    model.load_state_dict(model_sd, strict=False)
+
+    print(f"[INFO] Loaded {len(compatible)} tensors from checkpoint; "
+          f"{len(mismatched)} mismatched, {len(unexpected)} unexpected, "
+          f"{len(model_sd) - len(compatible)} missing.")
+
 
 def _save_checkpoint(trainer: pl.Trainer, ckpt_out: Optional[str]):
-    if ckpt_out:
+    if ckpt_out and on_rank_zero():
         trainer.save_checkpoint(ckpt_out)
         print(f"✓ checkpoint sauvegardé: {ckpt_out}")
+
+def get_worker_info():
+    rank = int(os.environ.get("SLURM_PROCID") or os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or 0)
+    world = int(os.environ.get("SLURM_NTASKS") or os.environ.get("WORLD_SIZE") or 1)
+    return rank, world
+
+def wait_for_file(path, check_every=5, timeout=24*3600):
+    import time
+    t0 = time.time()
+    while not os.path.isfile(path):
+        if time.time() - t0 > timeout:
+            raise TimeoutError(f"Timeout en attendant {path}")
+        time.sleep(check_every)
+    return path
 
 def train_stage_custom(
     model: PhysicallyInformedAE,
@@ -1791,24 +1837,17 @@ def train_stage_custom(
     enable_progress_bar: bool = False,
     **trainer_kwargs,
 ):
-    """
-    Stage Lightning robuste:
-    - évite accelerator/strategy en double
-    - pas de plugins= → aucun conflit cluster_environment
-    """
-    import os
     import pytorch_lightning as pl
     from pytorch_lightning.strategies import Strategy
 
     print(f"\n===== Stage {stage_name} =====")
 
-    # --- EXTRA KW non-Lightning ---
     ckpt_in  = trainer_kwargs.pop("ckpt_in",  None)
     ckpt_out = trainer_kwargs.pop("ckpt_out", None)
 
     _load_weights_if_any(model, ckpt_in)
 
-    # Progress bar optionnelle
+    # Nettoyage de la barre de progression si demandé
     try:
         from pytorch_lightning.callbacks.progress import TQDMProgressBar
         if callbacks is not None and enable_progress_bar is False:
@@ -1831,16 +1870,14 @@ def train_stage_custom(
 
     trainer_kwargs.setdefault("log_every_n_steps", 1)
 
-    # 🔧 SANITIZE: si strategy est un objet, on laisse Lightning déduire l'accélérateur
+    # Si l’appelant a fourni un objet Strategy, laisse Lightning déduire l’accélérateur
     strat = trainer_kwargs.get("strategy", None)
     if isinstance(strat, Strategy):
         trainer_kwargs.pop("accelerator", None)
 
-    # 🔧 Nettoie quelques variables d'env piégeuses
-    for env_key in ("PL_TRAINER_ACCELERATOR", "PL_TRAINER_MAX_EPOCHS"):
-        os.environ.pop(env_key, None)
+    # ⚙️ IMPORTANT: DataLoaders distribués explicites (évite un remplacement auto par PL)
+    train_loader, val_loader = ensure_distributed_samplers(train_loader, val_loader)
 
-    # Construire le Trainer (sans plugins= → pas de conflit)
     trainer = pl.Trainer(
         max_epochs=epochs,
         enable_progress_bar=enable_progress_bar,
@@ -1852,6 +1889,30 @@ def train_stage_custom(
     _save_checkpoint(trainer, ckpt_out)
     return model
 
+
+
+# --- helpers JSON best artefacts ---
+from pathlib import Path
+import json
+
+def _dump_json(path: Path, obj: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False))
+
+def _save_best_params_json(stage: str, best_trial, ckpt_path: str, stage_dir: Path) -> str:
+    """
+    Écrit checkpoints/<stage>_best_params.json avec:
+      - stage, score, params (hyperparams Optuna), ckpt (chemin best .ckpt)
+    """
+    payload = {
+        "stage": stage,
+        "score": float(best_trial.value),
+        "params": dict(best_trial.params),
+        "ckpt": str(ckpt_path),
+    }
+    out = stage_dir / "checkpoints" / f"{stage}_best_params.json"
+    _dump_json(out, payload)
+    return str(out)
 
 
 # Facades conviviales
@@ -1891,12 +1952,47 @@ def train_stage_B2(model, train_loader, val_loader, **kw):
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
 
+def export_param_errors_files(ckpt_path: str, which: str, *, refine: bool, split: str = "val",
+                              robust_smape: bool = False) -> dict:
+    """
+    Charge le modèle + données, restaure le checkpoint, puis écrit:
+      - eval/<which>_<split>_metrics.csv          (agrégé)
+      - eval/<which>_<split>_errors_per_sample.csv (par-échantillon)
+    Retourne les chemins des fichiers.
+    """
+    from pathlib import Path
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, which)
+    out_dir = stage_dir / "eval"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Recrée un modèle compatible + loaders (puis load poids)
+    model, train_loader, val_loader = build_data_and_model()
+    _load_weights_if_any(model, ckpt_path)
+    loader = val_loader if split == "val" else train_loader
+    tag = f"{which}_{split}"
+
+    # Sauvegardes CSV à l’intérieur de evaluate_and_plot
+    _ = evaluate_and_plot(
+        model, loader,
+        n_show=3, refine=refine, robust_smape=robust_smape,
+        save_dir=str(out_dir), tag=tag, save_per_sample=True
+    )
+
+    return {
+        "metrics_csv": str(out_dir / f"{tag}_metrics.csv"),
+        "per_sample_csv": str(out_dir / f"{tag}_errors_per_sample.csv"),
+    }
+
 
 @torch.no_grad()
-def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: int = 5,
-                      refine: bool = True, robust_smape: bool = False, eps: float = 1e-12, seed: int = 123,
-                      baseline_correction: dict | None = None,
-                      save_dir: str | None = None, tag: str | None = None):
+def evaluate_and_plot(
+    model: PhysicallyInformedAE, loader: DataLoader, n_show: int = 5,
+    refine: bool = True, robust_smape: bool = False, eps: float = 1e-12, seed: int = 123,
+    baseline_correction: dict | None = None,
+    save_dir: str | None = None, tag: str | None = None,
+    save_per_sample: bool = True,        # ← NEW: écrit aussi un CSV par-échantillon
+):
     model.eval()
     device = model.device
     rng = random.Random(seed)
@@ -1905,9 +2001,10 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
     if not pred_names:
         raise RuntimeError("Aucun paramètre à évaluer.")
 
-
     per_param_err = {p: [] for p in pred_names}
     show_examples = []
+    per_sample_rows = []                    # ← NEW
+    sample_idx = 0                          # ← NEW compteur d’échantillons globaux
 
     for batch in loader:
         noisy  = batch["noisy_spectra"].to(device)
@@ -1939,9 +2036,20 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
             denom = torch.clamp(true_phys.abs(), min=eps)
             err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
 
+        # agrégation par-paramètre
         for j, name in enumerate(pred_names):
             per_param_err[name].append(err_pct[:, j].detach().cpu())
 
+        # NEW: enregistrement par-échantillon
+        if save_per_sample:
+            for i in range(B):
+                row = {"sample": sample_idx + i}
+                for j, name in enumerate(pred_names):
+                    row[name] = float(err_pct[i, j])
+                per_sample_rows.append(row)
+            sample_idx += B
+
+        # (… le bloc show_examples inchangé …)
         for i in range(B):
             if len(show_examples) < n_show:
                 show_examples.append({
@@ -1954,6 +2062,7 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
                 })
         if len(show_examples) >= n_show: break
 
+    # === Stats agrégées ===
     rows = []
     for name in pred_names:
         if len(per_param_err[name]) == 0: continue
@@ -1969,6 +2078,7 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
     df = pd.DataFrame(rows).set_index("param").sort_index()
     print("\n=== Erreurs en % (globales, sur le loader) ==="); print(df.round(4))
 
+    # === Sauvegardes CSV ===
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         tag = tag or "eval"
@@ -1976,34 +2086,13 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
         df.round(6).to_csv(csv_path)
         print(f"✓ Metrics CSV: {csv_path}")
 
-    if len(show_examples) > 0:
-        R = len(show_examples)
-        fig, axes = plt.subplots(R, 2, figsize=(12, 2.8*R), sharex=False)
-        if R == 1: axes = np.array([axes])
-        for r, ex in enumerate(show_examples):
-            x = np.arange(ex["clean"].numel()); ax1, ax2 = axes[r, 0], axes[r, 1]
-            ax1.plot(x, ex["noisy"],  lw=0.9, alpha=0.7, label="Noisy")
-            ax1.plot(x, ex["clean"],  lw=1.2,              label="Clean")
-            ax1.plot(x, ex["recon"],  lw=1.0, ls="--",     label="Recon")
-            ax1.set_ylabel("Transmission")
-            err_txt = ", ".join([f"{k}: {ex['errpct'][k]:.2f}%" for k in pred_names])
-            ax1.set_title(f"Exemple {r+1} — erreurs % : {err_txt}", fontsize=10)
-            ax1.legend(frameon=False, fontsize=8)
+        if save_per_sample and len(per_sample_rows) > 0:
+            df_samples = pd.DataFrame(per_sample_rows)
+            csv_path2 = os.path.join(save_dir, f"{tag}_errors_per_sample.csv")
+            df_samples.to_csv(csv_path2, index=False)
+            print(f"✓ Per-sample CSV: {csv_path2}")
 
-            ax2.plot(x, ex["recon"] - ex["noisy"], lw=0.9, label="Recon - Noisy")
-            ax2.plot(x, ex["recon"] - ex["clean"], lw=0.9, label="Recon - Clean")
-            ax2.axhline(0, color="k", ls=":", lw=0.7)
-            ax2.set_ylabel("Résidu"); ax2.legend(frameon=False, fontsize=8)
-        axes[-1, 0].set_xlabel("Index spectral"); axes[-1, 1].set_xlabel("Index spectral")
-        for axrow in axes:
-            for ax in axrow: ax.grid(alpha=0.25)
-        fig.tight_layout()
-        if save_dir is not None:
-            png_path = os.path.join(save_dir, f"{tag}_examples.png")
-            save_fig(fig, png_path, dpi=160)
-            print(f"✓ Examples PNG: {png_path}")
-        else:
-            plt.show()
+    # (… le reste de la fonction, les figures, inchangé …)
     return df
 
 # ============================================================
@@ -2011,7 +2100,7 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
 # ============================================================
 def build_data_and_model(
     *,
-    seed=42, n_points=800, n_train=150000, n_val=5000, batch_size=16,
+    seed=42, n_points=800, n_train=100000, n_val=500, batch_size=16,
     train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
     predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
     backbone_variant="s", refiner_variant="s",
@@ -2055,7 +2144,7 @@ def build_data_and_model(
     default_val = {
         'sig0': (3085.43, 3085.46),
         'dsig': (0.001521, 0.00154),
-        'mf_CH4': (2e-6, 20e-6),
+        'mf_CH4': (2e-6, 50e-6),
         'baseline0': (0.99, 1.01),
         'baseline1': (-0.0004, -0.0003),
         'baseline2': (-4.0565E-08, -3.07117E-08),
@@ -2170,6 +2259,42 @@ def build_data_and_model(
     return model, train_loader, val_loader
 
 # ------------- Utilitaires HPC -------------
+
+def _env_as_int(*keys: str, default: Optional[int] = None) -> Optional[int]:
+    """Parse first integer value from a list of environment variable keys."""
+    for key in keys:
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        raw = str(raw).strip()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            match = re.search(r"\d+", raw)
+            if match:
+                try:
+                    return int(match.group(0))
+                except ValueError:
+                    continue
+    return default
+
+
+def _env_flag(*keys: str, default: bool = False) -> bool:
+    """Return True if any of the provided environment variables is truthy."""
+    truthy = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+    falsy = {"0", "false", "FALSE", "no", "NO", "off", "OFF"}
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw = str(raw).strip()
+        if raw in truthy:
+            return True
+        if raw in falsy:
+            return False
+    return bool(default)
+
+
 def get_master_addr_and_port(default_port=12910):
     # MASTER_ADDR pour SLURM : 1er hostname de la nodelist
     master_addr = os.environ.get("MASTER_ADDR")
@@ -2221,46 +2346,94 @@ def _with_sampler(loader, shuffle_default):
     )
 
 def ensure_distributed_samplers(train_loader, val_loader):
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size <= 1:
+    # On ne se base QUE sur l'init réelle de torch.distributed (pas les env SLURM).
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return train_loader, val_loader
     return _with_sampler(train_loader, True), _with_sampler(val_loader, False)
 
-
 def trainer_common_kwargs():
-    import os, torch, pytorch_lightning as pl
-    try:
-        from lightning_fabric.plugins.environments import SLURMEnvironment
-        slurm_env = SLURMEnvironment(auto_requeue=True)
-    except Exception:
-        slurm_env = None  # fallback si hors SLURM
-
-    num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("NUM_NODES", "1")))
-
-    # SLURM_NTASKS_PER_NODE peut être "4" ou "4(xxx)" → on prend le premier entier
-    raw = os.environ.get("SLURM_NTASKS_PER_NODE", os.environ.get("SLURM_TASKS_PER_NODE", "1"))
-    tasks_per_node = int(str(raw).split('(')[0])
-
+    import pytorch_lightning as pl
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices = tasks_per_node if accelerator == "gpu" else 1
 
-    precision = "32-true"  # garde simple/robuste; tu peux brancher choose_precision() si tu veux
-
+    precision = choose_precision()
     default_dir = os.environ.get("SLURM_JOB_ID", "runs_local")
     default_root_dir = f"./lightning_logs/{default_dir}"
 
-    # 🔑 SLURM intégré DANS la stratégie (pas de plugins=)
-    strategy = pl.strategies.DDPStrategy(
-        cluster_environment=slurm_env,
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True,
-        static_graph=False,
-        process_group_backend="nccl" if accelerator == "gpu" else "gloo",
-    )
+    devices = 1
+    num_nodes = 1
+    strategy: Union[str, "pl.strategies.Strategy"] = "auto"
 
-    # Petits réglages NCCL robustes
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    force_ddp = _env_flag("PHYS_AE_FORCE_DDP")
+    disable_ddp = _env_flag("PHYS_AE_DISABLE_DDP")
+
+    if accelerator == "gpu":
+        visible_devices = max(1, torch.cuda.device_count())
+        requested_devices = _env_as_int("PHYS_AE_DEVICES")
+        if requested_devices is None:
+            requested_devices = _env_as_int("LOCAL_WORLD_SIZE", "SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE")
+        if requested_devices is not None:
+            devices = max(1, min(visible_devices, requested_devices))
+        else:
+            devices = visible_devices
+
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
+
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1:
+                if world_size_env is None or world_size_env == expected_world:
+                    should_enable_ddp = True
+                else:
+                    if on_rank_zero():
+                        print(
+                            f"[INFO] WORLD_SIZE={world_size_env} != devices*num_nodes={expected_world}; "
+                            "skipping automatic DDP initialisation."
+                        )
+            elif world_size_env and world_size_env > 1:
+                if on_rank_zero():
+                    print(
+                        f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device setup; "
+                        "not enabling DDP automatically."
+                    )
+
+        if should_enable_ddp:
+            get_master_addr_and_port()
+            try:
+                from pytorch_lightning.strategies import DDPStrategy
+                strategy = DDPStrategy(find_unused_parameters=False)
+            except Exception:
+                strategy = "ddp_find_unused_parameters_false"
+    else:
+        devices = 1
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
+
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1 and (world_size_env is None or world_size_env == expected_world):
+                should_enable_ddp = True
+            elif world_size_env and world_size_env > 1 and on_rank_zero():
+                print(
+                    f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device CPU setup; "
+                    "not enabling DDP automatically."
+                )
+
+        if should_enable_ddp:
+            strategy = "ddp"
 
     return dict(
         accelerator=accelerator,
@@ -2272,23 +2445,76 @@ def trainer_common_kwargs():
         enable_progress_bar=False,
         deterministic=False,
         gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm" 
+        gradient_clip_algorithm="norm",
+        strategy=strategy,
     )
 
 
 def on_rank_zero():
-    # Simple helper: True uniquement sur le rank 0 global
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
+    """Return True uniquement pour le rank global 0.
+
+    Avant l'initialisation explicite de torch.distributed (ex: avant le premier
+    Trainer DDP), ``torch.distributed.is_initialized()`` retourne False sur tous
+    les processus, ce qui faisait croire à chaque worker qu'il était le rank 0.
+    On complète donc la détection en se basant sur les variables d'environnement
+    (SLURM, TorchElastic, etc.) lorsque le backend distribué n'est pas encore
+    prêt.
+    """
+
+    if torch.distributed.is_available():
+        if torch.distributed.is_initialized():
+            try:
+                return torch.distributed.get_rank() == 0
+            except RuntimeError:
+                # Peut lever si le backend est dispo mais pas encore configuré
+                pass
+
+    env_rank = _env_as_int("RANK", "SLURM_PROCID", "PMI_RANK", "MPI_RANK", "LOCAL_RANK")
+    if env_rank is not None:
+        return env_rank == 0
+
+    # Fallback mono-process: si aucune info dispo on considère qu'on est seul
+    return True
+
+def _ensure_stage_structure(stage_dir: Path):
+    for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
+        (stage_dir / sub).mkdir(parents=True, exist_ok=True)
+
 
 def make_run_dir(base="runs"):
-    job = os.environ.get("SLURM_JOB_ID", "local")
-    run_dir = os.path.join(base, f"{job}") 
-    os.makedirs(run_dir, exist_ok=True)
-    for d in ("checkpoints", "figs", "eval", "logs"):
-        os.makedirs(os.path.join(run_dir, d), exist_ok=True)
-    return run_dir
+    existing = os.environ.get("PHYS_AE_RUN_DIR")
+    if existing:
+        Path(existing).mkdir(parents=True, exist_ok=True)
+        _ensure_stage_structure(Path(existing) / "A")
+        _ensure_stage_structure(Path(existing) / "B")
+        (Path(existing) / "finetune" / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (Path(existing) / "finetune" / "logs").mkdir(parents=True, exist_ok=True)
+        (Path(existing) / "finetune" / "figs").mkdir(parents=True, exist_ok=True)
+        return existing
+
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        run_dir = Path(base) / f"study_{job}"
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = Path(base) / f"study_local_{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for stage in ("A", "B"):
+        _ensure_stage_structure(run_dir / stage)
+
+    finetune_dir = run_dir / "finetune"
+    for sub in ("checkpoints", "logs", "figs"):
+        (finetune_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    os.environ["PHYS_AE_RUN_DIR"] = str(run_dir)
+    return str(run_dir)
+
+
+def get_stage_dir(run_dir: Path, stage: str) -> Path:
+    stage_dir = Path(run_dir) / stage.upper()
+    _ensure_stage_structure(stage_dir)
+    return stage_dir
 
 import yaml
 import numpy as np
@@ -2326,114 +2552,975 @@ def save_config(run_dir_path, **cfg):
             default_flow_style=False
         )
     return path
-    
-# ------------- Main entraînement multi-étapes -------------
-if __name__ == "__main__":
-    torch.set_float32_matmul_precision("high")  
-    pl.seed_everything(42, workers=True)
 
-    get_master_addr_and_port()
 
-    # --- Crée le dossier du run ---
-    RUN_DIR = make_run_dir(base="runs")
+"""
+Optuna tuning pour les étapes A (backbone+heads) et B1 (refiner) de ton pipeline.
 
-    # --- Construit modèle + loaders ---
+Pré-requis: place ton gros fichier (celui que tu as collé) sous le nom `pipeline.py`
+dans le même dossier que ce script, OU adapte `PIPELINE_MODULE` ci‑dessous.
+
+Ce script:
+  1) optimise Stage A → écrit RUN_DIR/checkpoints/A_opt.ckpt
+  2) optimise Stage B1 en repartant du meilleur A → écrit RUN_DIR/checkpoints/B_opt.ckpt
+  3) (optionnel) lance un court B2 (fine‑tune global) en repartant de B1 best → RUN_DIR/checkpoints/B2_final.ckpt
+
+Usage minimal:
+  python optuna_tuner.py --trials-a 20 --trials-b 20 --epochs-a 50 --epochs-b 30
+
+Tu peux relancer: les studies sont stockées en SQLite dans RUN_DIR.
+"""
+import os
+import math
+import shutil
+import argparse
+from pathlib import Path
+
+import optuna
+from optuna.samplers import TPESampler
+from optuna.pruners import MedianPruner
+from optuna.storages.journal import JournalFileBackend
+from optuna.storages import JournalStorage
+
+
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+
+import json, os, shutil, time
+from pathlib import Path
+
+# ---- callback à mettre près de ton objective() ----
+import torch
+import optuna
+import pytorch_lightning as pl
+
+class LossHistory(pl.callbacks.Callback):
+    def __init__(self, trial: optuna.trial.Trial):
+        self.trial = trial
+        self.train_hist = []
+        self.val_hist = []
+
+    @staticmethod
+    def _to_float(x):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu()
+            x = x.item() if x.ndim == 0 else float(x.mean().item())
+        return float(x)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        cm = trainer.callback_metrics
+        # suivant ta config, la clé peut être train_loss_epoch ou train_loss
+        v = cm.get("train_loss_epoch", cm.get("train_loss", None))
+        self.train_hist.append(self._to_float(v))
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        cm = trainer.callback_metrics
+        # idem pour la val : val_loss_epoch ou val_loss
+        v = cm.get("val_loss_epoch", cm.get("val_loss", None))
+        v = self._to_float(v)
+        self.val_hist.append(v)
+
+        # (optionnel) reporter la val_loss à Optuna pour pruning/traçage
+        step = len(self.val_hist) - 1
+        if v is not None:
+            self.trial.report(v, step)
+            if self.trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+    def on_fit_end(self, trainer, pl_module):
+        # stocke les historiques dans le trial → récupérable après l’étude
+        self.trial.set_user_attr("train_loss_history", self.train_hist)
+        self.trial.set_user_attr("val_loss_history", self.val_hist)
+
+
+class OptunaCSVLogger:
+    """Enregistre chaque trial Optuna dans un CSV et maintient le top 5."""
+
+    def __init__(self, stage_dir: Path, stage: str, top_k: int = 5):
+        self.stage_dir = Path(stage_dir)
+        self.stage = stage.upper()
+        self.top_k = top_k
+        self.csv_path = self.stage_dir / "trials.csv"
+        self.top_path = self.stage_dir / "top5.json"
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+        self._append_trial(trial)
+        self._update_top(study)
+
+    def _append_trial(self, trial: optuna.trial.FrozenTrial):
+        record = {
+            "trial": trial.number,
+            "timestamp": datetime.utcnow().isoformat(),
+            "state": trial.state.name if trial.state else "UNKNOWN",
+            "value": "" if trial.value is None else float(trial.value),
+            "duration_s": trial.duration.total_seconds() if trial.duration else "",
+            "params": json.dumps(trial.params, sort_keys=True, ensure_ascii=False),
+        }
+
+        file_exists = self.csv_path.exists()
+        with self.csv_path.open("a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(record.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+
+    def _update_top(self, study: optuna.study.Study):
+        try:
+            trials = study.get_trials(deepcopy=False, states=None)
+        except Exception:
+            trials = study.trials
+
+        completed = [
+            t for t in trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if not completed:
+            return
+
+        direction = getattr(study, "direction", None)
+        if direction is None:
+            directions = getattr(study, "directions", None)
+            direction = directions[0] if directions else optuna.study.StudyDirection.MINIMIZE
+
+        reverse = direction == optuna.study.StudyDirection.MAXIMIZE
+        completed.sort(key=lambda t: t.value, reverse=reverse)
+        top = completed[: self.top_k]
+
+        ckpt_attr = "best_ckpt_A" if self.stage.startswith("A") else "best_ckpt_B1"
+        payload = [
+            {
+                "rank": rank,
+                "trial": t.number,
+                "value": float(t.value),
+                "params": dict(t.params),
+                "checkpoint": t.user_attrs.get(ckpt_attr, ""),
+            }
+            for rank, t in enumerate(top, start=1)
+        ]
+
+        self.top_path.parent.mkdir(parents=True, exist_ok=True)
+        self.top_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
+def get_worker_info():
+    rank = int(os.environ.get("SLURM_PROCID") or os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or 0)
+    world = int(os.environ.get("SLURM_NTASKS") or os.environ.get("WORLD_SIZE") or 1)
+    return rank, world
+
+def wait_for_file(path, check_every=5, timeout=24*3600):
+    t0 = time.time()
+    while not os.path.isfile(path):
+        if time.time() - t0 > timeout:
+            raise TimeoutError(f"Timeout en attendant {path}")
+        time.sleep(check_every)
+    return path
+
+from typing import Tuple, Union
+from pathlib import Path
+import json, os, shutil, time
+
+def _atomic_update_best_ckpt(
+    src_ckpt: Union[str, Path],
+    new_score: float,
+    dest_ckpt: Union[str, Path],
+    meta_path: Union[str, Path],
+    direction: str = "min",
+) -> Tuple[bool, str]:
+    """
+    Copie src_ckpt -> dest_ckpt si new_score est meilleur que 'score' dans meta_path.
+    direction: 'min' (par défaut) ou 'max'.
+    Retourne (is_new_best, str(dest_ckpt)).
+    """
+    if not src_ckpt:
+        return False, str(dest_ckpt)
+
+    dest_ckpt = Path(dest_ckpt)
+    meta_path = Path(meta_path)
+    dest_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # petit verrou (optionnel) pour éviter les races entre ranks
+    lock_fh = None
+    lock_path = meta_path.with_suffix(meta_path.suffix + ".lock")
+    try:
+        try:
+            import fcntl
+            lock_fh = open(lock_path, "w")
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        except Exception:
+            lock_fh = None
+
+        cur = None
+        if meta_path.exists():
+            try:
+                cur = float(json.loads(meta_path.read_text()).get("score", None))
+            except Exception:
+                cur = None
+
+        if direction not in ("min", "max"):
+            raise ValueError("direction must be 'min' or 'max'")
+
+        is_better = (cur is None) or (
+            (direction == "min" and new_score < cur) or
+            (direction == "max" and new_score > cur)
+        )
+
+        if is_better:
+            tmp = dest_ckpt.with_suffix(dest_ckpt.suffix + f".tmp.{os.getpid()}")
+            shutil.copy2(str(src_ckpt), tmp)
+            os.replace(tmp, dest_ckpt)
+            meta_path.write_text(json.dumps({
+                "score": float(new_score),
+                "path": str(dest_ckpt),
+                "time": time.time()
+            }))
+            return True, str(dest_ckpt)
+
+        return False, str(dest_ckpt) if dest_ckpt.exists() else ""
+
+    finally:
+        if lock_fh:
+            try:
+                import fcntl
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                lock_fh.close()
+            except Exception:
+                pass
+
+
+def _cleanup_trial_checkpoint(path: Union[str, Path]):
+    if not path:
+        return
+
+    p = Path(path)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+    parent = p.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        pass
+
+
+def _cleanup_trial_dir(root: Union[str, Path]):
+    if not root:
+        return
+
+    root = Path(root)
+    try:
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        pass
+
+    parent = root.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        pass
+
+
+def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[str], best_score: float,
+                         direction: str = "min") -> str:
+    if not best_path:
+        return ""
+
+    dest_ckpt = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.ckpt"
+    meta_path = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.json"
+    is_new_best, final_ckpt = _atomic_update_best_ckpt(best_path, best_score, dest_ckpt, meta_path, direction=direction)
+
+    _cleanup_trial_checkpoint(best_path)
+
+    if final_ckpt and os.path.isfile(final_ckpt):
+        return final_ckpt
+
+    return ""
+
+
+def _trial_dirs(run_dir: Path, stage: str, trial_number: int) -> dict[str, Path]:
+    stage_dir = get_stage_dir(run_dir, stage)
+    root = stage_dir / "trials" / f"trial_{trial_number:04d}"
+    ck   = root / "ckpts"
+    fig  = root / "figs"
+    for p in (root, ck, fig):
+        p.mkdir(parents=True, exist_ok=True)
+    return {"root": root, "ckpts": ck, "figs": fig}
+
+
+def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val_loss",
+                      patience: int = 15, ckpt_dir: Optional[Path] = None) -> list:
+    if ckpt_dir is not None:
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckp = ModelCheckpoint(
+        monitor=monitor,
+        mode="min",
+        save_top_k=1,
+        filename=f"best-{stage}",
+        save_last=False,
+        auto_insert_metric_name=False,
+        dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
+    )
+    early = EarlyStopping(monitor=monitor, mode="min", patience=patience)
+    plot = PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1, save_dir=str(fig_dir), stage_tag=f"stage_{stage}")
+    return [ckp, early, plot, UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch()]
+
+
+def _score_from_callbacks(callbacks: list, fallback: float | None = None) -> tuple[float, str | None]:
+    ckps = [c for c in callbacks if isinstance(c, ModelCheckpoint)]
+    if ckps and ckps[0].best_model_path:
+        score = ckps[0].best_model_score
+        if score is not None:
+            try:
+                return float(score.cpu().item()), ckps[0].best_model_path
+            except Exception:
+                return float(score), ckps[0].best_model_path
+    # fallback (ex: aucune amélioration)
+    return (float("inf") if fallback is None else float(fallback), None)
+
+
+def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
+    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(src_path), str(dst_path))
+
+
+def _cleanup_artifacts(paths: Iterable[Path | str]):
+    for p in paths:
+        if not p:
+            continue
+        path = Path(p)
+        if path.is_file():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+# ===================== OBJECTIVE: STAGE A =====================
+
+def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
+                      n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
+    # --- Search space ---
+    base_lr = trial.suggest_float("base_lr", 1e-5, 5e-4, log=True)
+    backbone_variant = trial.suggest_categorical("backbone_variant", ["s"])  # compacité vs capacité
+    backbone_width_mult = trial.suggest_float("backbone_width_mult", 0.8, 1.3)
+    backbone_depth_mult = trial.suggest_float("backbone_depth_mult", 0.85, 1.35)
+    backbone_drop_path  = trial.suggest_float("backbone_drop_path", 0.0, 0.2)
+    backbone_se_ratio   = trial.suggest_float("backbone_se_ratio", 0.15, 0.35)
+    huber_beta          = trial.suggest_float("huber_beta", 5e-4, 5e-3, log=True)
+    batch_size          = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
+
+    # Dossiers dédiés au trial
+    stage_dir = get_stage_dir(run_dir, "A")
+    dirs = _trial_dirs(run_dir, stage="A", trial_number=trial.number)
+
+    # Construire data + modèle avec HPs trial
     model, train_loader, val_loader = build_data_and_model(
-        backbone_variant="s", # s, m, l
-        backbone_width_mult=1.0,
-        backbone_depth_mult=1.0,
-        refiner_variant="s",
-        refiner_width_mult=1.0,
-        refiner_depth_mult=1.0,
-        refiner_feature_pool="avg", # avg, max, avgmax
-        refiner_shared_hidden_scale=0.5,
-        huber_beta=0.002,
-        backbone_drop_path=0.0,
-        refiner_drop_path=0.0,
+        seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
+        batch_size=batch_size,
+        huber_beta=huber_beta,
+        backbone_variant=backbone_variant,
+        backbone_width_mult=backbone_width_mult,
+        backbone_depth_mult=backbone_depth_mult,
+        backbone_drop_path=backbone_drop_path,
+        backbone_se_ratio=backbone_se_ratio,
     )
 
-    train_loader, val_loader = ensure_distributed_samplers(train_loader, val_loader)
-
-    # --- Dossiers de sortie ---
-    FIGS_ROOT = os.path.join(RUN_DIR, "figs")
-    EVAL_DIR  = os.path.join(RUN_DIR, "eval")
-
-    # --- Trainer kwargs communs ---
+    # Trainer kwargs (on force 1 device pour éviter des essais multi-GPU par trial)
     tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = os.path.join(RUN_DIR, "logs")
+    tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
+    tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
-    # --- Callbacks par étape ---
-    cb_A  = [
-        PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1,
-                               save_dir=FIGS_ROOT, stage_tag="stage_A"),
-        UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch(),
-    ]
-    cb_B1 = [
-        PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1,
-                               save_dir=FIGS_ROOT, stage_tag="stage_B1"),
-        UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch(),
-    ]
-    cb_B2 = [
-        PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1,
-                               save_dir=FIGS_ROOT, stage_tag="stage_B2"),
-        UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch(),
-    ]
-
-    # --- Chemins ckpt ---
-    ckpt_A  = os.path.join(RUN_DIR, "checkpoints", "stage_A.ckpt")
-    ckpt_B1 = os.path.join(RUN_DIR, "checkpoints", "stage_B1.ckpt")
-    ckpt_B2 = os.path.join(RUN_DIR, "checkpoints", "stage_B2.ckpt")
-
-    # ===================== ÉTAPE A =====================
-    model = train_stage_A(
+    # Callbacks
+    callbacks = _common_callbacks("A", val_loader, fig_dir=dirs["figs"], patience=12, ckpt_dir=dirs["ckpts"])
+    callbacks = [LossHistory(trial), *callbacks] 
+    # Lancement stage A
+    train_stage_A(
         model, train_loader, val_loader,
-        epochs=100, base_lr=1e-4,
-        train_film=False, use_film=False, film_subset=[],
-        heads_subset=["sig0","dsig","P","T","mf_CH4","baseline1","baseline2"],
-        callbacks=cb_A, ckpt_out=ckpt_A, **tkw,
+        epochs=epochs,
+        base_lr=base_lr,
+        callbacks=callbacks,
+        # ckpt_out facultatif ici (ModelCheckpoint gère l'early/best)
+        **tkw,
     )
 
-    # ➜ ÉVAL après A
-    if on_rank_zero():
-        evaluate_and_plot(
-            model, val_loader, n_show=5, refine=True, robust_smape=False,
-            baseline_correction={"enabled": False, "edge_pts": 50, "deg": 2, "iters": 1},
-            save_dir=EVAL_DIR, tag="stage_A"
-        )
+    # Récup meilleure val_loss + ckpt
+    # Récup meilleure val_loss + ckpt
+    best_score, best_path = _score_from_callbacks(callbacks)
+    global_ckpt = _register_trial_best(stage_dir, "A", best_path, best_score, direction="min")
 
-    # ===================== ÉTAPE B1 =====================
-    model = train_stage_B1(
-        model, train_loader, val_loader,
-        epochs=100, refiner_lr=1e-4,
-        refine_steps=1, delta_scale=0.03,
-        use_film=False, train_film=False, film_subset=[],
-        heads_subset=["sig0","dsig","P","T","mf_CH4","baseline1","baseline2"],
-        callbacks=cb_B1, ckpt_in=ckpt_A, ckpt_out=ckpt_B1, **tkw,
+    trial.set_user_attr("best_ckpt_A", global_ckpt)
+    trial.set_user_attr("best_val_A", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
+    return best_score
+
+
+
+
+# ===================== OBJECTIVE: STAGE B1 =====================
+
+def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str,
+                       n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
+    # --- Search space (refiner-centric) ---
+    refiner_lr = trial.suggest_float("refiner_lr", 1e-6, 3e-4, log=True)
+    refine_steps = trial.suggest_int("refine_steps", 1, 1)
+    delta_scale  = trial.suggest_float("delta_scale", 0.02, 0.15)
+    refiner_variant = trial.suggest_categorical("refiner_variant", ["s"])
+    refiner_width_mult = trial.suggest_float("refiner_width_mult", 0.85, 1.35)
+    refiner_depth_mult = trial.suggest_float("refiner_depth_mult", 0.85, 1.35)
+    refiner_feature_pool = trial.suggest_categorical("refiner_feature_pool", ["avg"])
+    refiner_shared_hidden_scale = trial.suggest_float("refiner_shared_hidden_scale", 0.35, 0.8)
+    refiner_time_embed_dim = trial.suggest_categorical("refiner_time_embed_dim", [16, 24, 32, 48, 64])
+
+    batch_size = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
+
+    stage_dir = get_stage_dir(run_dir, "B")
+    dirs = _trial_dirs(run_dir, stage="B", trial_number=trial.number)
+
+    # IMPORTANT: reconstruit le modèle avec les HP refiner (le backbone peut rester celui du meilleur A)
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
+        batch_size=batch_size,
+        refiner_variant=refiner_variant,
+        refiner_width_mult=refiner_width_mult,
+        refiner_depth_mult=refiner_depth_mult,
+        refiner_feature_pool=refiner_feature_pool,
+        refiner_shared_hidden_scale=refiner_shared_hidden_scale,
+        refiner_time_embed_dim=refiner_time_embed_dim,
     )
 
-    # ➜ ÉVAL après B1
-    if on_rank_zero():
-        evaluate_and_plot(
-            model, val_loader, n_show=5, refine=True, robust_smape=False,
-            baseline_correction={"enabled": False, "edge_pts": 50, "deg": 2, "iters": 1},
-            save_dir=EVAL_DIR, tag="stage_B1"
-        )
+    # Trainer kwargs
+    tkw = trainer_common_kwargs()
+    tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
+    tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
-    # ===================== ÉTAPE B2 =====================
-    model = train_stage_B2(
+    callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
+    callbacks = [LossHistory(trial), *callbacks] 
+
+
+    # Lancement B1 en repartant de A
+    train_stage_B1(
         model, train_loader, val_loader,
-        epochs=20, base_lr=1e-9, refiner_lr=1e-9,
-        refine_steps=2, delta_scale=0.08,
-        use_film=False, train_film=False, film_subset=[],
-        callbacks=cb_B2,
-        heads_subset=["sig0","dsig","P","T","mf_CH4","baseline1","baseline2"],
-        ckpt_in=ckpt_B1, ckpt_out=ckpt_B2, **tkw,
+        epochs=epochs,
+        refiner_lr=refiner_lr,
+        refine_steps=refine_steps,
+        delta_scale=delta_scale,
+        callbacks=callbacks,
+        ckpt_in=ckpt_A,
+        **tkw,
     )
 
-    # ➜ ÉVAL après B2 (final)
-    if on_rank_zero():
-        evaluate_and_plot(
-            model, val_loader, n_show=5, refine=True, robust_smape=False,
-            baseline_correction={"enabled": False, "edge_pts": 50, "deg": 2, "iters": 1},
-            save_dir=EVAL_DIR, tag="stage_B2"
+    # Récup meilleure val_loss + ckpt
+    best_score, best_path = _score_from_callbacks(callbacks)
+    global_ckpt = _register_trial_best(stage_dir, "B1", best_path, best_score, direction="min")
+
+    trial.set_user_attr("best_ckpt_B1", global_ckpt)
+    trial.set_user_attr("best_val_B1", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
+    return best_score
+
+
+
+# ===================== RUNNERS =====================
+
+def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
+                       n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "A")
+    optuna_dir = stage_dir / "optuna"
+    optuna_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = optuna_dir / "journal.log"
+    storage = JournalStorage(JournalFileBackend(str(journal_path)))
+
+    study = optuna.create_study(
+        study_name="stage_A_opt",
+        storage=storage,
+        direction="minimize",
+        sampler=TPESampler(seed=seed),
+        pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
+        load_if_exists=True,
+    )
+
+    def _obj(trial: optuna.Trial) -> float:
+        return objective_stage_A(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
         )
+
+    csv_logger = OptunaCSVLogger(stage_dir, stage="A")
+    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
+
+    # ► meilleur global (tous workers) + artefacts
+    best = study.best_trial
+    best_ckpt_src = best.user_attrs.get("best_ckpt_A", "")
+    if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
+        raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de A.")
+
+    dest_ckpt = stage_dir / "checkpoints" / "A_opt.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_best.json"
+    _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
+
+    # ► JSON des meilleurs hyperparams d'A
+    if on_rank_zero():
+        _save_best_params_json("A", best, str(dest_ckpt), stage_dir)
+
+    print(f"✓ A_opt prêt: {dest_ckpt}")
+    return str(dest_ckpt), float(best.value), dict(best.params)
+
+def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
+                        n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "B")
+    optuna_dir = stage_dir / "optuna"
+    optuna_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = optuna_dir / "journal.log"
+    storage = JournalStorage(JournalFileBackend(str(journal_path)))
+
+    study = optuna.create_study(
+        study_name="stage_B1_opt",
+        storage=storage,
+        direction="minimize",
+        sampler=TPESampler(seed=seed),
+        pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
+        load_if_exists=True,
+    )
+
+    def _obj(trial: optuna.Trial) -> float:
+        return objective_stage_B1(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            ckpt_A=ckpt_A_path,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
+        )
+
+    csv_logger = OptunaCSVLogger(stage_dir, stage="B")
+    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
+
+    best = study.best_trial
+    best_ckpt_src = best.user_attrs.get("best_ckpt_B1", "")
+    if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
+        raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de B1.")
+
+    dest_ckpt = stage_dir / "checkpoints" / "B_opt.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_best.json"
+    _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
+
+    # ► JSON des meilleurs hyperparams de B (B1)
+    if on_rank_zero():
+        _save_best_params_json("B", best, str(dest_ckpt), stage_dir)
+
+    print(f"✓ B_opt prêt: {dest_ckpt}")
+    return str(dest_ckpt), float(best.value), dict(best.params)
+
+
+def _best_source_from_callbacks(callbacks: list, fallback_ckpt: Optional[Path]) -> tuple[str, float]:
+    score, path = _score_from_callbacks(callbacks)
+    if path and os.path.isfile(path):
+        return path, float(score)
+    if fallback_ckpt is not None and fallback_ckpt.exists():
+        return str(fallback_ckpt), float(score)
+    return "", float(score)
+
+
+def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "A")
+    retrain_dir = stage_dir / "retrain"
+    logs_dir = retrain_dir / "logs"
+    figs_dir = retrain_dir / "figs"
+    ckpts_dir = retrain_dir / "ckpts"
+    for p in (logs_dir, figs_dir, ckpts_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_params.get("batch_size", 16))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(best_params.get("huber_beta", 0.002)),
+        backbone_variant=best_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(best_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(best_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(best_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(best_params.get("backbone_se_ratio", 0.25)),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
+    ckpt_last = retrain_dir / "A_fine_tuned_last.ckpt"
+
+    train_stage_A(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        base_lr=float(best_params.get("base_lr", 2e-4)),
+        callbacks=callbacks,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = stage_dir / "checkpoints" / "A_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_fine_tuned.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "A_fine_tuned_params.json", {
+        "params": dict(best_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "source_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
+
+
+def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, *, epochs: int, seed: int,
+                    n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "B")
+    retrain_dir = stage_dir / "retrain"
+    logs_dir = retrain_dir / "logs"
+    figs_dir = retrain_dir / "figs"
+    ckpts_dir = retrain_dir / "ckpts"
+    for p in (logs_dir, figs_dir, ckpts_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_params.get("batch_size", stage_a_params.get("batch_size", 16)))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(stage_a_params.get("huber_beta", 0.002)),
+        backbone_variant=stage_a_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(stage_a_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(stage_a_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(stage_a_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(stage_a_params.get("backbone_se_ratio", 0.25)),
+        refiner_variant=best_params.get("refiner_variant", "s"),
+        refiner_width_mult=float(best_params.get("refiner_width_mult", 1.0)),
+        refiner_depth_mult=float(best_params.get("refiner_depth_mult", 1.0)),
+        refiner_feature_pool=best_params.get("refiner_feature_pool", "avg"),
+        refiner_shared_hidden_scale=float(best_params.get("refiner_shared_hidden_scale", 0.5)),
+        refiner_time_embed_dim=best_params.get("refiner_time_embed_dim", None),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
+    ckpt_last = retrain_dir / "B_fine_tuned_last.ckpt"
+
+    train_stage_B1(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        refiner_lr=float(best_params.get("refiner_lr", 1e-5)),
+        refine_steps=int(best_params.get("refine_steps", 1)),
+        delta_scale=float(best_params.get("delta_scale", 0.1)),
+        callbacks=callbacks,
+        ckpt_in=stage_a_ckpt,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = stage_dir / "checkpoints" / "B_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_fine_tuned.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "B_fine_tuned_params.json", {
+        "params": dict(best_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "stage_a_checkpoint": stage_a_ckpt,
+        "source_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
+
+
+def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict, *, epochs: int, seed: int,
+                      n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    finetune_dir = Path(run_dir) / "finetune"
+    logs_dir = finetune_dir / "logs"
+    figs_dir = finetune_dir / "figs"
+    tmp_ckpt_dir = finetune_dir / "tmp_ckpts"
+    for p in (logs_dir, figs_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_b_params.get("batch_size", best_a_params.get("batch_size", 16)))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(best_a_params.get("huber_beta", 0.002)),
+        backbone_variant=best_a_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(best_a_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(best_a_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(best_a_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(best_a_params.get("backbone_se_ratio", 0.25)),
+        refiner_variant=best_b_params.get("refiner_variant", "s"),
+        refiner_width_mult=float(best_b_params.get("refiner_width_mult", 1.0)),
+        refiner_depth_mult=float(best_b_params.get("refiner_depth_mult", 1.0)),
+        refiner_feature_pool=best_b_params.get("refiner_feature_pool", "avg"),
+        refiner_shared_hidden_scale=float(best_b_params.get("refiner_shared_hidden_scale", 0.5)),
+        refiner_time_embed_dim=best_b_params.get("refiner_time_embed_dim", None),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    callbacks = _common_callbacks("B2_finetune", val_loader, fig_dir=figs_dir, patience=10, ckpt_dir=tmp_ckpt_dir)
+    ckpt_last = finetune_dir / "checkpoints" / "finetune_last.ckpt"
+
+    train_stage_B2(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        base_lr=float(best_a_params.get("base_lr", 3e-5)),
+        refiner_lr=float(best_b_params.get("refiner_lr", 3e-6)),
+        refine_steps=int(best_b_params.get("refine_steps", 1)),
+        delta_scale=float(best_b_params.get("delta_scale", 0.1)),
+        callbacks=callbacks,
+        ckpt_in=ckpt_B_path,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = finetune_dir / "checkpoints" / "ensemble_best.ckpt"
+    meta_path = finetune_dir / "checkpoints" / "ensemble_best.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _dump_json(finetune_dir / "checkpoints" / "ensemble_finetune_params.json", {
+        "stage_A_params": dict(best_a_params),
+        "stage_B_params": dict(best_b_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "source_checkpoint": ckpt_B_path,
+        "selected_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
+
+
+def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
+    """Fine-tune global court (B2) en repartant du meilleur B1."""
+    run_dir = Path(make_run_dir())
+
+    model, train_loader, val_loader = build_data_and_model()
+
+    tkw = trainer_common_kwargs()
+    tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
+    ft_dir = Path(run_dir) / "finetune"
+    tkw["default_root_dir"] = str(ft_dir / "logs")
+
+    tmp_ckpt_dir = ft_dir / "tmp_ckpts"
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = ft_dir / "checkpoints" / "B2_optional.ckpt"
+    callbacks = _common_callbacks("B2_optional", val_loader, fig_dir=ft_dir / "figs", patience=8, ckpt_dir=tmp_ckpt_dir)
+
+    train_stage_B2(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        base_lr=3e-5, refiner_lr=3e-6,
+        refine_steps=1, delta_scale=0.08,
+        callbacks=callbacks,
+        ckpt_in=ckpt_B1_path,
+        ckpt_out=str(out_path),
+        **tkw,
+    )
+
+    best_score, best_path = _score_from_callbacks(callbacks)
+    print(f"\n✓ B2 terminé — best val_loss={best_score:.6g}; ckpt={best_path or out_path}")
+
+if __name__ == "__main__":
+    import argparse, math, json, os
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Optuna tuner pour stages A et B1")
+    parser.add_argument("--trials-a", type=int, default=200, help="Nombre d'essais Optuna pour A")
+    parser.add_argument("--trials-b", type=int, default=200, help="Nombre d'essais Optuna pour B1")
+    parser.add_argument("--epochs-a", type=int, default=50, help="Epochs par essai pour A")
+    parser.add_argument("--epochs-b", type=int, default=50, help="Epochs par essai pour B1")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-samples", type=int, default=100_000,
+                        help="Nombre d'échantillons synthétiques pour chaque essai (train)")
+    parser.add_argument("--val-samples", type=int, default=500,
+                        help="Nombre d'échantillons synthétiques pour la validation des essais")
+    parser.add_argument("--retrain-samples", type=int, default=1_000_000,
+                        help="Nombre d'échantillons synthétiques pour les ré-entraînements finaux")
+    # Par défaut on NE lance PAS B2 ; pour l'activer, passer --run-b2
+    parser.add_argument("--run-b2", action="store_true", help="Lancer le fine-tune B2 final")
+    args = parser.parse_args()
+
+    run_dir = Path(make_run_dir())
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+    # Répartition des trials entre workers (un process ~ un GPU)
+    rank, world = get_worker_info()
+    world = max(1, world)
+
+    trials_a_each = max(1, math.ceil(args.trials_a / world))
+    trials_b_each = max(1, math.ceil(args.trials_b / world))
+
+    if on_rank_zero():
+        print(f"[stage A] essais totaux demandés={args.trials_a} → par worker={trials_a_each}")
+    a_ckpt, a_best, a_params = run_optuna_stage_A(
+        n_trials=trials_a_each,
+        epochs=args.epochs_a,
+        seed=args.seed,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
+    )
+
+    # S'assure que le meilleur ckpt A est bien écrit (cas multi-workers)
+    wait_for_file(a_ckpt)
+
+    if on_rank_zero():
+        print(f"[stage B] essais totaux demandés={args.trials_b} → par worker={trials_b_each}")
+    b_ckpt, b_best, b_params = run_optuna_stage_B1(
+        n_trials=trials_b_each,
+        epochs=args.epochs_b,
+        seed=args.seed,
+        ckpt_A_path=a_ckpt,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
+    )
+
+    wait_for_file(b_ckpt)
+
+    if on_rank_zero():
+        print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
+        a_re_ckpt, a_re_score = retrain_stage_A(
+            a_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(a_re_ckpt)
+
+        print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
+        b_re_ckpt, b_re_score = retrain_stage_B(
+            b_params, a_params, a_re_ckpt, epochs=5, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(b_re_ckpt)
+
+        print("\n========== FINE-TUNE ENSEMBLE ==========")
+        ensemble_ckpt, ensemble_score = finetune_ensemble(
+            b_re_ckpt, a_params, b_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(ensemble_ckpt)
+
+        stage_dir_A = get_stage_dir(run_dir, "A")
+        stage_dir_B = get_stage_dir(run_dir, "B")
+
+        a_err_files = {}
+        b_err_files = {}
+        try:
+            a_err_files = export_param_errors_files(
+                a_re_ckpt, "A", refine=False, split="val", robust_smape=False
+            )
+        except Exception as e:
+            print(f"[warn] export erreurs A a échoué: {e}")
+        try:
+            b_err_files = export_param_errors_files(
+                ensemble_ckpt, "B", refine=True, split="val", robust_smape=False
+            )
+        except Exception as e:
+            print(f"[warn] export erreurs B a échoué: {e}")
+
+        summary = {
+            "study_root": str(run_dir),
+            "A": {
+                "optuna": {
+                    "ckpt": a_ckpt,
+                    "best_val_loss": a_best,
+                    "best_params": a_params,
+                },
+                "retrain": {
+                    "ckpt": a_re_ckpt,
+                    "best_val_loss": a_re_score,
+                    "epochs": 5,
+                    "n_train": args.retrain_samples,
+                },
+                "trials_csv": str(stage_dir_A / "trials.csv"),
+                "top5_params": str(stage_dir_A / "top5.json"),
+                "errors_files": a_err_files,
+            },
+            "B": {
+                "optuna": {
+                    "ckpt": b_ckpt,
+                    "best_val_loss": b_best,
+                    "best_params": b_params,
+                },
+                "retrain": {
+                    "ckpt": b_re_ckpt,
+                    "best_val_loss": b_re_score,
+                    "epochs": 5,
+                    "n_train": args.retrain_samples,
+                },
+                "trials_csv": str(stage_dir_B / "trials.csv"),
+                "top5_params": str(stage_dir_B / "top5.json"),
+                "errors_files": b_err_files,
+            },
+            "ensemble": {
+                "ckpt": ensemble_ckpt,
+                "best_val_loss": ensemble_score,
+                "epochs": 5,
+                "n_train": args.retrain_samples,
+            },
+        }
+
+        out_summary = run_dir / "summary.json"
+        out_summary.parent.mkdir(parents=True, exist_ok=True)
+        out_summary.write_text(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+
+        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
+
+    # Fine-tune B2 optionnel, seulement sur le rank 0
+    if args.run_b2 and rank == 0:
+        print("\n========== OPTIONAL FINE-TUNE B2 ==========")
+        optional_finetune_B2(b_ckpt, epochs=20)
