@@ -16,8 +16,19 @@ set -euo pipefail
 mkdir -p logs
 
 # Valeurs optionnelles configurables directement depuis le script / l'environnement.
-# Par exemple :
-#   N_TRAIN=50000 STAGEA_EPOCHS=10 MAX_TRIALS=20 sbatch bash_optuna.sh
+# Quelques exemples d'utilisation :
+#   # Nombre d'échantillons et epochs spécifiques
+#   N_TRAIN=50000 N_VAL=4000 N_POINTS=256 \
+#   STAGEA_EPOCHS=24 STAGEB1_EPOCHS=12 STAGEB2_EPOCHS=18 \
+#   sbatch bash_optuna.sh
+#
+#   # Limiter le nombre d'essais Optuna et fixer une seed
+#   MAX_TRIALS=40 TRIALS_PER_WORKER=5 OPTUNA_SEED=1234 sbatch bash_optuna.sh
+#
+# Rappels sur les bornes habituelles des paramètres optimisés (utile pour lire les logs) :
+#   - Stage A  : epochs 15-30, base_lr 5e-5 -> 3e-4, refiner_lr 1e-6 -> 5e-5
+#   - Stage B1 : epochs 8-20,  refiner_lr 5e-5 -> 5e-4, delta_scale 0.05 -> 0.2,  refine_steps 1-3
+#   - Stage B2 : epochs 10-25, base_lr 1e-5 -> 1e-4, refiner_lr 5e-6 -> 5e-5, delta_scale 0.05 -> 0.15, refine_steps 1-3
 N_TRAIN=${N_TRAIN:-}
 N_VAL=${N_VAL:-}
 N_POINTS=${N_POINTS:-}
