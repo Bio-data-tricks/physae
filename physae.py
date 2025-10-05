@@ -2451,10 +2451,30 @@ def trainer_common_kwargs():
 
 
 def on_rank_zero():
-    # Simple helper: True uniquement sur le rank 0 global
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
+    """Return True uniquement pour le rank global 0.
+
+    Avant l'initialisation explicite de torch.distributed (ex: avant le premier
+    Trainer DDP), ``torch.distributed.is_initialized()`` retourne False sur tous
+    les processus, ce qui faisait croire à chaque worker qu'il était le rank 0.
+    On complète donc la détection en se basant sur les variables d'environnement
+    (SLURM, TorchElastic, etc.) lorsque le backend distribué n'est pas encore
+    prêt.
+    """
+
+    if torch.distributed.is_available():
+        if torch.distributed.is_initialized():
+            try:
+                return torch.distributed.get_rank() == 0
+            except RuntimeError:
+                # Peut lever si le backend est dispo mais pas encore configuré
+                pass
+
+    env_rank = _env_as_int("RANK", "SLURM_PROCID", "PMI_RANK", "MPI_RANK", "LOCAL_RANK")
+    if env_rank is not None:
+        return env_rank == 0
+
+    # Fallback mono-process: si aucune info dispo on considère qu'on est seul
+    return True
 
 def _ensure_stage_structure(stage_dir: Path):
     for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
