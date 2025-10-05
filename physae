@@ -2365,9 +2365,12 @@ def make_run_dir(base="runs"):
         (Path(existing) / "finetune" / "figs").mkdir(parents=True, exist_ok=True)
         return existing
 
-    job = os.environ.get("SLURM_JOB_ID", "local")
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(base) / f"study_{job}_{stamp}"
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        run_dir = Path(base) / str(job)
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = Path(base) / f"local_{stamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
     for stage in ("A", "B"):
@@ -2505,15 +2508,15 @@ class LossHistory(pl.callbacks.Callback):
 
 
 class OptunaCSVLogger:
-    """Enregistre chaque trial Optuna dans un CSV et maintient le top 5."""
+    """Enregistre chaque trial Optuna dans un CSV situé à la racine du job."""
 
-    def __init__(self, stage_dir: Path, stage: str, top_k: int = 5):
-        self.stage_dir = Path(stage_dir)
+    def __init__(self, output_dir: Path, stage: str, top_k: int = 5):
+        self.output_dir = Path(output_dir)
         self.stage = stage.upper()
         self.top_k = top_k
-        self.csv_path = self.stage_dir / "trials.csv"
-        self.top_path = self.stage_dir / "top5.json"
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.output_dir / f"trials_{self.stage}.csv"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._top_cache = None
 
     def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
         self._append_trial(trial)
@@ -2570,8 +2573,10 @@ class OptunaCSVLogger:
             for rank, t in enumerate(top, start=1)
         ]
 
-        self.top_path.parent.mkdir(parents=True, exist_ok=True)
-        self.top_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+        # La demande utilisateur impose de ne produire que les CSV à la racine.
+        # On conserve le calcul du top 5 pour une éventuelle exploitation
+        # ultérieure mais on ne sérialise plus de fichier supplémentaire ici.
+        self._top_cache = payload
 
 
 def get_worker_info():
@@ -2844,7 +2849,7 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, floa
     def _obj(trial: optuna.Trial) -> float:
         return objective_stage_A(trial, run_dir=run_dir, epochs=epochs, seed=seed)
 
-    csv_logger = OptunaCSVLogger(stage_dir, stage="A")
+    csv_logger = OptunaCSVLogger(run_dir, stage="A")
     study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
 
     # ► meilleur global (tous workers) + artefacts
@@ -2884,7 +2889,7 @@ def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str)
     def _obj(trial: optuna.Trial) -> float:
         return objective_stage_B1(trial, run_dir=run_dir, epochs=epochs, seed=seed, ckpt_A=ckpt_A_path)
 
-    csv_logger = OptunaCSVLogger(stage_dir, stage="B")
+    csv_logger = OptunaCSVLogger(run_dir, stage="B")
     study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
 
     best = study.best_trial
@@ -3221,8 +3226,8 @@ if __name__ == "__main__":
                     "epochs": 50,
                     "n_train": 1_000_000,
                 },
-                "trials_csv": str(stage_dir_A / "trials.csv"),
-                "top5_params": str(stage_dir_A / "top5.json"),
+                "trials_csv": str(run_dir / "trials_A.csv"),
+                "top5_params": None,
                 "errors_files": a_err_files,
             },
             "B": {
@@ -3237,8 +3242,8 @@ if __name__ == "__main__":
                     "epochs": 50,
                     "n_train": 1_000_000,
                 },
-                "trials_csv": str(stage_dir_B / "trials.csv"),
-                "top5_params": str(stage_dir_B / "top5.json"),
+                "trials_csv": str(run_dir / "trials_B.csv"),
+                "top5_params": None,
                 "errors_files": b_err_files,
             },
             "ensemble": {
