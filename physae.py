@@ -2635,19 +2635,17 @@ class LossHistory(pl.callbacks.Callback):
 
 
 class OptunaCSVLogger:
-    """Enregistre chaque trial Optuna dans un CSV et maintient le top 5."""
+    """Enregistre chaque trial Optuna dans un CSV."""
 
-    def __init__(self, stage_dir: Path, stage: str, top_k: int = 5):
+    def __init__(self, stage_dir: Path, stage: str):
         self.stage_dir = Path(stage_dir)
         self.stage = stage.upper()
-        self.top_k = top_k
         self.csv_path = self.stage_dir / "trials.csv"
-        self.top_path = self.stage_dir / "top5.json"
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+        del study  # non utilisé, mais conservé pour signature Optuna
         self._append_trial(trial)
-        self._update_top(study)
 
     def _append_trial(self, trial: optuna.trial.FrozenTrial):
         record = {
@@ -2665,43 +2663,6 @@ class OptunaCSVLogger:
             if not file_exists:
                 writer.writeheader()
             writer.writerow(record)
-
-    def _update_top(self, study: optuna.study.Study):
-        try:
-            trials = study.get_trials(deepcopy=False, states=None)
-        except Exception:
-            trials = study.trials
-
-        completed = [
-            t for t in trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-        ]
-        if not completed:
-            return
-
-        direction = getattr(study, "direction", None)
-        if direction is None:
-            directions = getattr(study, "directions", None)
-            direction = directions[0] if directions else optuna.study.StudyDirection.MINIMIZE
-
-        reverse = direction == optuna.study.StudyDirection.MAXIMIZE
-        completed.sort(key=lambda t: t.value, reverse=reverse)
-        top = completed[: self.top_k]
-
-        ckpt_attr = "best_ckpt_A" if self.stage.startswith("A") else "best_ckpt_B1"
-        payload = [
-            {
-                "rank": rank,
-                "trial": t.number,
-                "value": float(t.value),
-                "params": dict(t.params),
-                "checkpoint": t.user_attrs.get(ckpt_attr, ""),
-            }
-            for rank, t in enumerate(top, start=1)
-        ]
-
-        self.top_path.parent.mkdir(parents=True, exist_ok=True)
-        self.top_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 def get_worker_info():
@@ -2906,6 +2867,24 @@ def _cleanup_artifacts(paths: Iterable[Path | str]):
             shutil.rmtree(path, ignore_errors=True)
 
 
+def cleanup_stage_outputs(stage_dir: Path, keep_files: Iterable[str] = ("trials.csv",)):
+    stage_path = Path(stage_dir)
+    if not stage_path.exists():
+        return
+
+    keep = {stage_path / name for name in keep_files}
+    for item in stage_path.iterdir():
+        if item in keep:
+            continue
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        else:
+            try:
+                item.unlink()
+            except FileNotFoundError:
+                pass
+
+
 # ===================== OBJECTIVE: STAGE A =====================
 
 def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
@@ -3084,10 +3063,6 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
     meta_path = stage_dir / "checkpoints" / "A_best.json"
     _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
 
-    # ► JSON des meilleurs hyperparams d'A
-    if on_rank_zero():
-        _save_best_params_json("A", best, str(dest_ckpt), stage_dir)
-
     print(f"✓ A_opt prêt: {dest_ckpt}")
     return str(dest_ckpt), float(best.value), dict(best.params)
 
@@ -3131,10 +3106,6 @@ def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
     dest_ckpt = stage_dir / "checkpoints" / "B_opt.ckpt"
     meta_path = stage_dir / "checkpoints" / "B_best.json"
     _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
-
-    # ► JSON des meilleurs hyperparams de B (B1)
-    if on_rank_zero():
-        _save_best_params_json("B", best, str(dest_ckpt), stage_dir)
 
     print(f"✓ B_opt prêt: {dest_ckpt}")
     return str(dest_ckpt), float(best.value), dict(best.params)
@@ -3393,10 +3364,6 @@ if __name__ == "__main__":
                         help="Nombre d'échantillons synthétiques pour chaque essai (train)")
     parser.add_argument("--val-samples", type=int, default=500,
                         help="Nombre d'échantillons synthétiques pour la validation des essais")
-    parser.add_argument("--retrain-samples", type=int, default=1_000_000,
-                        help="Nombre d'échantillons synthétiques pour les ré-entraînements finaux")
-    # Par défaut on NE lance PAS B2 ; pour l'activer, passer --run-b2
-    parser.add_argument("--run-b2", action="store_true", help="Lancer le fine-tune B2 final")
     args = parser.parse_args()
 
     run_dir = Path(make_run_dir())
@@ -3435,92 +3402,27 @@ if __name__ == "__main__":
 
     wait_for_file(b_ckpt)
 
-    if on_rank_zero():
-        print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
-        a_re_ckpt, a_re_score = retrain_stage_A(
-            a_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(a_re_ckpt)
-
-        print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
-        b_re_ckpt, b_re_score = retrain_stage_B(
-            b_params, a_params, a_re_ckpt, epochs=50, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(b_re_ckpt)
-
-        print("\n========== FINE-TUNE ENSEMBLE ==========")
-        ensemble_ckpt, ensemble_score = finetune_ensemble(
-            b_re_ckpt, a_params, b_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(ensemble_ckpt)
-
+    if rank == 0:
         stage_dir_A = get_stage_dir(run_dir, "A")
         stage_dir_B = get_stage_dir(run_dir, "B")
 
-        a_err_files = {}
-        b_err_files = {}
-        try:
-            a_err_files = export_param_errors_files(
-                a_re_ckpt, "A", refine=False, split="val", robust_smape=False
-            )
-        except Exception as e:
-            print(f"[warn] export erreurs A a échoué: {e}")
-        try:
-            b_err_files = export_param_errors_files(
-                ensemble_ckpt, "B", refine=True, split="val", robust_smape=False
-            )
-        except Exception as e:
-            print(f"[warn] export erreurs B a échoué: {e}")
-
-        summary = {
-            "study_root": str(run_dir),
-            "A": {
-                "optuna": {
-                    "ckpt": a_ckpt,
-                    "best_val_loss": a_best,
-                    "best_params": a_params,
-                },
-                "retrain": {
-                    "ckpt": a_re_ckpt,
-                    "best_val_loss": a_re_score,
-                    "epochs": 50,
-                    "n_train": args.retrain_samples,
-                },
-                "trials_csv": str(stage_dir_A / "trials.csv"),
-                "top5_params": str(stage_dir_A / "top5.json"),
-                "errors_files": a_err_files,
+        print("\n========== RÉSUMÉ OPTIMISATION ==========")
+        print(json.dumps({
+            "stage_A": {
+                "best_val_loss": a_best,
+                "best_params": a_params,
+                "csv": str(stage_dir_A / "trials.csv"),
             },
-            "B": {
-                "optuna": {
-                    "ckpt": b_ckpt,
-                    "best_val_loss": b_best,
-                    "best_params": b_params,
-                },
-                "retrain": {
-                    "ckpt": b_re_ckpt,
-                    "best_val_loss": b_re_score,
-                    "epochs": 50,
-                    "n_train": args.retrain_samples,
-                },
-                "trials_csv": str(stage_dir_B / "trials.csv"),
-                "top5_params": str(stage_dir_B / "top5.json"),
-                "errors_files": b_err_files,
+            "stage_B": {
+                "best_val_loss": b_best,
+                "best_params": b_params,
+                "csv": str(stage_dir_B / "trials.csv"),
             },
-            "ensemble": {
-                "ckpt": ensemble_ckpt,
-                "best_val_loss": ensemble_score,
-                "epochs": 50,
-                "n_train": args.retrain_samples,
-            },
-        }
+        }, indent=2, sort_keys=True, ensure_ascii=False))
 
-        out_summary = run_dir / "summary.json"
-        out_summary.parent.mkdir(parents=True, exist_ok=True)
-        out_summary.write_text(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
-
-        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
-
-    # Fine-tune B2 optionnel, seulement sur le rank 0
-    if args.run_b2 and rank == 0:
-        print("\n========== OPTIONAL FINE-TUNE B2 ==========")
-        optional_finetune_B2(b_ckpt, epochs=20)
+        if world == 1:
+            _cleanup_artifacts([a_ckpt, b_ckpt, stage_dir_A / "checkpoints", stage_dir_B / "checkpoints"])
+            cleanup_stage_outputs(stage_dir_A)
+            cleanup_stage_outputs(stage_dir_B)
+        else:
+            print("[info] Nettoyage final ignoré (plusieurs workers détectés).")
