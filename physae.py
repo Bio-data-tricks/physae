@@ -3043,6 +3043,18 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
 
 # ===================== RUNNERS =====================
 
+def _rank_aware_seed(base_seed: int) -> int:
+    """Retourne un seed dérivé du rang global pour des essais distribués uniques."""
+
+    try:
+        rank, _world = get_worker_info()
+    except Exception:
+        rank = 0
+
+    # On évite les collisions en espaçant largement chaque rang
+    return int(base_seed + rank * 10_000 + (rank % 10_000))
+
+
 def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
                        n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
     run_dir = Path(make_run_dir())
@@ -3052,11 +3064,13 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
     journal_path = optuna_dir / "journal.log"
     storage = JournalStorage(JournalFileBackend(str(journal_path)))
 
+    sampler_seed = _rank_aware_seed(seed)
+
     study = optuna.create_study(
         study_name="stage_A_opt",
         storage=storage,
         direction="minimize",
-        sampler=TPESampler(seed=seed),
+        sampler=TPESampler(seed=sampler_seed),
         pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
         load_if_exists=True,
     )
@@ -3100,11 +3114,13 @@ def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
     journal_path = optuna_dir / "journal.log"
     storage = JournalStorage(JournalFileBackend(str(journal_path)))
 
+    sampler_seed = _rank_aware_seed(seed + 17_341)
+
     study = optuna.create_study(
         study_name="stage_B1_opt",
         storage=storage,
         direction="minimize",
-        sampler=TPESampler(seed=seed),
+        sampler=TPESampler(seed=sampler_seed),
         pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
         load_if_exists=True,
     )
