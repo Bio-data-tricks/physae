@@ -1,6 +1,6 @@
 import math, random, sys, os
 import shutil
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Iterable
 import os
 import csv
 import socket
@@ -2766,6 +2766,20 @@ def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
     shutil.copyfile(str(src_path), str(dst_path))
 
 
+def _cleanup_artifacts(paths: Iterable[Path | str]):
+    for p in paths:
+        if not p:
+            continue
+        path = Path(p)
+        if path.is_file():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
 # ===================== OBJECTIVE: STAGE A =====================
 
 def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
@@ -3032,7 +3046,7 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
     tkw["default_root_dir"] = str(logs_dir)
 
     callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "last.ckpt"
+    ckpt_last = retrain_dir / "A_fine_tuned_last.ckpt"
 
     train_stage_A(
         model, train_loader, val_loader,
@@ -3045,12 +3059,14 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
 
     best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
 
-    dest_ckpt = stage_dir / "checkpoints" / "A_retrain_best.ckpt"
-    meta_path = stage_dir / "checkpoints" / "A_retrain_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "A_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_fine_tuned.json"
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _dump_json(stage_dir / "checkpoints" / "A_retrain_params.json", {
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "A_fine_tuned_params.json", {
         "params": dict(best_params),
         "epochs": epochs,
         "n_train": n_train,
@@ -3095,7 +3111,7 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
     tkw["default_root_dir"] = str(logs_dir)
 
     callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "last.ckpt"
+    ckpt_last = retrain_dir / "B_fine_tuned_last.ckpt"
 
     train_stage_B1(
         model, train_loader, val_loader,
@@ -3111,12 +3127,14 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
 
     best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
 
-    dest_ckpt = stage_dir / "checkpoints" / "B_retrain_best.ckpt"
-    meta_path = stage_dir / "checkpoints" / "B_retrain_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "B_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_fine_tuned.json"
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _dump_json(stage_dir / "checkpoints" / "B_retrain_params.json", {
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "B_fine_tuned_params.json", {
         "params": dict(best_params),
         "epochs": epochs,
         "n_train": n_train,
