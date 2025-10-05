@@ -1,7 +1,8 @@
 import math, random, sys, os
 import shutil
+import copy
+import tempfile
 from typing import Optional, List, Dict, Union, Iterable
-import os
 import csv
 import socket
 import re
@@ -2477,8 +2478,8 @@ def on_rank_zero():
     return True
 
 def _ensure_stage_structure(stage_dir: Path):
-    for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
-        (stage_dir / sub).mkdir(parents=True, exist_ok=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    (stage_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
 
 def make_run_dir(base="runs"):
@@ -2488,8 +2489,6 @@ def make_run_dir(base="runs"):
         _ensure_stage_structure(Path(existing) / "A")
         _ensure_stage_structure(Path(existing) / "B")
         (Path(existing) / "finetune" / "checkpoints").mkdir(parents=True, exist_ok=True)
-        (Path(existing) / "finetune" / "logs").mkdir(parents=True, exist_ok=True)
-        (Path(existing) / "finetune" / "figs").mkdir(parents=True, exist_ok=True)
         return existing
 
     job = os.environ.get("SLURM_JOB_ID")
@@ -2504,8 +2503,7 @@ def make_run_dir(base="runs"):
         _ensure_stage_structure(run_dir / stage)
 
     finetune_dir = run_dir / "finetune"
-    for sub in ("checkpoints", "logs", "figs"):
-        (finetune_dir / sub).mkdir(parents=True, exist_ok=True)
+    (finetune_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
 
     os.environ["PHYS_AE_RUN_DIR"] = str(run_dir)
     return str(run_dir)
@@ -2659,6 +2657,24 @@ class OptunaCSVLogger:
             "params": json.dumps(trial.params, sort_keys=True, ensure_ascii=False),
         }
 
+        ckpt_attr = "best_ckpt_A" if self.stage.startswith("A") else "best_ckpt_B1"
+        best_ckpt = trial.user_attrs.get(ckpt_attr, "")
+        val_mf = trial.user_attrs.get("val_mf_pct")
+        if val_mf is None:
+            val_mf_entry = ""
+        else:
+            try:
+                val_mf_value = float(val_mf)
+                if math.isnan(val_mf_value) or math.isinf(val_mf_value):
+                    val_mf_entry = ""
+                else:
+                    val_mf_entry = val_mf_value
+            except Exception:
+                val_mf_entry = ""
+
+        record["best_checkpoint"] = best_ckpt
+        record["val_mf_pct"] = val_mf_entry
+
         file_exists = self.csv_path.exists()
         with self.csv_path.open("a", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=list(record.keys()))
@@ -2696,6 +2712,7 @@ class OptunaCSVLogger:
                 "value": float(t.value),
                 "params": dict(t.params),
                 "checkpoint": t.user_attrs.get(ckpt_attr, ""),
+                "val_mf_pct": t.user_attrs.get("val_mf_pct"),
             }
             for rank, t in enumerate(top, start=1)
         ]
@@ -2828,6 +2845,54 @@ def _cleanup_trial_dir(root: Union[str, Path]):
         pass
 
 
+def _compute_mf_validation_pct(model, val_loader, ckpt_path: str, *, refine: bool = True) -> float:
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        return float("nan")
+
+    clone = copy.deepcopy(model)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    state = torch.load(ckpt_path, map_location=device)
+    state_dict = state.get("state_dict", state)
+    clone.load_state_dict(state_dict, strict=False)
+    clone.to(device)
+    clone.eval()
+
+    idx = clone.name_to_idx.get("mf_CH4")
+    if idx is None:
+        return float("nan")
+
+    errs = []
+    with torch.no_grad():
+        for batch in val_loader:
+            noisy = batch["noisy_spectra"].to(device)
+            params_norm = batch["params"].to(device)
+
+            provided_phys = {}
+            for name in getattr(clone, "provided_params", []):
+                idp = clone.name_to_idx[name]
+                v_norm = params_norm[:, idp]
+                phys = clone._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
+                provided_phys[name] = phys
+
+            out = clone.infer(noisy, provided_phys=provided_phys, refine=refine, resid_target="input")
+            y_full = out["y_phys_full"].detach()
+
+            pred = y_full[:, idx]
+            true_norm = params_norm[:, idx]
+            true_phys = clone._denorm_params_subset(true_norm.unsqueeze(1), ["mf_CH4"])[:, 0]
+
+            denom = true_phys.abs().clamp_min(1e-12)
+            err_pct = 100.0 * (pred - true_phys).abs() / denom
+            errs.append(err_pct.detach().cpu())
+
+    if not errs:
+        return float("nan")
+
+    all_errs = torch.cat([e.reshape(-1) for e in errs])
+    return float(all_errs.mean().item())
+
+
 def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[str], best_score: float,
                          direction: str = "min") -> str:
     if not best_path:
@@ -2847,16 +2912,14 @@ def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[s
 
 def _trial_dirs(run_dir: Path, stage: str, trial_number: int) -> dict[str, Path]:
     stage_dir = get_stage_dir(run_dir, stage)
-    root = stage_dir / "trials" / f"trial_{trial_number:04d}"
-    ck   = root / "ckpts"
-    fig  = root / "figs"
-    for p in (root, ck, fig):
-        p.mkdir(parents=True, exist_ok=True)
-    return {"root": root, "ckpts": ck, "figs": fig}
+    root = Path(tempfile.mkdtemp(prefix=f"trial_{trial_number:04d}_", dir=stage_dir))
+    ck = root / "ckpts"
+    ck.mkdir(parents=True, exist_ok=True)
+    return {"root": root, "ckpts": ck}
 
 
-def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val_loss",
-                      patience: int = 15, ckpt_dir: Optional[Path] = None) -> list:
+def _common_callbacks(stage: str, monitor: str = "val_loss", patience: int = 15,
+                      ckpt_dir: Optional[Path] = None) -> list:
     if ckpt_dir is not None:
         ckpt_dir = Path(ckpt_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -2870,8 +2933,7 @@ def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val
         dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
     )
     early = EarlyStopping(monitor=monitor, mode="min", patience=patience)
-    plot = PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1, save_dir=str(fig_dir), stage_tag=f"stage_{stage}")
-    return [ckp, early, plot, UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch()]
+    return [ckp, early, UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch()]
 
 
 def _score_from_callbacks(callbacks: list, fallback: float | None = None) -> tuple[float, str | None]:
@@ -2943,10 +3005,10 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     tkw["devices"] = 1
     tkw["num_nodes"] = 1
     tkw["strategy"] = "auto"
-    tkw["default_root_dir"] = str(dirs["root"] / "logs")
+    tkw["default_root_dir"] = str(dirs["root"])
 
     # Callbacks
-    callbacks = _common_callbacks("A", val_loader, fig_dir=dirs["figs"], patience=12, ckpt_dir=dirs["ckpts"])
+    callbacks = _common_callbacks("A", patience=12, ckpt_dir=dirs["ckpts"])
     callbacks = [LossHistory(trial), *callbacks] 
     # Lancement stage A
     train_stage_A(
@@ -2961,10 +3023,13 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     # Récup meilleure val_loss + ckpt
     # Récup meilleure val_loss + ckpt
     best_score, best_path = _score_from_callbacks(callbacks)
+    mf_pct = _compute_mf_validation_pct(model, val_loader, best_path, refine=True)
+
     global_ckpt = _register_trial_best(stage_dir, "A", best_path, best_score, direction="min")
 
     trial.set_user_attr("best_ckpt_A", global_ckpt)
     trial.set_user_attr("best_val_A", best_score)
+    trial.set_user_attr("val_mf_pct", mf_pct)
 
     _cleanup_trial_dir(dirs.get("root"))
     return best_score
@@ -3011,9 +3076,9 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
     tkw["devices"] = 1
     tkw["num_nodes"] = 1
     tkw["strategy"] = "auto"
-    tkw["default_root_dir"] = str(dirs["root"] / "logs")
+    tkw["default_root_dir"] = str(dirs["root"])
 
-    callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
+    callbacks = _common_callbacks("B1", patience=10, ckpt_dir=dirs["ckpts"])
     callbacks = [LossHistory(trial), *callbacks] 
 
 
@@ -3031,10 +3096,13 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
 
     # Récup meilleure val_loss + ckpt
     best_score, best_path = _score_from_callbacks(callbacks)
+    mf_pct = _compute_mf_validation_pct(model, val_loader, best_path, refine=True)
+
     global_ckpt = _register_trial_best(stage_dir, "B1", best_path, best_score, direction="min")
 
     trial.set_user_attr("best_ckpt_B1", global_ckpt)
     trial.set_user_attr("best_val_B1", best_score)
+    trial.set_user_attr("val_mf_pct", mf_pct)
 
     _cleanup_trial_dir(dirs.get("root"))
     return best_score
@@ -3168,12 +3236,9 @@ def _best_source_from_callbacks(callbacks: list, fallback_ckpt: Optional[Path]) 
 def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int = 1_000_000) -> tuple[str, float]:
     run_dir = Path(make_run_dir())
     stage_dir = get_stage_dir(run_dir, "A")
-    retrain_dir = stage_dir / "retrain"
-    logs_dir = retrain_dir / "logs"
-    figs_dir = retrain_dir / "figs"
-    ckpts_dir = retrain_dir / "ckpts"
-    for p in (logs_dir, figs_dir, ckpts_dir):
-        p.mkdir(parents=True, exist_ok=True)
+    tmp_root = Path(tempfile.mkdtemp(prefix="retrain_A_", dir=stage_dir))
+    ckpts_dir = tmp_root / "ckpts"
+    ckpts_dir.mkdir(parents=True, exist_ok=True)
 
     batch_size = int(best_params.get("batch_size", 16))
     model, train_loader, val_loader = build_data_and_model(
@@ -3189,10 +3254,10 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
     )
 
     tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
+    tkw["default_root_dir"] = str(tmp_root)
 
-    callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "A_fine_tuned_last.ckpt"
+    callbacks = _common_callbacks("A_retrain", patience=15, ckpt_dir=ckpts_dir)
+    ckpt_last = tmp_root / "A_fine_tuned_last.ckpt"
 
     train_stage_A(
         model, train_loader, val_loader,
@@ -3210,7 +3275,7 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _cleanup_artifacts([ckpt_last, ckpts_dir])
+    _cleanup_artifacts([tmp_root])
 
     _dump_json(stage_dir / "checkpoints" / "A_fine_tuned_params.json", {
         "params": dict(best_params),
@@ -3227,12 +3292,9 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
                     n_train: int = 1_000_000) -> tuple[str, float]:
     run_dir = Path(make_run_dir())
     stage_dir = get_stage_dir(run_dir, "B")
-    retrain_dir = stage_dir / "retrain"
-    logs_dir = retrain_dir / "logs"
-    figs_dir = retrain_dir / "figs"
-    ckpts_dir = retrain_dir / "ckpts"
-    for p in (logs_dir, figs_dir, ckpts_dir):
-        p.mkdir(parents=True, exist_ok=True)
+    tmp_root = Path(tempfile.mkdtemp(prefix="retrain_B_", dir=stage_dir))
+    ckpts_dir = tmp_root / "ckpts"
+    ckpts_dir.mkdir(parents=True, exist_ok=True)
 
     batch_size = int(best_params.get("batch_size", stage_a_params.get("batch_size", 16)))
     model, train_loader, val_loader = build_data_and_model(
@@ -3254,10 +3316,10 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
     )
 
     tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
+    tkw["default_root_dir"] = str(tmp_root)
 
-    callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "B_fine_tuned_last.ckpt"
+    callbacks = _common_callbacks("B_retrain", patience=12, ckpt_dir=ckpts_dir)
+    ckpt_last = tmp_root / "B_fine_tuned_last.ckpt"
 
     train_stage_B1(
         model, train_loader, val_loader,
@@ -3278,7 +3340,7 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _cleanup_artifacts([ckpt_last, ckpts_dir])
+    _cleanup_artifacts([tmp_root])
 
     _dump_json(stage_dir / "checkpoints" / "B_fine_tuned_params.json", {
         "params": dict(best_params),
@@ -3296,11 +3358,9 @@ def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict
                       n_train: int = 1_000_000) -> tuple[str, float]:
     run_dir = Path(make_run_dir())
     finetune_dir = Path(run_dir) / "finetune"
-    logs_dir = finetune_dir / "logs"
-    figs_dir = finetune_dir / "figs"
-    tmp_ckpt_dir = finetune_dir / "tmp_ckpts"
-    for p in (logs_dir, figs_dir):
-        p.mkdir(parents=True, exist_ok=True)
+    tmp_root = Path(tempfile.mkdtemp(prefix="finetune_", dir=finetune_dir))
+    tmp_ckpt_dir = tmp_root / "ckpts"
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     batch_size = int(best_b_params.get("batch_size", best_a_params.get("batch_size", 16)))
     model, train_loader, val_loader = build_data_and_model(
@@ -3322,12 +3382,10 @@ def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict
     )
 
     tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
+    tkw["default_root_dir"] = str(tmp_root)
 
-    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    callbacks = _common_callbacks("B2_finetune", val_loader, fig_dir=figs_dir, patience=10, ckpt_dir=tmp_ckpt_dir)
-    ckpt_last = finetune_dir / "checkpoints" / "finetune_last.ckpt"
+    callbacks = _common_callbacks("B2_finetune", patience=10, ckpt_dir=tmp_ckpt_dir)
+    ckpt_last = tmp_root / "finetune_last.ckpt"
 
     train_stage_B2(
         model, train_loader, val_loader,
@@ -3359,6 +3417,8 @@ def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict
         "selected_checkpoint": best_src,
     })
 
+    _cleanup_artifacts([tmp_root])
+
     return str(dest_ckpt), best_score
 
 
@@ -3373,13 +3433,14 @@ def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
     tkw["num_nodes"] = 1
     tkw["strategy"] = "auto"
     ft_dir = Path(run_dir) / "finetune"
-    tkw["default_root_dir"] = str(ft_dir / "logs")
+    tmp_root = Path(tempfile.mkdtemp(prefix="optional_B2_", dir=ft_dir))
+    tkw["default_root_dir"] = str(tmp_root)
 
-    tmp_ckpt_dir = ft_dir / "tmp_ckpts"
+    tmp_ckpt_dir = tmp_root / "ckpts"
     tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = ft_dir / "checkpoints" / "B2_optional.ckpt"
-    callbacks = _common_callbacks("B2_optional", val_loader, fig_dir=ft_dir / "figs", patience=8, ckpt_dir=tmp_ckpt_dir)
+    callbacks = _common_callbacks("B2_optional", patience=8, ckpt_dir=tmp_ckpt_dir)
 
     train_stage_B2(
         model, train_loader, val_loader,
@@ -3394,6 +3455,8 @@ def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
 
     best_score, best_path = _score_from_callbacks(callbacks)
     print(f"\n✓ B2 terminé — best val_loss={best_score:.6g}; ckpt={best_path or out_path}")
+
+    _cleanup_artifacts([tmp_root])
 
 if __name__ == "__main__":
     import argparse, math, json, os
