@@ -1,7 +1,10 @@
 import math, random, sys, os
-from typing import Optional, List, Dict
+import shutil
+from typing import Optional, List, Dict, Union
 import os
+import csv
 import socket
+from pathlib import Path
 import torch
 import pytorch_lightning as pl
 from torch.utils.data.distributed import DistributedSampler
@@ -1895,7 +1898,7 @@ def _dump_json(path: Path, obj: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False))
 
-def _save_best_params_json(stage: str, best_trial, ckpt_path: str, run_dir: Path) -> str:
+def _save_best_params_json(stage: str, best_trial, ckpt_path: str, stage_dir: Path) -> str:
     """
     Écrit checkpoints/<stage>_best_params.json avec:
       - stage, score, params (hyperparams Optuna), ckpt (chemin best .ckpt)
@@ -1906,7 +1909,7 @@ def _save_best_params_json(stage: str, best_trial, ckpt_path: str, run_dir: Path
         "params": dict(best_trial.params),
         "ckpt": str(ckpt_path),
     }
-    out = run_dir / "checkpoints" / f"{stage}_best_params.json"
+    out = stage_dir / "checkpoints" / f"{stage}_best_params.json"
     _dump_json(out, payload)
     return str(out)
 
@@ -1958,7 +1961,8 @@ def export_param_errors_files(ckpt_path: str, which: str, *, refine: bool, split
     """
     from pathlib import Path
     run_dir = Path(make_run_dir())
-    out_dir = run_dir / "eval"
+    stage_dir = get_stage_dir(run_dir, which)
+    out_dir = stage_dir / "eval"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Recrée un modèle compatible + loaders (puis load poids)
@@ -2346,13 +2350,45 @@ def on_rank_zero():
         return True
     return torch.distributed.get_rank() == 0
 
+def _ensure_stage_structure(stage_dir: Path):
+    for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
+        (stage_dir / sub).mkdir(parents=True, exist_ok=True)
+
+
 def make_run_dir(base="runs"):
-    job = os.environ.get("SLURM_JOB_ID", "local")
-    run_dir = os.path.join(base, f"{job}") 
-    os.makedirs(run_dir, exist_ok=True)
-    for d in ("checkpoints", "figs", "eval", "logs"):
-        os.makedirs(os.path.join(run_dir, d), exist_ok=True)
-    return run_dir
+    existing = os.environ.get("PHYS_AE_RUN_DIR")
+    if existing:
+        Path(existing).mkdir(parents=True, exist_ok=True)
+        _ensure_stage_structure(Path(existing) / "A")
+        _ensure_stage_structure(Path(existing) / "B")
+        (Path(existing) / "finetune" / "checkpoints").mkdir(parents=True, exist_ok=True)
+        (Path(existing) / "finetune" / "logs").mkdir(parents=True, exist_ok=True)
+        (Path(existing) / "finetune" / "figs").mkdir(parents=True, exist_ok=True)
+        return existing
+
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        run_dir = Path(base) / f"study_{job}"
+    else:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_dir = Path(base) / f"study_local_{stamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    for stage in ("A", "B"):
+        _ensure_stage_structure(run_dir / stage)
+
+    finetune_dir = run_dir / "finetune"
+    for sub in ("checkpoints", "logs", "figs"):
+        (finetune_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    os.environ["PHYS_AE_RUN_DIR"] = str(run_dir)
+    return str(run_dir)
+
+
+def get_stage_dir(run_dir: Path, stage: str) -> Path:
+    stage_dir = Path(run_dir) / stage.upper()
+    _ensure_stage_structure(stage_dir)
+    return stage_dir
 
 import yaml
 import numpy as np
@@ -2472,6 +2508,76 @@ class LossHistory(pl.callbacks.Callback):
         self.trial.set_user_attr("val_loss_history", self.val_hist)
 
 
+class OptunaCSVLogger:
+    """Enregistre chaque trial Optuna dans un CSV et maintient le top 5."""
+
+    def __init__(self, stage_dir: Path, stage: str, top_k: int = 5):
+        self.stage_dir = Path(stage_dir)
+        self.stage = stage.upper()
+        self.top_k = top_k
+        self.csv_path = self.stage_dir / "trials.csv"
+        self.top_path = self.stage_dir / "top5.json"
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
+        self._append_trial(trial)
+        self._update_top(study)
+
+    def _append_trial(self, trial: optuna.trial.FrozenTrial):
+        record = {
+            "trial": trial.number,
+            "timestamp": datetime.utcnow().isoformat(),
+            "state": trial.state.name if trial.state else "UNKNOWN",
+            "value": "" if trial.value is None else float(trial.value),
+            "duration_s": trial.duration.total_seconds() if trial.duration else "",
+            "params": json.dumps(trial.params, sort_keys=True, ensure_ascii=False),
+        }
+
+        file_exists = self.csv_path.exists()
+        with self.csv_path.open("a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(record.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+
+    def _update_top(self, study: optuna.study.Study):
+        try:
+            trials = study.get_trials(deepcopy=False, states=None)
+        except Exception:
+            trials = study.trials
+
+        completed = [
+            t for t in trials
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ]
+        if not completed:
+            return
+
+        direction = getattr(study, "direction", None)
+        if direction is None:
+            directions = getattr(study, "directions", None)
+            direction = directions[0] if directions else optuna.study.StudyDirection.MINIMIZE
+
+        reverse = direction == optuna.study.StudyDirection.MAXIMIZE
+        completed.sort(key=lambda t: t.value, reverse=reverse)
+        top = completed[: self.top_k]
+
+        ckpt_attr = "best_ckpt_A" if self.stage.startswith("A") else "best_ckpt_B1"
+        payload = [
+            {
+                "rank": rank,
+                "trial": t.number,
+                "value": float(t.value),
+                "params": dict(t.params),
+                "checkpoint": t.user_attrs.get(ckpt_attr, ""),
+            }
+            for rank, t in enumerate(top, start=1)
+        ]
+
+        self.top_path.parent.mkdir(parents=True, exist_ok=True)
+        self.top_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+
+
 def get_worker_info():
     rank = int(os.environ.get("SLURM_PROCID") or os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or 0)
     world = int(os.environ.get("SLURM_NTASKS") or os.environ.get("WORLD_SIZE") or 1)
@@ -2558,17 +2664,76 @@ def _atomic_update_best_ckpt(
                 pass
 
 
+def _cleanup_trial_checkpoint(path: Union[str, Path]):
+    if not path:
+        return
+
+    p = Path(path)
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+    parent = p.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        pass
+
+
+def _cleanup_trial_dir(root: Union[str, Path]):
+    if not root:
+        return
+
+    root = Path(root)
+    try:
+        if root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+    except Exception:
+        pass
+
+    parent = root.parent
+    try:
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        pass
+
+
+def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[str], best_score: float,
+                         direction: str = "min") -> str:
+    if not best_path:
+        return ""
+
+    dest_ckpt = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.ckpt"
+    meta_path = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.json"
+    is_new_best, final_ckpt = _atomic_update_best_ckpt(best_path, best_score, dest_ckpt, meta_path, direction=direction)
+
+    _cleanup_trial_checkpoint(best_path)
+
+    if final_ckpt and os.path.isfile(final_ckpt):
+        return final_ckpt
+
+    return ""
+
+
 def _trial_dirs(run_dir: Path, stage: str, trial_number: int) -> dict[str, Path]:
-    root = run_dir / f"optuna_{stage}" / f"trial_{trial_number:04d}"
+    stage_dir = get_stage_dir(run_dir, stage)
+    root = stage_dir / "trials" / f"trial_{trial_number:04d}"
     ck   = root / "ckpts"
     fig  = root / "figs"
-    for p in (ck, fig):
+    for p in (root, ck, fig):
         p.mkdir(parents=True, exist_ok=True)
     return {"root": root, "ckpts": ck, "figs": fig}
 
 
 def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val_loss",
-                      patience: int = 15) -> list:
+                      patience: int = 15, ckpt_dir: Optional[Path] = None) -> list:
+    if ckpt_dir is not None:
+        ckpt_dir = Path(ckpt_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckp = ModelCheckpoint(
         monitor=monitor,
         mode="min",
@@ -2576,6 +2741,7 @@ def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val
         filename=f"best-{stage}",
         save_last=False,
         auto_insert_metric_name=False,
+        dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
     )
     early = EarlyStopping(monitor=monitor, mode="min", patience=patience)
     plot = PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1, save_dir=str(fig_dir), stage_tag=f"stage_{stage}")
@@ -2602,7 +2768,8 @@ def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
 
 # ===================== OBJECTIVE: STAGE A =====================
 
-def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int) -> float:
+def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
+                      n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
     # --- Search space ---
     base_lr = trial.suggest_float("base_lr", 1e-5, 5e-4, log=True)
     backbone_variant = trial.suggest_categorical("backbone_variant", ["s"])  # compacité vs capacité
@@ -2614,11 +2781,14 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     batch_size          = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
 
     # Dossiers dédiés au trial
+    stage_dir = get_stage_dir(run_dir, "A")
     dirs = _trial_dirs(run_dir, stage="A", trial_number=trial.number)
 
     # Construire data + modèle avec HPs trial
     model, train_loader, val_loader = build_data_and_model(
         seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
         batch_size=batch_size,
         huber_beta=huber_beta,
         backbone_variant=backbone_variant,
@@ -2634,7 +2804,7 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
     # Callbacks
-    callbacks = _common_callbacks("A", val_loader, fig_dir=dirs["figs"], patience=12)
+    callbacks = _common_callbacks("A", val_loader, fig_dir=dirs["figs"], patience=12, ckpt_dir=dirs["ckpts"])
     callbacks = [LossHistory(trial), *callbacks] 
     # Lancement stage A
     train_stage_A(
@@ -2649,11 +2819,12 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     # Récup meilleure val_loss + ckpt
     # Récup meilleure val_loss + ckpt
     best_score, best_path = _score_from_callbacks(callbacks)
+    global_ckpt = _register_trial_best(stage_dir, "A", best_path, best_score, direction="min")
 
-    # ➜ MAJ best global + nettoyage
-# ➜ on laisse run_optuna_stage_A faire l’update atomique global
-    trial.set_user_attr("best_ckpt_A", best_path or "")
+    trial.set_user_attr("best_ckpt_A", global_ckpt)
     trial.set_user_attr("best_val_A", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
     return best_score
 
 
@@ -2661,7 +2832,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
 
 # ===================== OBJECTIVE: STAGE B1 =====================
 
-def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str) -> float:
+def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str,
+                       n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
     # --- Search space (refiner-centric) ---
     refiner_lr = trial.suggest_float("refiner_lr", 1e-6, 3e-4, log=True)
     refine_steps = trial.suggest_int("refine_steps", 1, 1)
@@ -2675,11 +2847,14 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
 
     batch_size = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
 
-    dirs = _trial_dirs(run_dir, stage="B1", trial_number=trial.number)
+    stage_dir = get_stage_dir(run_dir, "B")
+    dirs = _trial_dirs(run_dir, stage="B", trial_number=trial.number)
 
     # IMPORTANT: reconstruit le modèle avec les HP refiner (le backbone peut rester celui du meilleur A)
     model, train_loader, val_loader = build_data_and_model(
         seed=seed,
+        n_train=n_train_samples,
+        n_val=n_val_samples,
         batch_size=batch_size,
         refiner_variant=refiner_variant,
         refiner_width_mult=refiner_width_mult,
@@ -2694,7 +2869,7 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
     tkw["devices"] = 1
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
-    callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10)
+    callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
     callbacks = [LossHistory(trial), *callbacks] 
 
 
@@ -2712,20 +2887,25 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
 
     # Récup meilleure val_loss + ckpt
     best_score, best_path = _score_from_callbacks(callbacks)
+    global_ckpt = _register_trial_best(stage_dir, "B1", best_path, best_score, direction="min")
 
-    trial.set_user_attr("best_ckpt_B1", best_path or "")
+    trial.set_user_attr("best_ckpt_B1", global_ckpt)
     trial.set_user_attr("best_val_B1", best_score)
+
+    _cleanup_trial_dir(dirs.get("root"))
     return best_score
 
 
 
 # ===================== RUNNERS =====================
 
-def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, float, dict]:
+def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
+                       n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
     run_dir = Path(make_run_dir())
-    subdir = run_dir / "optuna_A"
-    subdir.mkdir(parents=True, exist_ok=True)
-    journal_path = subdir / "optuna_journal.log"
+    stage_dir = get_stage_dir(run_dir, "A")
+    optuna_dir = stage_dir / "optuna"
+    optuna_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = optuna_dir / "journal.log"
     storage = JournalStorage(JournalFileBackend(str(journal_path)))
 
     study = optuna.create_study(
@@ -2738,9 +2918,17 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, floa
     )
 
     def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_A(trial, run_dir=run_dir, epochs=epochs, seed=seed)
+        return objective_stage_A(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
+        )
 
-    study.optimize(_obj, n_trials=n_trials, show_progress_bar=True)
+    csv_logger = OptunaCSVLogger(stage_dir, stage="A")
+    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
 
     # ► meilleur global (tous workers) + artefacts
     best = study.best_trial
@@ -2748,22 +2936,24 @@ def run_optuna_stage_A(n_trials: int, epochs: int, seed: int) -> tuple[str, floa
     if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
         raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de A.")
 
-    dest_ckpt = run_dir / "checkpoints" / "A_opt.ckpt"
-    meta_path = run_dir / "checkpoints" / "A_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "A_opt.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_best.json"
     _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
 
     # ► JSON des meilleurs hyperparams d'A
     if on_rank_zero():
-        _save_best_params_json("A", best, str(dest_ckpt), run_dir)
+        _save_best_params_json("A", best, str(dest_ckpt), stage_dir)
 
     print(f"✓ A_opt prêt: {dest_ckpt}")
     return str(dest_ckpt), float(best.value), dict(best.params)
 
-def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str) -> tuple[str, float, dict]:
+def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
+                        n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
     run_dir = Path(make_run_dir())
-    subdir = run_dir / "optuna_B1"
-    subdir.mkdir(parents=True, exist_ok=True)
-    journal_path = subdir / "optuna_journal.log"
+    stage_dir = get_stage_dir(run_dir, "B")
+    optuna_dir = stage_dir / "optuna"
+    optuna_dir.mkdir(parents=True, exist_ok=True)
+    journal_path = optuna_dir / "journal.log"
     storage = JournalStorage(JournalFileBackend(str(journal_path)))
 
     study = optuna.create_study(
@@ -2776,43 +2966,254 @@ def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str)
     )
 
     def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_B1(trial, run_dir=run_dir, epochs=epochs, seed=seed, ckpt_A=ckpt_A_path)
+        return objective_stage_B1(
+            trial,
+            run_dir=run_dir,
+            epochs=epochs,
+            seed=seed,
+            ckpt_A=ckpt_A_path,
+            n_train_samples=n_train_samples,
+            n_val_samples=n_val_samples,
+        )
 
-    study.optimize(_obj, n_trials=n_trials, show_progress_bar=True)
+    csv_logger = OptunaCSVLogger(stage_dir, stage="B")
+    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
 
     best = study.best_trial
     best_ckpt_src = best.user_attrs.get("best_ckpt_B1", "")
     if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
         raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de B1.")
 
-    dest_ckpt = run_dir / "checkpoints" / "B_opt.ckpt"
-    meta_path = run_dir / "checkpoints" / "B_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "B_opt.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_best.json"
     _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
 
     # ► JSON des meilleurs hyperparams de B (B1)
     if on_rank_zero():
-        _save_best_params_json("B", best, str(dest_ckpt), run_dir)
+        _save_best_params_json("B", best, str(dest_ckpt), stage_dir)
 
     print(f"✓ B_opt prêt: {dest_ckpt}")
     return str(dest_ckpt), float(best.value), dict(best.params)
 
 
+def _best_source_from_callbacks(callbacks: list, fallback_ckpt: Optional[Path]) -> tuple[str, float]:
+    score, path = _score_from_callbacks(callbacks)
+    if path and os.path.isfile(path):
+        return path, float(score)
+    if fallback_ckpt is not None and fallback_ckpt.exists():
+        return str(fallback_ckpt), float(score)
+    return "", float(score)
+
+
+def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "A")
+    retrain_dir = stage_dir / "retrain"
+    logs_dir = retrain_dir / "logs"
+    figs_dir = retrain_dir / "figs"
+    ckpts_dir = retrain_dir / "ckpts"
+    for p in (logs_dir, figs_dir, ckpts_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_params.get("batch_size", 16))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(best_params.get("huber_beta", 0.002)),
+        backbone_variant=best_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(best_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(best_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(best_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(best_params.get("backbone_se_ratio", 0.25)),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
+    ckpt_last = retrain_dir / "last.ckpt"
+
+    train_stage_A(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        base_lr=float(best_params.get("base_lr", 2e-4)),
+        callbacks=callbacks,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = stage_dir / "checkpoints" / "A_retrain_best.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_retrain_best.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _dump_json(stage_dir / "checkpoints" / "A_retrain_params.json", {
+        "params": dict(best_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "source_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
+
+
+def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, *, epochs: int, seed: int,
+                    n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    stage_dir = get_stage_dir(run_dir, "B")
+    retrain_dir = stage_dir / "retrain"
+    logs_dir = retrain_dir / "logs"
+    figs_dir = retrain_dir / "figs"
+    ckpts_dir = retrain_dir / "ckpts"
+    for p in (logs_dir, figs_dir, ckpts_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_params.get("batch_size", stage_a_params.get("batch_size", 16)))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(stage_a_params.get("huber_beta", 0.002)),
+        backbone_variant=stage_a_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(stage_a_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(stage_a_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(stage_a_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(stage_a_params.get("backbone_se_ratio", 0.25)),
+        refiner_variant=best_params.get("refiner_variant", "s"),
+        refiner_width_mult=float(best_params.get("refiner_width_mult", 1.0)),
+        refiner_depth_mult=float(best_params.get("refiner_depth_mult", 1.0)),
+        refiner_feature_pool=best_params.get("refiner_feature_pool", "avg"),
+        refiner_shared_hidden_scale=float(best_params.get("refiner_shared_hidden_scale", 0.5)),
+        refiner_time_embed_dim=best_params.get("refiner_time_embed_dim", None),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
+    ckpt_last = retrain_dir / "last.ckpt"
+
+    train_stage_B1(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        refiner_lr=float(best_params.get("refiner_lr", 1e-5)),
+        refine_steps=int(best_params.get("refine_steps", 1)),
+        delta_scale=float(best_params.get("delta_scale", 0.1)),
+        callbacks=callbacks,
+        ckpt_in=stage_a_ckpt,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = stage_dir / "checkpoints" / "B_retrain_best.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_retrain_best.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _dump_json(stage_dir / "checkpoints" / "B_retrain_params.json", {
+        "params": dict(best_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "stage_a_checkpoint": stage_a_ckpt,
+        "source_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
+
+
+def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict, *, epochs: int, seed: int,
+                      n_train: int = 1_000_000) -> tuple[str, float]:
+    run_dir = Path(make_run_dir())
+    finetune_dir = Path(run_dir) / "finetune"
+    logs_dir = finetune_dir / "logs"
+    figs_dir = finetune_dir / "figs"
+    tmp_ckpt_dir = finetune_dir / "tmp_ckpts"
+    for p in (logs_dir, figs_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    batch_size = int(best_b_params.get("batch_size", best_a_params.get("batch_size", 16)))
+    model, train_loader, val_loader = build_data_and_model(
+        seed=seed,
+        n_train=n_train,
+        batch_size=batch_size,
+        huber_beta=float(best_a_params.get("huber_beta", 0.002)),
+        backbone_variant=best_a_params.get("backbone_variant", "s"),
+        backbone_width_mult=float(best_a_params.get("backbone_width_mult", 1.0)),
+        backbone_depth_mult=float(best_a_params.get("backbone_depth_mult", 1.0)),
+        backbone_drop_path=float(best_a_params.get("backbone_drop_path", 0.0)),
+        backbone_se_ratio=float(best_a_params.get("backbone_se_ratio", 0.25)),
+        refiner_variant=best_b_params.get("refiner_variant", "s"),
+        refiner_width_mult=float(best_b_params.get("refiner_width_mult", 1.0)),
+        refiner_depth_mult=float(best_b_params.get("refiner_depth_mult", 1.0)),
+        refiner_feature_pool=best_b_params.get("refiner_feature_pool", "avg"),
+        refiner_shared_hidden_scale=float(best_b_params.get("refiner_shared_hidden_scale", 0.5)),
+        refiner_time_embed_dim=best_b_params.get("refiner_time_embed_dim", None),
+    )
+
+    tkw = trainer_common_kwargs()
+    tkw["default_root_dir"] = str(logs_dir)
+
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    callbacks = _common_callbacks("B2_finetune", val_loader, fig_dir=figs_dir, patience=10, ckpt_dir=tmp_ckpt_dir)
+    ckpt_last = finetune_dir / "checkpoints" / "finetune_last.ckpt"
+
+    train_stage_B2(
+        model, train_loader, val_loader,
+        epochs=epochs,
+        base_lr=float(best_a_params.get("base_lr", 3e-5)),
+        refiner_lr=float(best_b_params.get("refiner_lr", 3e-6)),
+        refine_steps=int(best_b_params.get("refine_steps", 1)),
+        delta_scale=float(best_b_params.get("delta_scale", 0.1)),
+        callbacks=callbacks,
+        ckpt_in=ckpt_B_path,
+        ckpt_out=str(ckpt_last),
+        **tkw,
+    )
+
+    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
+
+    dest_ckpt = finetune_dir / "checkpoints" / "ensemble_best.ckpt"
+    meta_path = finetune_dir / "checkpoints" / "ensemble_best.json"
+    if best_src:
+        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
+
+    _dump_json(finetune_dir / "checkpoints" / "ensemble_finetune_params.json", {
+        "stage_A_params": dict(best_a_params),
+        "stage_B_params": dict(best_b_params),
+        "epochs": epochs,
+        "n_train": n_train,
+        "batch_size": batch_size,
+        "source_checkpoint": ckpt_B_path,
+        "selected_checkpoint": best_src,
+    })
+
+    return str(dest_ckpt), best_score
 
 
 def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
     """Fine-tune global court (B2) en repartant du meilleur B1."""
     run_dir = Path(make_run_dir())
 
-    # On repart d'une config data+modèle standard (tu peux la paramétrer ici)
     model, train_loader, val_loader = build_data_and_model()
 
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
-    tkw["default_root_dir"] = str(run_dir / "optuna_B2" / "logs")
+    ft_dir = Path(run_dir) / "finetune"
+    tkw["default_root_dir"] = str(ft_dir / "logs")
 
-    # Petits LR prudents
-    out_path = run_dir / "checkpoints" / "B2_final.ckpt"
-    callbacks = _common_callbacks("B2", val_loader, fig_dir=run_dir / "optuna_B2" / "figs", patience=8)
+    tmp_ckpt_dir = ft_dir / "tmp_ckpts"
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = ft_dir / "checkpoints" / "B2_optional.ckpt"
+    callbacks = _common_callbacks("B2_optional", val_loader, fig_dir=ft_dir / "figs", patience=8, ckpt_dir=tmp_ckpt_dir)
 
     train_stage_B2(
         model, train_loader, val_loader,
@@ -2838,6 +3239,12 @@ if __name__ == "__main__":
     parser.add_argument("--epochs-a", type=int, default=50, help="Epochs par essai pour A")
     parser.add_argument("--epochs-b", type=int, default=50, help="Epochs par essai pour B1")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-samples", type=int, default=100_000,
+                        help="Nombre d'échantillons synthétiques pour chaque essai (train)")
+    parser.add_argument("--val-samples", type=int, default=500,
+                        help="Nombre d'échantillons synthétiques pour la validation des essais")
+    parser.add_argument("--retrain-samples", type=int, default=1_000_000,
+                        help="Nombre d'échantillons synthétiques pour les ré-entraînements finaux")
     # Par défaut on NE lance PAS B2 ; pour l'activer, passer --run-b2
     parser.add_argument("--run-b2", action="store_true", help="Lancer le fine-tune B2 final")
     args = parser.parse_args()
@@ -2855,7 +3262,11 @@ if __name__ == "__main__":
     if on_rank_zero():
         print(f"[stage A] essais totaux demandés={args.trials_a} → par worker={trials_a_each}")
     a_ckpt, a_best, a_params = run_optuna_stage_A(
-        n_trials=trials_a_each, epochs=args.epochs_a, seed=args.seed
+        n_trials=trials_a_each,
+        epochs=args.epochs_a,
+        seed=args.seed,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
     )
 
     # S'assure que le meilleur ckpt A est bien écrit (cas multi-workers)
@@ -2864,48 +3275,99 @@ if __name__ == "__main__":
     if on_rank_zero():
         print(f"[stage B] essais totaux demandés={args.trials_b} → par worker={trials_b_each}")
     b_ckpt, b_best, b_params = run_optuna_stage_B1(
-        n_trials=trials_b_each, epochs=args.epochs_b, seed=args.seed, ckpt_A_path=a_ckpt
+        n_trials=trials_b_each,
+        epochs=args.epochs_b,
+        seed=args.seed,
+        ckpt_A_path=a_ckpt,
+        n_train_samples=args.train_samples,
+        n_val_samples=args.val_samples,
     )
 
     wait_for_file(b_ckpt)
 
-    # Génération des fichiers d'erreurs (%) sur le split validation
-    a_err_files = {}
-    b_err_files = {}
     if on_rank_zero():
+        print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
+        a_re_ckpt, a_re_score = retrain_stage_A(
+            a_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(a_re_ckpt)
+
+        print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
+        b_re_ckpt, b_re_score = retrain_stage_B(
+            b_params, a_params, a_re_ckpt, epochs=50, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(b_re_ckpt)
+
+        print("\n========== FINE-TUNE ENSEMBLE ==========")
+        ensemble_ckpt, ensemble_score = finetune_ensemble(
+            b_re_ckpt, a_params, b_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
+        )
+        wait_for_file(ensemble_ckpt)
+
+        stage_dir_A = get_stage_dir(run_dir, "A")
+        stage_dir_B = get_stage_dir(run_dir, "B")
+
+        a_err_files = {}
+        b_err_files = {}
         try:
             a_err_files = export_param_errors_files(
-                a_ckpt, "A", refine=False, split="val", robust_smape=False
+                a_re_ckpt, "A", refine=False, split="val", robust_smape=False
             )
         except Exception as e:
             print(f"[warn] export erreurs A a échoué: {e}")
         try:
             b_err_files = export_param_errors_files(
-                b_ckpt, "B", refine=True, split="val", robust_smape=False
+                ensemble_ckpt, "B", refine=True, split="val", robust_smape=False
             )
         except Exception as e:
             print(f"[warn] export erreurs B a échoué: {e}")
 
-        # Résumé unique + persistance
         summary = {
+            "study_root": str(run_dir),
             "A": {
-                "ckpt": a_ckpt,
-                "best_val_loss": a_best,
-                "best_params": a_params,
-                "errors_files": a_err_files,  # chemins CSV agrégé + par-échantillon
+                "optuna": {
+                    "ckpt": a_ckpt,
+                    "best_val_loss": a_best,
+                    "best_params": a_params,
+                },
+                "retrain": {
+                    "ckpt": a_re_ckpt,
+                    "best_val_loss": a_re_score,
+                    "epochs": 50,
+                    "n_train": args.retrain_samples,
+                },
+                "trials_csv": str(stage_dir_A / "trials.csv"),
+                "top5_params": str(stage_dir_A / "top5.json"),
+                "errors_files": a_err_files,
             },
             "B": {
-                "ckpt": b_ckpt,
-                "best_val_loss": b_best,
-                "best_params": b_params,
+                "optuna": {
+                    "ckpt": b_ckpt,
+                    "best_val_loss": b_best,
+                    "best_params": b_params,
+                },
+                "retrain": {
+                    "ckpt": b_re_ckpt,
+                    "best_val_loss": b_re_score,
+                    "epochs": 50,
+                    "n_train": args.retrain_samples,
+                },
+                "trials_csv": str(stage_dir_B / "trials.csv"),
+                "top5_params": str(stage_dir_B / "top5.json"),
                 "errors_files": b_err_files,
             },
+            "ensemble": {
+                "ckpt": ensemble_ckpt,
+                "best_val_loss": ensemble_score,
+                "epochs": 50,
+                "n_train": args.retrain_samples,
+            },
         }
-        out_summary = run_dir / "checkpoints" / "best_summary.json"
+
+        out_summary = run_dir / "summary.json"
         out_summary.parent.mkdir(parents=True, exist_ok=True)
         out_summary.write_text(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
 
-        # Impression finale minimaliste (JSON)
         print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
 
     # Fine-tune B2 optionnel, seulement sur le rank 0
