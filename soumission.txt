@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #SBATCH --account="R240011"
 #SBATCH --job-name="eff_train"
-#SBATCH --time=10-00:00:00
-#SBATCH --nodes=10
+#SBATCH --time=10:00:00
+#SBATCH --nodes=5
 #SBATCH --gpus-per-node=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --cpus-per-task=4
@@ -10,82 +10,6 @@
 #SBATCH --constraint=armgpu
 #SBATCH --output=job_ptl_%J.out
 #SBATCH --error=job_ptl_%J.err
-
-set -euo pipefail
-
-show_help() {
-  cat <<'USAGE'
-Usage: sbatch soumission.txt [options]
-
-Options:
-  --trials-a <int>         Nombre d'essais Optuna pour le stage A (défaut: 200)
-  --trials-b <int>         Nombre d'essais Optuna pour le stage B1 (défaut: 200)
-  --epochs-a <int>         Nombre d'epochs par essai pour le stage A (défaut: 50)
-  --epochs-b <int>         Nombre d'epochs par essai pour le stage B1 (défaut: 50)
-  --train-samples <int>    Taille du dataset synthétique d'entraînement (défaut: 100000)
-  --val-samples <int>      Taille du dataset synthétique de validation (défaut: 500)
-  --retrain-samples <int>  Taille du dataset synthétique pour les ré-entraînements finaux (défaut: 1000000)
-  --seed <int>             Graine pseudo-aléatoire pour les essais et ré-entraînements (défaut: 42)
-  --run-b2                 Active le fine-tune final du stage B2
-  -h, --help               Affiche cette aide
-USAGE
-}
-
-TRIALS_A=200
-TRIALS_B=200
-EPOCHS_A=50
-EPOCHS_B=50
-TRAIN_SAMPLES=100000
-VAL_SAMPLES=500
-RETRAIN_SAMPLES=1000000
-SEED=42
-RUN_B2=false
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --trials-a)
-      TRIALS_A="$2"; shift 2 ;;
-    --trials-a=*)
-      TRIALS_A="${1#*=}"; shift ;;
-    --trials-b)
-      TRIALS_B="$2"; shift 2 ;;
-    --trials-b=*)
-      TRIALS_B="${1#*=}"; shift ;;
-    --epochs-a)
-      EPOCHS_A="$2"; shift 2 ;;
-    --epochs-a=*)
-      EPOCHS_A="${1#*=}"; shift ;;
-    --epochs-b)
-      EPOCHS_B="$2"; shift 2 ;;
-    --epochs-b=*)
-      EPOCHS_B="${1#*=}"; shift ;;
-    --train-samples)
-      TRAIN_SAMPLES="$2"; shift 2 ;;
-    --train-samples=*)
-      TRAIN_SAMPLES="${1#*=}"; shift ;;
-    --val-samples)
-      VAL_SAMPLES="$2"; shift 2 ;;
-    --val-samples=*)
-      VAL_SAMPLES="${1#*=}"; shift ;;
-    --retrain-samples)
-      RETRAIN_SAMPLES="$2"; shift 2 ;;
-    --retrain-samples=*)
-      RETRAIN_SAMPLES="${1#*=}"; shift ;;
-    --seed)
-      SEED="$2"; shift 2 ;;
-    --seed=*)
-      SEED="${1#*=}"; shift ;;
-    --run-b2)
-      RUN_B2=true; shift ;;
-    -h|--help)
-      show_help
-      exit 0 ;;
-    *)
-      echo "Unknown option: $1" >&2
-      show_help >&2
-      exit 1 ;;
-  esac
-done
 
 # --- Environnement logiciel
 romeo_load_armgpu_env
@@ -96,36 +20,5 @@ source /home/cosmic_86/envs/pytorch_arm_test/bin/activate
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="/home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2_opt.py"
-cat <<EOM
-Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
-  trials A       : ${TRIALS_A}
-  trials B1      : ${TRIALS_B}
-  epochs A       : ${EPOCHS_A}
-  epochs B1      : ${EPOCHS_B}
-  train samples  : ${TRAIN_SAMPLES}
-  val samples    : ${VAL_SAMPLES}
-  retrain samples: ${RETRAIN_SAMPLES}
-  seed           : ${SEED}
-  run B2         : ${RUN_B2}
-EOM
-
-SRUN_ARGS=(
-  --trials-a "${TRIALS_A}"
-  --trials-b "${TRIALS_B}"
-  --epochs-a "${EPOCHS_A}"
-  --epochs-b "${EPOCHS_B}"
-  --train-samples "${TRAIN_SAMPLES}"
-  --val-samples "${VAL_SAMPLES}"
-  --retrain-samples "${RETRAIN_SAMPLES}"
-  --seed "${SEED}"
-)
-
-if [[ "${RUN_B2}" == true ]]; then
-  SRUN_ARGS+=(--run-b2)
-fi
-
 srun --cpu-bind=cores \
-     python -u "${PYTHON_SCRIPT}" \
-        "${SRUN_ARGS[@]}"
+     python -u /home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2.py
