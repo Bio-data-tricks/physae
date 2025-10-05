@@ -1,9 +1,10 @@
 import math, random, sys, os
 import shutil
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict, Union, Iterable
 import os
 import csv
 import socket
+import re
 from pathlib import Path
 import torch
 import pytorch_lightning as pl
@@ -18,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from pytorch_lightning.callbacks import Callback
 from datetime import datetime
 import json, yaml  # pip install pyyaml si besoin
-from lion_pytorch import Lion  
+from lion_pytorch import Lion
 
 
 # --- Matplotlib: backend non interactif + polices ---
@@ -2258,6 +2259,42 @@ def build_data_and_model(
     return model, train_loader, val_loader
 
 # ------------- Utilitaires HPC -------------
+
+def _env_as_int(*keys: str, default: Optional[int] = None) -> Optional[int]:
+    """Parse first integer value from a list of environment variable keys."""
+    for key in keys:
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        raw = str(raw).strip()
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            match = re.search(r"\d+", raw)
+            if match:
+                try:
+                    return int(match.group(0))
+                except ValueError:
+                    continue
+    return default
+
+
+def _env_flag(*keys: str, default: bool = False) -> bool:
+    """Return True if any of the provided environment variables is truthy."""
+    truthy = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+    falsy = {"0", "false", "FALSE", "no", "NO", "off", "OFF"}
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw = str(raw).strip()
+        if raw in truthy:
+            return True
+        if raw in falsy:
+            return False
+    return bool(default)
+
+
 def get_master_addr_and_port(default_port=12910):
     # MASTER_ADDR pour SLURM : 1er hostname de la nodelist
     master_addr = os.environ.get("MASTER_ADDR")
@@ -2318,16 +2355,85 @@ def trainer_common_kwargs():
     import pytorch_lightning as pl
     accelerator = "gpu" if torch.cuda.is_available() else "cpu"
 
-    # ► Trials mono-GPU seulement (1 tâche = 1 GPU)
-    devices = 1
-    num_nodes = 1
-
     precision = choose_precision()
     default_dir = os.environ.get("SLURM_JOB_ID", "runs_local")
     default_root_dir = f"./lightning_logs/{default_dir}"
 
-    # ► Pas de DDP pour les trials mono-GPU
-    strategy = "auto"
+    devices = 1
+    num_nodes = 1
+    strategy: Union[str, "pl.strategies.Strategy"] = "auto"
+
+    force_ddp = _env_flag("PHYS_AE_FORCE_DDP")
+    disable_ddp = _env_flag("PHYS_AE_DISABLE_DDP")
+
+    if accelerator == "gpu":
+        visible_devices = max(1, torch.cuda.device_count())
+        requested_devices = _env_as_int("PHYS_AE_DEVICES")
+        if requested_devices is None:
+            requested_devices = _env_as_int("LOCAL_WORLD_SIZE", "SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE")
+        if requested_devices is not None:
+            devices = max(1, min(visible_devices, requested_devices))
+        else:
+            devices = visible_devices
+
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
+
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1:
+                if world_size_env is None or world_size_env == expected_world:
+                    should_enable_ddp = True
+                else:
+                    if on_rank_zero():
+                        print(
+                            f"[INFO] WORLD_SIZE={world_size_env} != devices*num_nodes={expected_world}; "
+                            "skipping automatic DDP initialisation."
+                        )
+            elif world_size_env and world_size_env > 1:
+                if on_rank_zero():
+                    print(
+                        f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device setup; "
+                        "not enabling DDP automatically."
+                    )
+
+        if should_enable_ddp:
+            get_master_addr_and_port()
+            try:
+                from pytorch_lightning.strategies import DDPStrategy
+                strategy = DDPStrategy(find_unused_parameters=False)
+            except Exception:
+                strategy = "ddp_find_unused_parameters_false"
+    else:
+        devices = 1
+        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
+        if requested_nodes is None:
+            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
+        num_nodes = max(1, requested_nodes) if requested_nodes else 1
+        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
+        expected_world = max(1, devices * num_nodes)
+
+        should_enable_ddp = False
+        if not disable_ddp:
+            if force_ddp:
+                should_enable_ddp = expected_world > 1
+            elif expected_world > 1 and (world_size_env is None or world_size_env == expected_world):
+                should_enable_ddp = True
+            elif world_size_env and world_size_env > 1 and on_rank_zero():
+                print(
+                    f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device CPU setup; "
+                    "not enabling DDP automatically."
+                )
+
+        if should_enable_ddp:
+            strategy = "ddp"
 
     return dict(
         accelerator=accelerator,
@@ -2345,10 +2451,30 @@ def trainer_common_kwargs():
 
 
 def on_rank_zero():
-    # Simple helper: True uniquement sur le rank 0 global
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
+    """Return True uniquement pour le rank global 0.
+
+    Avant l'initialisation explicite de torch.distributed (ex: avant le premier
+    Trainer DDP), ``torch.distributed.is_initialized()`` retourne False sur tous
+    les processus, ce qui faisait croire à chaque worker qu'il était le rank 0.
+    On complète donc la détection en se basant sur les variables d'environnement
+    (SLURM, TorchElastic, etc.) lorsque le backend distribué n'est pas encore
+    prêt.
+    """
+
+    if torch.distributed.is_available():
+        if torch.distributed.is_initialized():
+            try:
+                return torch.distributed.get_rank() == 0
+            except RuntimeError:
+                # Peut lever si le backend est dispo mais pas encore configuré
+                pass
+
+    env_rank = _env_as_int("RANK", "SLURM_PROCID", "PMI_RANK", "MPI_RANK", "LOCAL_RANK")
+    if env_rank is not None:
+        return env_rank == 0
+
+    # Fallback mono-process: si aucune info dispo on considère qu'on est seul
+    return True
 
 def _ensure_stage_structure(stage_dir: Path):
     for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
@@ -2766,6 +2892,20 @@ def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
     shutil.copyfile(str(src_path), str(dst_path))
 
 
+def _cleanup_artifacts(paths: Iterable[Path | str]):
+    for p in paths:
+        if not p:
+            continue
+        path = Path(p)
+        if path.is_file():
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+
+
 # ===================== OBJECTIVE: STAGE A =====================
 
 def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
@@ -2801,6 +2941,8 @@ def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: 
     # Trainer kwargs (on force 1 device pour éviter des essais multi-GPU par trial)
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
     # Callbacks
@@ -2867,6 +3009,8 @@ def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed:
     # Trainer kwargs
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
     callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
@@ -3032,7 +3176,7 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
     tkw["default_root_dir"] = str(logs_dir)
 
     callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "last.ckpt"
+    ckpt_last = retrain_dir / "A_fine_tuned_last.ckpt"
 
     train_stage_A(
         model, train_loader, val_loader,
@@ -3045,12 +3189,14 @@ def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int =
 
     best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
 
-    dest_ckpt = stage_dir / "checkpoints" / "A_retrain_best.ckpt"
-    meta_path = stage_dir / "checkpoints" / "A_retrain_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "A_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "A_fine_tuned.json"
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _dump_json(stage_dir / "checkpoints" / "A_retrain_params.json", {
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "A_fine_tuned_params.json", {
         "params": dict(best_params),
         "epochs": epochs,
         "n_train": n_train,
@@ -3095,7 +3241,7 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
     tkw["default_root_dir"] = str(logs_dir)
 
     callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "last.ckpt"
+    ckpt_last = retrain_dir / "B_fine_tuned_last.ckpt"
 
     train_stage_B1(
         model, train_loader, val_loader,
@@ -3111,12 +3257,14 @@ def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, 
 
     best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
 
-    dest_ckpt = stage_dir / "checkpoints" / "B_retrain_best.ckpt"
-    meta_path = stage_dir / "checkpoints" / "B_retrain_best.json"
+    dest_ckpt = stage_dir / "checkpoints" / "B_fine_tuned.ckpt"
+    meta_path = stage_dir / "checkpoints" / "B_fine_tuned.json"
     if best_src:
         _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
 
-    _dump_json(stage_dir / "checkpoints" / "B_retrain_params.json", {
+    _cleanup_artifacts([ckpt_last, ckpts_dir])
+
+    _dump_json(stage_dir / "checkpoints" / "B_fine_tuned_params.json", {
         "params": dict(best_params),
         "epochs": epochs,
         "n_train": n_train,
@@ -3206,6 +3354,8 @@ def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
 
     tkw = trainer_common_kwargs()
     tkw["devices"] = 1
+    tkw["num_nodes"] = 1
+    tkw["strategy"] = "auto"
     ft_dir = Path(run_dir) / "finetune"
     tkw["default_root_dir"] = str(ft_dir / "logs")
 
@@ -3288,19 +3438,19 @@ if __name__ == "__main__":
     if on_rank_zero():
         print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
         a_re_ckpt, a_re_score = retrain_stage_A(
-            a_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
+            a_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(a_re_ckpt)
 
         print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
         b_re_ckpt, b_re_score = retrain_stage_B(
-            b_params, a_params, a_re_ckpt, epochs=50, seed=args.seed, n_train=args.retrain_samples
+            b_params, a_params, a_re_ckpt, epochs=5, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(b_re_ckpt)
 
         print("\n========== FINE-TUNE ENSEMBLE ==========")
         ensemble_ckpt, ensemble_score = finetune_ensemble(
-            b_re_ckpt, a_params, b_params, epochs=50, seed=args.seed, n_train=args.retrain_samples
+            b_re_ckpt, a_params, b_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
         )
         wait_for_file(ensemble_ckpt)
 
@@ -3333,7 +3483,7 @@ if __name__ == "__main__":
                 "retrain": {
                     "ckpt": a_re_ckpt,
                     "best_val_loss": a_re_score,
-                    "epochs": 50,
+                    "epochs": 5,
                     "n_train": args.retrain_samples,
                 },
                 "trials_csv": str(stage_dir_A / "trials.csv"),
@@ -3349,7 +3499,7 @@ if __name__ == "__main__":
                 "retrain": {
                     "ckpt": b_re_ckpt,
                     "best_val_loss": b_re_score,
-                    "epochs": 50,
+                    "epochs": 5,
                     "n_train": args.retrain_samples,
                 },
                 "trials_csv": str(stage_dir_B / "trials.csv"),
@@ -3359,7 +3509,7 @@ if __name__ == "__main__":
             "ensemble": {
                 "ckpt": ensemble_ckpt,
                 "best_val_loss": ensemble_score,
-                "epochs": 50,
+                "epochs": 5,
                 "n_train": args.retrain_samples,
             },
         }
