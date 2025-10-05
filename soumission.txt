@@ -97,7 +97,7 @@ export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_SCRIPT="/home/cosmic_86/CODES/scripts/10_PIAE_trainv2_effv2_opt.py"
+PYTHON_SCRIPT="${SCRIPT_DIR}/physae.py"
 cat <<EOM
 Lancement du script ${PYTHON_SCRIPT} avec les paramètres :
   trials A       : ${TRIALS_A}
