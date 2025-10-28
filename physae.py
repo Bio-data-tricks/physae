@@ -1049,11 +1049,12 @@ class EfficientNetRefiner(nn.Module):
         h = self.shared_head(feat)
 
         # FiLM sans temps
-        if cond_norm is None:
-            raise RuntimeError("cond_norm ne doit pas être None quand FiLM est activé.")
-        gamma_beta = self.film_time(cond_norm)
-        gamma, beta = gamma_beta[:, :h.shape[1]], gamma_beta[:, h.shape[1]:]
-        h = h * (1 + 0.1 * gamma) + 0.1 * beta
+        if self.use_film:
+            if cond_norm is None:
+                raise RuntimeError("cond_norm ne doit pas être None quand FiLM est activé.")
+            gamma_beta = self.film_time(cond_norm)
+            gamma, beta = gamma_beta[:, :h.shape[1]], gamma_beta[:, h.shape[1]:]
+            h = h * (1 + 0.1 * gamma) + 0.1 * beta
 
         gate = torch.sigmoid(self.scale_gate(h))
         scale = self.delta_scale * gate
