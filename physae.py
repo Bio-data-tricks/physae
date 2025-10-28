@@ -2005,6 +2005,69 @@ class PhysicallyInformedAE(pl.LightningModule):
 # ============================================================
 # 8) Callbacks visu & epoch sync dataset
 # ============================================================
+class LossCurvePlotCallback(pl.Callback):
+    """Sauvegarde une courbe des pertes train/val au fil des epochs.
+
+    Cette callback collecte les métriques "train_loss_total" et "val_loss_total"
+    (loggées via ``self.log(..., on_epoch=True)`` dans le module Lightning)
+    puis génère un graphique mis à jour après chaque epoch. L'objectif est de
+    visualiser rapidement l'écart entre les pertes d'entraînement et de
+    validation pour détecter un éventuel sur-apprentissage.
+    """
+
+    def __init__(self, save_path: str = "./figs_loss/loss_curve.png"):
+        super().__init__()
+        self.save_path = save_path
+        self._history: dict[int, dict[str, float | None]] = {}
+
+    def _record(self, epoch: int, kind: str, value):
+        if value is None:
+            return
+        if hasattr(value, "detach"):
+            value = value.detach()
+        try:
+            value = float(value.cpu())
+        except Exception:
+            value = float(value)
+        entry = self._history.setdefault(epoch, {"train": None, "val": None})
+        entry[kind] = value
+        self._plot()
+
+    def _plot(self):
+        if not self._history:
+            return
+        epochs_sorted = sorted(self._history.keys())
+
+        train_pts = [(e + 1, self._history[e]["train"]) for e in epochs_sorted if self._history[e]["train"] is not None]
+        val_pts   = [(e + 1, self._history[e]["val"])   for e in epochs_sorted if self._history[e]["val"]   is not None]
+
+        if not train_pts and not val_pts:
+            return
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+
+        if train_pts:
+            ax.plot([e for e, _ in train_pts], [v for _, v in train_pts], label="Train", marker="o")
+        if val_pts:
+            ax.plot([e for e, _ in val_pts], [v for _, v in val_pts], label="Validation", marker="o")
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss")
+        ax.set_title("Train vs Val loss")
+        ax.grid(True, which="both", linestyle="--", alpha=0.5)
+        ax.legend()
+
+        save_fig(fig, self.save_path)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        self._record(trainer.current_epoch, "train", metrics.get("train_loss_total"))
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        self._record(trainer.current_epoch, "val", metrics.get("val_loss_total"))
+
+
 class StageAwarePlotCallback(pl.Callback):
     """
     Callback de visualisation conscient de l'étape:
@@ -3269,6 +3332,7 @@ cb_pt_compare.refine = False      # <- clé : désactiver le refine pour ce call
 callbacks = [
     cb_visu_stage,            # <- affiche MSE global + erreurs % par param sur la figure
     cb_pt_compare,            # comparaison PT=pred vs PT=exp
+    LossCurvePlotCallback(save_path="./figs_local/stageA/loss_curve.png"),
     UpdateEpochInDataset(),   # keep
     UpdateEpochInValDataset() # keep
 ]
