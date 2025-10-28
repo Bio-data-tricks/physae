@@ -1,28 +1,20 @@
-import math, random, sys, os
-import shutil
-from typing import Optional, List, Dict, Union, Iterable
-import os
-import csv
-import socket
-import re
+from __future__ import annotations
+
+import math, random, sys, os, socket, pickle, json, yaml
+from typing import Optional, List, Dict
 from pathlib import Path
-import torch
-import pytorch_lightning as pl
-from torch.utils.data.distributed import DistributedSampler
-import pandas as pd
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader, Dataset
-from pytorch_lightning.callbacks import Callback
-from datetime import datetime
-import json, yaml  # pip install pyyaml si besoin
+
+import pandas as pd
+import numpy as np
+
 from lion_pytorch import Lion
 
-
-# --- Matplotlib: backend non interactif + polices ---
 import matplotlib as mpl
 mpl.use("Agg")  # important: définir le backend AVANT d'importer pyplot
 try:
@@ -30,7 +22,7 @@ try:
     mpl.rcParams['axes.unicode_minus'] = False
 except Exception:
     pass
-import matplotlib.pyplot as plt  # import unique (plusieurs imports causent des soucis HPC)
+import matplotlib.pyplot as plt  # import unique
 
 # === Helpers rank0 + save figure (réutilisés partout) ===
 def is_rank0():
@@ -47,9 +39,9 @@ def save_fig(fig, path, dpi=150):
 # ============================================================
 # 1) Configs globaux & normalisation
 # ============================================================
-PARAMS = ['sig0', 'dsig', 'mf_CH4', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
+PARAMS = ['sig0', 'dsig', 'mf_CH4', 'mf_H2O', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
 PARAM_TO_IDX = {n:i for i,n in enumerate(PARAMS)}
-LOG_SCALE_PARAMS = {'mf_CH4'}
+LOG_SCALE_PARAMS = {'mf_CH4','mf_H2O'}
 LOG_FLOOR = 1e-7
 NORM_PARAMS: Dict[str, tuple] = {}
 
@@ -88,11 +80,8 @@ def unnorm_param_torch(name: str, val_norm_t: torch.Tensor) -> torch.Tensor:
     else:
         return val_norm_t*(vmax_t-vmin_t)+vmin_t
 
-import math, torch, torch.nn.functional as F
 
 # ---------- LOWESS unifié ----------
-import math, torch
-
 def _k_from_length(N: int, frac: float | None, win: int | None) -> int:
     if win is not None:
         k = int(win)
@@ -200,7 +189,7 @@ def lowess_value(
 
 
 # ============================================================
-# 2) Moteur physique & parsing
+# 2) Moteur physique fidèle (HITRAN+TIPS QTpy / Pine / LM) & parsing
 # ============================================================
 def parse_csv_transitions(csv_str):
     transitions = []
@@ -222,99 +211,353 @@ def transitions_to_tensors(transitions, device):
             'shift_air', 'gDicke', 'nDicke', 'lmf', 'nlmf']
     return [torch.tensor([t[k] for t in transitions], dtype=torch.float32, device=device) for k in keys]
 
-MOLECULE_PARAMS = {'CH4': {'M': 16.04, 'PL': 15.12}, 'H2O': {'M': 18.02, 'PL': 15.12}}
+# ==================== PHYSIQUE (cgs) + TIPS_2021 (QTpy) ====================
+# Constantes cgs
+C     = 2.99792458e10           # cm/s
+NA    = 6.02214129e23
+KB    = 1.380649e-16            # erg/K
+R     = NA * KB                  # erg/(mol.K)
+P0    = 1013.25                  # mbar
+T0    = 273.15                   # K
+TREF  = 296.0
+L0    = 2.6867773e19            # cm^-3 (Loschmidt)
+C2    = 1.438776877             # cm.K
+SQRT_LN2    = math.sqrt(math.log(2.0))
+INV_SQRT_PI = 1.0 / math.sqrt(math.pi)
 
-_b = torch.tensor([-0.0173-0.0463j, -0.7399+0.8395j, 5.8406+0.9536j, -5.5834-11.2086j], dtype=torch.cdouble)
+# Paramètres moléculaires (g/mol, longueur m)
+MOLECULE_PARAMS = {
+    'CH4': {'M': 16.04,     'PL': 15.12},
+    'H2O': {'M': 18.01528,  'PL': 15.12},
+}
+
+def find_qtpy_dir(pref: str | Path) -> Path:
+    p = Path(pref)
+    if p.exists() and p.is_dir(): return p.resolve()
+    here = Path.cwd()
+    for cand in (here / "QTpy", here.parent / "QTpy"):
+        if cand.exists(): return cand.resolve()
+    raise FileNotFoundError(f"Dossier QTpy introuvable (essayé: {pref}, ./QTpy, ../QTpy).")
+
+class Tips2021QTpy:
+    """
+    Lecteur QTpy (pickle HITRAN TIPS_2021) + interpolation linéaire en T (entiers).
+    """
+    def __init__(self, qtpy_dir: str | Path, device: str = 'cpu'):
+        self.base = Path(qtpy_dir).resolve()
+        if not self.base.exists():
+            raise FileNotFoundError(f"Dossier QTpy introuvable: {self.base}")
+        self.device = device
+        self.cache_dict = {}
+        self.cache_table = {}
+        self.cache_tmax = {}
+
+    def _path_for(self, mid: int, iso: int) -> Path:
+        return self.base / f"{int(mid)}_{int(iso)}.QTpy"
+
+    def _load_one(self, mid: int, iso: int):
+        key = (int(mid), int(iso))
+        if key in self.cache_dict:
+            return
+        p = self._path_for(mid, iso)
+        if not p.exists():
+            raise FileNotFoundError(f"Fichier QTpy manquant pour (mol={mid}, iso={iso}): {p}")
+        with open(p, "rb") as h:
+            d = pickle.loads(h.read())
+        dd = {int(k): float(v) for k, v in d.items()}
+        tmax = int(max(dd.keys()))
+        table = np.zeros(tmax, dtype=np.float64)
+        for T in range(1, tmax + 1):
+            if T in dd:
+                table[T-1] = dd[T]
+            else:
+                prev = max([k for k in dd.keys() if k < T], default=min(dd.keys()))
+                nxt  = min([k for k in dd.keys() if k > T], default=max(dd.keys()))
+                if nxt == prev: table[T-1] = dd[prev]
+                else:
+                    a = (T - prev) / (nxt - prev)
+                    table[T-1] = dd[prev] + a*(dd[nxt] - dd[prev])
+        self.cache_dict[key]  = dd
+        self.cache_table[key] = table
+        self.cache_tmax[key]  = tmax
+
+    def q_scalar(self, mid: int, iso: int, T: float) -> float:
+        self._load_one(mid, iso)
+        key = (int(mid), int(iso))
+        table = self.cache_table[key]; tmax = self.cache_tmax[key]
+        if T <= 1: return float(table[0])
+        if T >= tmax: return float(table[-1])
+        t0 = int(np.floor(T)); t1 = t0 + 1
+        f  = (T - t0) / (t1 - t0)
+        q1, q2 = table[t0-1], table[t1-1]
+        return float(q1 + f*(q2 - q1))
+
+    def q_torch(self, mid: int, iso: int, T: torch.Tensor) -> torch.Tensor:
+        self._load_one(mid, iso)
+        key = (int(mid), int(iso))
+        table = self.cache_table[key]; tmax = self.cache_tmax[key]
+        Ts = T.detach().to(dtype=torch.float64, device=self.device)
+        Ts = torch.clamp(Ts, 1.0, float(tmax))
+        t0 = torch.floor(Ts); t1 = torch.clamp(t0 + 1.0, max=float(tmax))
+        f  = (Ts - t0) / torch.clamp(t1 - t0, min=1e-12)
+        i0 = (t0.to(torch.int64) - 1).clamp(0, tmax-1)
+        i1 = (t1.to(torch.int64) - 1).clamp(0, tmax-1)
+        tab = torch.from_numpy(table).to(dtype=torch.float64, device=self.device)
+        q1 = tab[i0]; q2 = tab[i1]
+        return q1 + f*(q2 - q1)
+
+# ---------- wofz (Humlíček), Pine, line mixing ----------
+_b = torch.tensor(
+    [-0.0173-0.0463j, -0.7399+0.8395j,  5.8406+0.9536j, -5.5834-11.2086j],
+    dtype=torch.cdouble
+)
 _b = torch.cat((_b, _b.conj()))
-_c = torch.tensor([2.2377-1.626j, 1.4652-1.7896j, 0.8393-1.892j, 0.2739-1.9418j], dtype=torch.cdouble)
+_c = torch.tensor(
+    [ 2.2377-1.626j ,  1.4652-1.7896j,  0.8393-1.892j ,  0.2739-1.9418j],
+    dtype=torch.cdouble
+)
 _c = torch.cat((_c, -_c.conj()))
 
 def wofz_torch(z: torch.Tensor) -> torch.Tensor:
-    inv_sqrt_pi = 1.0 / math.sqrt(math.pi)
-    _b_local = _b.to(device=z.device, dtype=z.dtype)
-    _c_local = _c.to(device=z.device, dtype=z.dtype)
-    w = (_b_local / (z.unsqueeze(-1) - _c_local)).sum(dim=-1)
-    w = w * (1j * inv_sqrt_pi)
-    mask = (z.imag < 0)
-    w_ref_all = torch.exp(-(z**2)) * 2.0 - w.conj()
-    w = torch.where(mask, w_ref_all, w)
-    return w
+    b_loc = _b.to(device=z.device, dtype=z.dtype)
+    c_loc = _c.to(device=z.device, dtype=z.dtype)
+    w_pos = (b_loc / (z.unsqueeze(-1) - c_loc)).sum(dim=-1) * (1j * INV_SQRT_PI)
+    w_neg = (b_loc / ((-z).unsqueeze(-1) - c_loc)).sum(dim=-1) * (1j * INV_SQRT_PI)
+    return torch.where(z.imag < 0, 2.0*torch.exp(-(z**2)) - w_neg, w_pos)
 
-def pine_profile_torch_complex(x, sigma_hwhm, gamma, gDicke, *, device='cpu'):
-    sigma = sigma_hwhm / math.sqrt(2*math.log(2.))
-    xh = math.sqrt(math.log(2.))*x/sigma_hwhm
-    yh = math.sqrt(math.log(2.))*gamma/sigma_hwhm
-    zD = math.sqrt(math.log(2.))*gDicke/sigma_hwhm
-    z = xh + 1j*(yh + zD)
-    k = -wofz_torch(z)
+def pine_profile_torch_complex(x, sigma_hwhm, gamma, g_dicke):
+    xh = SQRT_LN2 * x / sigma_hwhm
+    yh = SQRT_LN2 * gamma / sigma_hwhm
+    zD = SQRT_LN2 * g_dicke / sigma_hwhm
+    z  = xh + 1j * (yh + zD)
+    k  = -wofz_torch(z)
     k_r, k_i = k.real, k.imag
-    denom = (1 - zD*math.sqrt(math.pi)*k_r)**2 + (zD*math.sqrt(math.pi)*k_i)**2
-    real = (k_r - zD*math.sqrt(math.pi)*(k_r**2 + k_i**2)) / denom
+    pi_sqrt = math.sqrt(math.pi)
+    denom = (1 - zD * pi_sqrt * k_r)**2 + (zD * pi_sqrt * k_i)**2
+    real = (k_r - zD * pi_sqrt * (k_r**2 + k_i**2)) / denom
     imag = k_i / denom
-    factor = math.sqrt(math.log(2.) / math.pi) / sigma
+    factor = math.sqrt(math.log(2.0) / math.pi) / sigma_hwhm  # facteur HWHM (comme script de réf.)
     return real * factor, imag * factor
 
-def apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T, TREF=296.): 
-    flm = lmf * ((T/TREF) ** nlmf)
-    return real_prof + imag_prof * flm
+def apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T, P, *, PREF=P0, TREF_=TREF):
+    flm = lmf * ((TREF_ / T) ** nlmf) * (P / PREF)  # dépendance P et T
+    return -(real_prof + imag_prof * flm)  # signe absorption
 
 def polyval_torch(coeffs, x):
     powers = torch.arange(coeffs.shape[1], device=coeffs.device, dtype=coeffs.dtype)
     return torch.sum(coeffs.unsqueeze(2) * x.unsqueeze(0).pow(powers.view(1, -1, 1)), dim=1)
 
+def ST_hitran_with_qtpy(
+    Sref,                # intensité à Tref (HITRAN, 296 K) — [1,L,1] ou [B,L,1]
+    nu0,                 # fréquence de transition (cm^-1)   — [1,L,1] ou [B,L,1]
+    e0,                  # énergie d'état bas (cm^-1)        — [1,L,1] ou [B,L,1]
+    abundance,           # (conservé pour compat)             — [1,L,1] ou [B,L,1]
+    def_abundance,       # (conservé pour compat)             — [1,L,1] ou [B,L,1]
+    mid_arr,             # ID molécule par ligne              — [1,L,1] (long)
+    iso_arr,             # ID isotopologue par ligne          — [1,L,1] (long)
+    T_exp,               # température expérimentale          — [B,1,1] ou [B] (K)
+    mf=None,             # ignoré (pour compat signature)
+    tipspy=None,         # objet Tips2021QTpy (requis)
+    Tref: float = 296.0, # température de référence HITRAN
+    device=None,
+):
+    """
+    Retourne S(T) pour chaque échantillon du batch, en utilisant Q(T) issu de QTpy/TIPS_2021,
+    calculé **par ligne spectrale et par échantillon** (via tipspy.q_torch).
+    Shapes de sortie: [B, L, 1] (diffuse correctement avec le reste de la physique).
+    """
+    import torch
+
+    if tipspy is None:
+        raise RuntimeError("tipspy (QTpy/TIPS) est requis pour ST_hitran_with_qtpy().")
+
+    # -- Device/dtype cohérents
+    if device is None:
+        if torch.is_tensor(Sref):
+            device = Sref.device
+        elif torch.is_tensor(T_exp):
+            device = T_exp.device
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = Sref.dtype if torch.is_tensor(Sref) else torch.float32
+
+    def to_tensor(x, dtype_=dtype):
+        if torch.is_tensor(x):
+            return x.to(device=device, dtype=dtype_, non_blocking=True)
+        return torch.as_tensor(x, device=device, dtype=dtype_)
+
+    Sref = to_tensor(Sref)
+    nu0  = to_tensor(nu0)
+    e0   = to_tensor(e0)
+    abundance     = to_tensor(abundance)
+    def_abundance = to_tensor(def_abundance)
+    mid_arr = to_tensor(mid_arr, dtype_=torch.long)
+    iso_arr = to_tensor(iso_arr, dtype_=torch.long)
+    T_exp   = to_tensor(T_exp)
+
+    # Mise en forme T_exp -> [B,1,1] et extraction Ts -> [B]
+    if T_exp.ndim == 1:
+        T_exp = T_exp.view(-1, 1, 1)
+    elif T_exp.ndim == 2:
+        T_exp = T_exp.view(T_exp.shape[0], 1, 1)
+    B = T_exp.shape[0]
+
+    # Déduire L (nb de lignes)
+    # Sref/nu0/e0 sont typiquement [1,L,1] (ou [B,L,1] par broadcast). On lit la deuxième dim.
+    if Sref.ndim == 3:
+        L = Sref.shape[1]
+    else:
+        # fallback si fourni 1D : on tente via mid_arr
+        L = mid_arr.view(-1).numel()
+
+    # Constante c2 en dtype/device correct
+    c2 = torch.tensor(1.438776877, device=device, dtype=dtype)
+
+    # === Q(T) et Q(Tref) vectorisés par ligne & par échantillon ===
+    # Indices (L) des paires (mid, iso)
+    mid_L = mid_arr.view(-1).to(torch.long)[:L]
+    iso_L = iso_arr.view(-1).to(torch.long)[:L]
+    key   = mid_L * 100 + iso_L
+    uniq  = torch.unique(key)
+
+    # Sorties [B, L, 1]
+    Q_T    = torch.empty((B, L, 1), device=device, dtype=dtype)
+    Q_refT = torch.empty((B, L, 1), device=device, dtype=dtype)
+
+    # Températures échantillon [B]
+    Ts = T_exp.view(B)
+
+    # Pour chaque groupe (molécule, isotopologue), on appelle tipspy.q_torch une seule fois
+    for k in uniq:
+        k = int(k.item())
+        mid_i = k // 100
+        iso_i = k % 100
+        cols  = (key == k).nonzero(as_tuple=True)[0]  # indices colonnes de ce groupe, shape [K]
+
+        # q_torch retourne [B] (float64 côté QTpy) → cast en dtype/device cible
+        qT_b  = tipspy.q_torch(mid_i, iso_i, Ts).to(device=device, dtype=dtype)          # [B]
+        qRef_b= tipspy.q_torch(mid_i, iso_i, torch.full_like(Ts, float(Tref)))\
+                    .to(device=device, dtype=dtype)                                       # [B]
+
+        # Répliquer sur les colonnes de ce groupe : [B, K, 1]
+        Q_T[:, cols, 0]    = qT_b.view(B, 1).expand(B, cols.numel())
+        Q_refT[:, cols, 0] = qRef_b.view(B, 1).expand(B, cols.numel())
+
+    # === Facteurs de Boltzmann et ratio (broadcast [B,L,1]) ===
+    Tref_t = torch.tensor(float(Tref), device=device, dtype=dtype)
+    invT    = 1.0 / T_exp
+    invTref = 1.0 / Tref_t
+
+    expo_fac = torch.exp(-c2 * e0 * (invT - invTref))
+    num_fac  = 1.0 - torch.exp(-c2 * nu0 * invT)
+    den_fac  = 1.0 - torch.exp(-c2 * nu0 * invTref)
+
+    # Sécurités numériques
+    eps = torch.tensor(torch.finfo(dtype).eps, device=device, dtype=dtype)
+    den_fac = torch.where(den_fac == 0, eps, den_fac)
+    Q_T     = torch.where(Q_T == 0,     eps, Q_T)
+
+    # abundance = torch.where(abundance == 0, eps, abundance)
+    # def_abundance = torch.where(def_abundance == 0, eps, def_abundance)
+    # abundance_ratio = (abundance / def_abundance)
+    # S_T = Sref * (Q_refT / Q_T) * expo_fac * (num_fac / den_fac) * abundance_ratio
+
+    # Intensité à T — shape [B, L, 1]
+    S_T = Sref * (Q_refT / Q_T) * expo_fac * (num_fac / den_fac)
+    return S_T
+
 def batch_physics_forward_multimol_vgrid(
     sig0, dsig, poly_freq, v_grid_idx, baseline_coeffs,
-    transitions_dict, P, T, mf_dict, device='cpu'
+    transitions_dict, P, T, mf_dict, *, tipspy: Tips2021QTpy, device='cpu', USE_LM: bool=True
 ):
+    """
+    Implémentation fidèle (script Spectro CH4):
+      - shift_air appliqué
+      - Pine + Dicke effectif
+      - LM avec flm ∝ (Tref/T)^nlmf * (P/P0), signe absorption
+      - S(T) HITRAN avec Q(T) via QTpy
+      - Colonne: (P/P0)*(T0/T)*L0*PL*100
+      - transmission = exp(total_profile) (profile déjà signé)
+    """
     B, N = sig0.shape[0], v_grid_idx.shape[0]
     v_grid_idx = v_grid_idx.to(device=device, dtype=torch.float64)
-    sig0, dsig, P, T = (
-        sig0.to(dtype=torch.float64).unsqueeze(1),
-        dsig.to(dtype=torch.float64).unsqueeze(1),
-        P.to(dtype=torch.float64).unsqueeze(1),
-        T.to(dtype=torch.float64).unsqueeze(1)
-    )
-    if baseline_coeffs.dim() == 1:
-        baseline_coeffs = baseline_coeffs.unsqueeze(0)
-    baseline_coeffs = baseline_coeffs.to(dtype=torch.float64)
+    sig0 = sig0.to(dtype=torch.float64, device=device).unsqueeze(1)
+    dsig = dsig.to(dtype=torch.float64, device=device).unsqueeze(1)
+    P    = P.to(dtype=torch.float64, device=device).unsqueeze(1)
+    T    = T.to(dtype=torch.float64, device=device).unsqueeze(1)
+
+    if baseline_coeffs.dim() == 1: baseline_coeffs = baseline_coeffs.unsqueeze(0)
+    baseline_coeffs = baseline_coeffs.to(dtype=torch.float64, device=device)
 
     poly_freq_torch = torch.tensor(poly_freq, dtype=torch.float64, device=device).unsqueeze(0).expand(B, -1)
     coeffs = torch.cat([sig0, dsig, poly_freq_torch], dim=1)
-    v_grid_batch = polyval_torch(coeffs, v_grid_idx)
+    v_grid_batch = polyval_torch(coeffs, v_grid_idx)  # (B,N)
 
     total_profile = torch.zeros((B, N), device=device, dtype=torch.float64)
 
-    C  = torch.tensor(2.99792458e10, dtype=torch.float64, device=device)
-    NA = torch.tensor(6.02214129e23, dtype=torch.float64, device=device)
-    KB = torch.tensor(1.380649e-16, dtype=torch.float64, device=device)
-    P0 = torch.tensor(1013.25, dtype=torch.float64, device=device)
-    T0 = torch.tensor(273.15, dtype=torch.float64, device=device)
-    L0 = torch.tensor(2.6867773e19, dtype=torch.float64, device=device)
-    TREF = torch.tensor(296.0, dtype=torch.float64, device=device)
+    P0_t   = torch.tensor(P0,   dtype=torch.float64, device=device)
+    T0_t   = torch.tensor(T0,   dtype=torch.float64, device=device)
+    TREF_t = torch.tensor(TREF, dtype=torch.float64, device=device)
+    L0_t   = torch.tensor(L0,   dtype=torch.float64, device=device)
+    C_t    = torch.tensor(C,    dtype=torch.float64, device=device)
+    R_t    = torch.tensor(R,    dtype=torch.float64, device=device)
 
     for mol, trans in transitions_dict.items():
-        tensors = transitions_to_tensors(trans, device)
-        amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf = [t.to(dtype=torch.float64).view(1, -1, 1) for t in tensors]
-        mf   = mf_dict[mol].to(dtype=torch.float64).view(B, 1, 1)
-        Mmol = torch.tensor(MOLECULE_PARAMS[mol]['M'], dtype=torch.float64, device=device)
+        (amp, center, ga, gs, na, sa, gd, nd, lmf, nlmf) = [
+            t.to(dtype=torch.float64, device=device).view(1, -1, 1)
+            for t in transitions_to_tensors(trans, device)
+        ]
+        e0  = torch.tensor([t['e0']        for t in trans], dtype=torch.float64, device=device).view(1, -1, 1)
+        abn = torch.tensor([t['abundance'] for t in trans], dtype=torch.float64, device=device).view(1, -1, 1)
+        def_abn = torch.ones_like(abn)
+        mid_arr = torch.tensor([t['mid']   for t in trans], dtype=torch.int64, device=device).view(1, -1, 1)
+        iso_arr = torch.tensor([t['lid']   for t in trans], dtype=torch.int64, device=device).view(1, -1, 1)
+
+        mf   = mf_dict[mol].to(dtype=torch.float64, device=device).view(B, 1, 1)  # fraction molaire
+        Mmol = torch.tensor(MOLECULE_PARAMS[mol]['M'],  dtype=torch.float64, device=device)
         PL   = torch.tensor(MOLECULE_PARAMS[mol]['PL'], dtype=torch.float64, device=device)
-        T_exp, P_exp, v_grid_exp = T.view(B, 1, 1), P.view(B, 1, 1), v_grid_batch.view(B, 1, N)
-        x = v_grid_exp - center
-        sigma_HWHM = (center / C) * torch.sqrt(2 * NA * KB * T_exp * math.log(2.) / Mmol)
-        gamma = P_exp / P0 * (TREF / T_exp) ** na * (ga * (1 - mf) + gs * mf)
-        real_prof, imag_prof = pine_profile_torch_complex(x, sigma_HWHM, gamma, gd, device=device)
-        profile = apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T_exp)
-        band = profile * amp * PL * 100 * mf * L0 * P_exp / P0 * T0 / T_exp
+
+        T_exp = T.view(B, 1, 1)
+        P_exp = P.view(B, 1, 1)
+        v_exp = v_grid_batch.view(B, 1, N)
+
+        # shift de pression
+        x = v_exp - (center + sa * (P_exp / P0_t))
+
+        # HWHM doppler
+        sigma_HWHM = (center / C_t) * torch.sqrt(2.0 * R_t * T_exp * math.log(2.0) / Mmol)
+
+        # élargissement collisionnel + Dicke effectif
+        gamma  = (P_exp / P0_t) * (TREF_t / T_exp) ** na * (ga * (1 - mf) + gs * mf)
+        gN_eff = gd * (P_exp / P0_t) * (TREF_t / T_exp) ** nd
+
+        real_prof, imag_prof = pine_profile_torch_complex(x, sigma_HWHM, gamma, gN_eff)
+        if USE_LM:
+            profile = apply_line_mixing_complex(real_prof, imag_prof, lmf, nlmf, T=T_exp, P=P_exp)
+        else:
+            profile = -real_prof  # signe absorption sans LM
+
+        # S(T) exact (HITRAN + Q(T))
+        S_T = ST_hitran_with_qtpy(
+            Sref=amp, nu0=center, e0=e0, abundance=abn, def_abundance=def_abn,
+            mid_arr=mid_arr, iso_arr=iso_arr, T_exp=T_exp, mf=mf, tipspy=tipspy,
+            device=device,
+        )
+
+        # Colonne (m -> cm via *100)
+        col = (P_exp / P0_t) * (T0_t / T_exp) * L0_t * PL * 100.0 * mf
+
+        band = profile * S_T * col  # (B, L, N) → somme sur L
         total_profile += band.sum(dim=1)
 
-    transmission = torch.exp(-total_profile)
+    transmission = torch.exp(total_profile)  # profile déjà signé
 
-    # Baseline poly (monômes 1, x, x^2 sur l'index — cohérent avec les ranges)
+    # baseline polynomiale sur l'index
     x_bl = torch.arange(N, device=device, dtype=torch.float64)
     powers_bl = torch.arange(baseline_coeffs.shape[1], device=device, dtype=torch.float64)
     baseline = torch.sum(baseline_coeffs.unsqueeze(2) * x_bl.unsqueeze(0).pow(powers_bl.view(1, -1, 1)), dim=1)
-
     return transmission * baseline, v_grid_batch
+
 
 # ============================================================
 # 3) Dataset & bruits
@@ -389,13 +632,14 @@ class SpectraDataset(Dataset):
     def __init__(self, n_samples, num_points, poly_freq_CH4, transitions_dict,
                  sample_ranges: Optional[dict] = None, strict_check: bool = True,
                  with_noise: bool = True, noise_profile: Optional[dict] = None,
-                 freeze_noise: bool = False):
+                 freeze_noise: bool = False, tipspy: Tips2021QTpy | None = None):
         self.n_samples, self.num_points = n_samples, num_points
         self.poly_freq_CH4, self.transitions_dict = poly_freq_CH4, transitions_dict
         self.sample_ranges = sample_ranges if sample_ranges is not None else NORM_PARAMS
         self.with_noise = bool(with_noise)
         self.noise_profile = dict(noise_profile or {})
         self.freeze_noise = bool(freeze_noise)
+        self.tipspy = tipspy
         self.epoch = 0
         if strict_check:
             for k in PARAMS:
@@ -422,18 +666,30 @@ class SpectraDataset(Dataset):
 
     def __getitem__(self, idx):
         device, dtype = 'cpu', torch.float32
-        vals = [torch.empty(1, dtype=dtype).uniform_(*self.sample_ranges[k]) for k in PARAMS]
-        sig0, dsig, mf_CH4, b0, b1, b2, P, T = vals
+
+        # Tirage des paramètres (dico générique)
+        sampled = {k: torch.empty(1, dtype=dtype).uniform_(*self.sample_ranges[k]) for k in PARAMS}
+        sig0 = sampled['sig0']; dsig = sampled['dsig']
+        b0 = sampled['baseline0']; b1 = sampled['baseline1']; b2 = sampled['baseline2']
+        P = sampled['P']; T = sampled['T']
+
         baseline_coeffs = torch.cat([b0, b1, b2]).unsqueeze(0)
-        mf_dict = {'CH4': mf_CH4}
         v_grid_idx = torch.arange(self.num_points, dtype=dtype, device=device)
 
-        params_norm = torch.tensor([norm_param_value(k, v.item()) for k, v in zip(PARAMS, vals)],
-                                   dtype=torch.float32)
+        # Fractions molaires utilisées par la physique
+        mf_dict = {}
+        if 'CH4' in self.transitions_dict:
+            mf_dict['CH4'] = sampled['mf_CH4']
+        if 'H2O' in self.transitions_dict:
+            mf_dict['H2O'] = sampled['mf_H2O']  # <-- varie dans la simu
+
+        # Vecteur normalisé
+        params_norm = torch.tensor([norm_param_value(k, sampled[k].item()) for k in PARAMS], dtype=torch.float32)
 
         spectra_clean, _ = batch_physics_forward_multimol_vgrid(
             sig0, dsig, self.poly_freq_CH4, v_grid_idx,
-            baseline_coeffs, self.transitions_dict, P, T, mf_dict, device=device
+            baseline_coeffs, self.transitions_dict, P, T, mf_dict,
+            tipspy=self.tipspy, device=device
         )
         spectra_clean = spectra_clean.to(torch.float32)
 
@@ -444,9 +700,7 @@ class SpectraDataset(Dataset):
             spectra_noisy = spectra_clean
 
         # --- ÉCHELLE POUR L'ENTRÉE (noisy) ---
-        #scale_noisy = scale_first_window(spectra_noisy).unsqueeze(1).clamp_min(1e-8)
         scale_noisy = lowess_value(spectra_noisy, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
-
         noisy_spectra = spectra_noisy / scale_noisy   # normalisé pour l’encodeur
 
         # --- MAX SIMPLE SUR LE CLEAN ---
@@ -460,15 +714,10 @@ class SpectraDataset(Dataset):
             'scale': scale_noisy.squeeze(1).to(torch.float32)[0]
         }
 
+
 # ============================================================
 # EfficientNetV2-1D encoder (drop-in replacement)
 # ============================================================
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# --- utils ---
 def _make_divisible(v, divisor=8, min_value=None):
     if min_value is None:
         min_value = divisor
@@ -504,7 +753,6 @@ class ConvBNAct1d(nn.Sequential):
         if act: mods.append(SiLU())
         super().__init__(*mods)
 
-# --- Squeeze & Excitation (optionnel dans MBConv) ---
 class SE1d(nn.Module):
     def __init__(self, c, se_ratio=0.25):
         super().__init__()
@@ -519,7 +767,6 @@ class SE1d(nn.Module):
         s = self.fc2(self.act(self.fc1(s)))
         return x * self.gate(s)
 
-# --- Fused-MBConv (EffNetV2) : conv(k,s) + pw expansion fusionnés ---
 class FusedMBConv1d(nn.Module):
     def __init__(self, in_c, out_c, k, s, expand_ratio, drop_path=0.0):
         super().__init__()
@@ -541,7 +788,6 @@ class FusedMBConv1d(nn.Module):
             y = self.drop(y) + x
         return y
 
-# --- MBConv (dw + se + pw) ---
 class MBConv1d(nn.Module):
     def __init__(self, in_c, out_c, k, s, expand_ratio, se_ratio=0.25, drop_path=0.0):
         super().__init__()
@@ -568,10 +814,7 @@ class MBConv1d(nn.Module):
             y = self.drop(y) + x
         return y
 
-# --- config EffNetV2 (S/M/L approximés pour 1D) ---
 _EFFV2_CFGS = {
-    # (block, repeats, out_c, kernel, stride, expand)
-    # Fused stages then MBConv stages (comme V2 2D, adaptés au 1D)
     "s": [
         ("fused", 2,  24, 3, 1, 1.0),
         ("fused", 4,  48, 3, 2, 4.0),
@@ -601,7 +844,6 @@ _EFFV2_CFGS = {
 class EfficientNetEncoder(nn.Module):
     """
     Drop-in encoder pour ton pipeline:
-      - même interface que EfficientNetEncoder
       - retourne (features_1d, None)
       - attribut self.feat_dim pour les têtes
     """
@@ -642,8 +884,6 @@ class EfficientNetEncoder(nn.Module):
                 in_c = out_c
                 b_idx += 1
         self.blocks = nn.Sequential(*blocks)
-
-        # head (optionnelle) : légère proj pour offrir une dimension "propre"
         self.head = nn.Identity()  # garde la résolution temporelle courante
         self.feat_dim = in_c
 
@@ -657,56 +897,31 @@ class EfficientNetEncoder(nn.Module):
 # ============================================================
 # 5) ReLoBRaLo
 # ============================================================
-import torch
-
 class ReLoBRaLoLoss:
     """
     ReLoBRaLo avec tirage Torch déterministe (DDP friendly).
-
-    Args
-    ----
-    loss_names : list[str]
-        Noms (ordre) des composantes de pertes.
-    alpha : float
-        Lissage EMA des poids (0→réactif, 1→inertiel).
-    tau : float
-        Température pour le softmax.
-    history_len : int
-        Longueur max d'historique par perte.
-    seed : int | None
-        Graine du générateur Torch. Si None, on laisse l'état global.
     """
-
     def __init__(self, loss_names, alpha=0.9, tau=1.0, history_len=10, seed=12345):
         self.loss_names = list(loss_names)
         self.alpha = float(alpha)
         self.tau = float(tau)
         self.history_len = int(history_len)
-
-        # Historique sous forme de listes (simple & rapide)
         self.loss_history = {name: [] for name in self.loss_names}
-
-        # Poids init = 1
         self.weights = torch.ones(len(self.loss_names), dtype=torch.float32)
-
-        # Générateur Torch pour tirages stochastiques (DDP-safe)
         self._g = torch.Generator(device="cpu")
         if seed is not None:
             self._g.manual_seed(int(seed))
 
     def set_seed(self, seed: int):
-        """Permet de (re)fixer la graine si besoin (ex: au début d'un run)."""
         self._g.manual_seed(int(seed))
 
     def to(self, device=None, dtype=None):
-        """Optionnel : déplacer/convertir les tenseurs internes."""
         if device is not None or dtype is not None:
             self.weights = self.weights.to(device=device or self.weights.device,
                                            dtype=dtype or self.weights.dtype)
         return self
 
     def _append_history(self, current_losses):
-        # current_losses: Tensor [K] (mêmes composantes que loss_names)
         for i, name in enumerate(self.loss_names):
             self.loss_history[name].append(float(current_losses[i].detach().cpu()))
             if len(self.loss_history[name]) > self.history_len:
@@ -714,50 +929,29 @@ class ReLoBRaLoLoss:
 
     @torch.no_grad()
     def compute_weights(self, current_losses: torch.Tensor) -> torch.Tensor:
-        """
-        Met à jour et retourne les poids (Tensor [K]) pour agréger les pertes.
-        """
         device = current_losses.device
         dtype  = current_losses.dtype
-
-        # 1) Alimente l'historique
         self._append_history(current_losses)
-
-        # 2) Pas assez d'historique -> retourner les poids courants (move to device)
         if len(self.loss_history[self.loss_names[0]]) < 2:
             return self.weights.to(device=device, dtype=dtype)
-
-        # 3) Ratios relatifs: L_t / L_{j} avec j tiré uniformément dans l'historique
         ratios = []
         for name in self.loss_names:
-            hist = self.loss_history[name]  # liste python
-            # j ∈ [0, len(hist)-2] pour éviter l'élément courant (le -1)
+            hist = self.loss_history[name]
             j = int(torch.randint(low=0, high=len(hist)-1, size=(), generator=self._g).item())
             num = float(hist[-1])
             den = float(hist[j]) + 1e-8
             ratios.append(num / den)
-
         ratios_t = torch.tensor(ratios, device=device, dtype=dtype)
-
-        # 4) Balancing (même logique que ta version)
         mean_rel = ratios_t.mean()
         balancing = mean_rel / (ratios_t + 1e-8)
-
-        # Softmax tempéré puis mise à l’échelle par K (nombre de pertes)
         K = len(self.loss_names)
         new_w = K * torch.softmax(balancing / self.tau, dim=0)
-
-        # 5) EMA des poids pour éviter les oscillations
         w_old = self.weights.to(device=device, dtype=dtype)
         w_new = self.alpha * w_old + (1.0 - self.alpha) * new_w
-
-        # 6) Stocke et renvoie
-        self.weights = w_new.detach().cpu()  # stockage neutre (CPU)
+        self.weights = w_new.detach().cpu()
         return w_new
 
-# ============================================================
-# 6) Raffineur type EfficientNet (identique au backbone)
-# ============================================================
+
 # ============================================================
 # 6) Raffineur type EfficientNet (paramétrable)
 # ============================================================
@@ -768,27 +962,25 @@ class EfficientNetRefiner(nn.Module):
         cond_dim: int,
         backbone_feat_dim: int,
         *,
-        # — contrôles existants —
         delta_scale: float = 0.1,
         max_refine_steps: int = 3,
         encoder_variant: str = "s",
-        # — NOUVEAUX hyperparamètres exposés —
         encoder_width_mult: float = 1.0,
         encoder_depth_mult: float = 1.0,
         encoder_stem_channels: int | None = None,
         encoder_drop_path: float = 0.1,
         encoder_se_ratio: float = 0.25,
         feature_pool: str = "avg",           # {"avg","max","avgmax"}
-        shared_hidden_scale: float = 0.5,    # taille du MLP partagé: H = max(64, D * scale)
-        time_embed_dim: int | None = None,   # si None → max(16, H//4)
+        shared_hidden_scale: float = 0.5,    # H = max(64, D * scale)
+        mlp_dropout: float = 0.10,
     ):
         super().__init__()
         self.delta_scale = float(delta_scale)
         self.m_params = int(m_params)
         self.cond_dim = int(cond_dim)
         self.use_film = True
+        self.mlp_dropout = float(mlp_dropout)
 
-        # ----- encodeur 1D (2 canaux: noisy + resid) -----
         self.encoder = EfficientNetEncoder(
             in_channels=2,
             variant=encoder_variant,
@@ -799,9 +991,9 @@ class EfficientNetRefiner(nn.Module):
             stem_channels=encoder_stem_channels,
         )
 
-        # pooling des features 1D
         D = self.encoder.feat_dim
         pool = feature_pool.lower()
+        self._feature_pool_mode = pool  # <<< important
         if pool == "avg":
             self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         elif pool == "max":
@@ -811,69 +1003,59 @@ class EfficientNetRefiner(nn.Module):
         else:
             raise ValueError(f"feature_pool inconnu: {feature_pool}")
 
-        # dimension du MLP partagé
         H = max(64, int(round(D * float(shared_hidden_scale))))
-
-        # Si avgmax, on double l'entrée du MLP partagé
         in_shared = D if pool != "avgmax" else 2 * D
 
         self.shared_head = nn.Sequential(
             nn.Linear(in_shared, H), nn.LayerNorm(H), nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
             nn.Linear(H, H), nn.LayerNorm(H), nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
         )
 
-        # ----- time-step embedding (+ FiLM temps) -----
-        self.time_embed_dim = int(time_embed_dim) if time_embed_dim is not None else max(16, H // 4)
-        self.time_embed = nn.Embedding(max_refine_steps, self.time_embed_dim)
-
-        film_in = self.cond_dim + self.time_embed_dim
+        # plus d'index temporel → film_in = cond_dim uniquement
+        film_in = self.cond_dim
         self.film_time = nn.Sequential(
             nn.Linear(film_in, H), nn.Tanh(),
+            nn.Dropout(self.mlp_dropout),
             nn.Linear(H, 2 * H)  # -> gamma, beta
         )
 
-        # portes d’amplitude par paramètre
         self.scale_gate = nn.Linear(H, m_params)
 
-        # tête delta (utilise aussi les features du backbone principal + params normés)
         self.delta_head = nn.Sequential(
             nn.Linear(H + backbone_feat_dim + m_params, H),
             nn.LayerNorm(H), nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
             nn.Linear(H, m_params)
         )
 
-        # mémorise pour forward
-        self._feature_pool_mode = pool
-        self._H = H
 
     def _pool_features(self, latent: torch.Tensor) -> torch.Tensor:
-        # latent: [B, C, T]
         if self._feature_pool_mode == "avg":
             return self.feature_head(latent)
         if self._feature_pool_mode == "max":
             return self.feature_head(latent)
-        # avgmax: concat(AvgPool, MaxPool)
         avgp, maxp = self.feature_head
         a = avgp(latent).flatten(1)
         m = maxp(latent).flatten(1)
         return torch.cat([a, m], dim=1)
 
-    def forward(self, noisy, resid, params_pred_norm, cond_norm, feat_shared, t_step: int = 0):
-        x = torch.stack([noisy, resid], dim=1)  # [B, 2, N]
+
+    def forward(self, noisy, resid, params_pred_norm, cond_norm, feat_shared):
+        x = torch.stack([noisy, resid], dim=1)
         latent, _ = self.encoder(x)
         feat = self._pool_features(latent)
         h = self.shared_head(feat)
 
-        # ----- Time-step embedding + (optionnel) condition -----
-        B = h.size(0)
-        t_ids = torch.full((B,), int(t_step), device=h.device, dtype=torch.long)
-        tvec = self.time_embed(t_ids)  # [B, time_embed_dim]
-        cond_in = tvec if (cond_norm is None) else torch.cat([cond_norm, tvec], dim=1)
-        gamma_beta = self.film_time(cond_in)
+        # FiLM sans temps
+        if cond_norm is None:
+            raise RuntimeError("cond_norm ne doit pas être None quand FiLM est activé.")
+        gamma_beta = self.film_time(cond_norm)
         gamma, beta = gamma_beta[:, :h.shape[1]], gamma_beta[:, h.shape[1]:]
         h = h * (1 + 0.1 * gamma) + 0.1 * beta
 
-        gate = torch.sigmoid(self.scale_gate(h))          # [B, m_params]
+        gate = torch.sigmoid(self.scale_gate(h))
         scale = self.delta_scale * gate
 
         z = torch.cat([h, feat_shared, params_pred_norm], dim=1)
@@ -882,9 +1064,82 @@ class EfficientNetRefiner(nn.Module):
         return delta
 
 
-# ============================================================
-# 7) Modèle principal (+ Baseline Fix) + contrôles de STAGE & FiLM
-# ============================================================
+class ResidualBlock1D(nn.Module):
+    def __init__(self, c, k=7, d=1, p=None):
+        super().__init__()
+        if p is None: p = (k - 1) // 2 * d
+        self.block = nn.Sequential(
+            nn.Conv1d(c, c, kernel_size=k, padding=p, dilation=d, bias=False),
+            Norm1d(c),
+            SiLU(),
+            nn.Conv1d(c, c, kernel_size=1, bias=False),
+            Norm1d(c),
+        )
+        self.act = SiLU()
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+class Denoiser1D(nn.Module):
+    """
+    Débruiteur simple, *longueur conservée* (stride=1), sortie = correction du résidu.
+    """
+    def __init__(self, in_ch=1, base_ch=64, depth=6):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_ch, base_ch, kernel_size=7, padding=3, bias=False),
+            Norm1d(base_ch),
+            SiLU(),
+        )
+        blocks = []
+        # échelle de dilatations: 1,2,4,8... modérée
+        for i in range(depth):
+            d = 2**(i % 4)   # cycle 1,2,4,8
+            blocks.append(ResidualBlock1D(base_ch, k=7, d=d))
+        self.blocks = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(base_ch, 1, kernel_size=1, bias=True)
+
+    def forward(self, resid):    # resid: [B, N]  → correction: [B, N]
+        y = self.stem(resid.unsqueeze(1))
+        y = self.blocks(y)
+        y = self.head(y).squeeze(1)
+        return y
+
+
+def _design_poly3(n: int, device, dtype):
+    # colonnes: [1, x, x^2, x^3] avec x centré-échelonné pour stabilité
+    x = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype)
+    xc = x - x.mean()
+    X = torch.stack([torch.ones_like(xc), xc, xc**2, xc**3], dim=1)  # [N,4]
+    return X
+
+def baseline_poly3_from_edges(resid: torch.Tensor, left_frac: float = 0.20, right_start: float = 0.75):
+    """
+    resid: [B, N]  (résidu recon - cible)
+    Retourne: resid_corr [B,N] où un polynôme d'ordre 3 ajusté sur (0..20%) U (75..100%) a été soustrait.
+    """
+    B, N = resid.shape
+    device, dtype = resid.device, resid.dtype
+    Xfull = _design_poly3(N, device, resid.dtype)              # [N,4]
+    iL = torch.arange(0, max(1, int(N*left_frac)), device=device)
+    iR = torch.arange(int(N*right_start), N, device=device)
+    idx = torch.cat([iL, iR], dim=0)                           # [M]
+    X = Xfull[idx]                                             # [M,4]
+    # (X^T X)^{-1} X^T y, batched
+    Xt = X.t()                                                 # [4,M]
+    XtX = Xt @ X                                               # [4,4]
+    # régularisation légère pour stabilité
+    lam = 1e-6
+    XtX = XtX + lam * torch.eye(4, device=device, dtype=dtype)
+    XtX_inv = torch.linalg.inv(XtX)                            # [4,4]
+    P = XtX_inv @ Xt                                           # [4,M]
+    y_edges = resid[:, idx]                                    # [B,M]
+    coeff = (P @ y_edges.T).T                                  # [B,4]
+    baseline = (Xfull @ coeff.transpose(0,1)).transpose(0,1)   # [B,N]
+    resid_corr = resid - baseline
+    return resid_corr, baseline
+
+
 class PhysicallyInformedAE(pl.LightningModule):
     def __init__(
         self,
@@ -892,11 +1147,10 @@ class PhysicallyInformedAE(pl.LightningModule):
         param_names: List[str],
         poly_freq_CH4,
         transitions_dict,
-        ranges_train: dict | None = None,
-        ranges_val: dict | None = None,
-        noise_train: dict | None = None,
-        noise_val: dict | None = None,
-        # --- optims & pondérations ---
+        mlp_dropout: float = 0.10,
+        refiner_mlp_dropout: float = 0.10,
+
+        # --- optims & pondérations globales ---
         lr: float = 1e-4,
         alpha_param: float = 1.0,
         alpha_phys: float = 1.0,
@@ -917,13 +1171,13 @@ class PhysicallyInformedAE(pl.LightningModule):
         stage3_delta_scale: Optional[float] = 0.08,
         stage3_alpha_phys: Optional[float] = 0.7,
         stage3_alpha_param: Optional[float] = 0.3,
-        # --- reconstruction / pertes ---
+        # --- reconstruction / pertes (existantes) ---
         recon_max1: bool = False,
         corr_mode: str = "savgol",
         corr_savgol_win: int = 11,
         corr_savgol_poly: int = 3,
-        huber_beta: float = 0.002,  
-        weight_mf: float = 1.0,
+        huber_beta: float = 0.002,
+        weight_mf: float = 2.0,
         # --- EfficientNet backbone  ---
         backbone_variant: str = "s",
         refiner_variant: str  = "s",
@@ -939,7 +1193,24 @@ class PhysicallyInformedAE(pl.LightningModule):
         refiner_se_ratio: float = 0.25,
         refiner_feature_pool: str = "avg",
         refiner_shared_hidden_scale: float = 0.5,
-        refiner_time_embed_dim: int | None = None,
+        # --- PHYSIQUE / TIPS ---
+        tipspy: Tips2021QTpy | None = None,
+
+        # --- débruitage ---
+        use_denoiser: bool = False,
+        denoiser_lr: float = 1e-4,
+        denoiser_width: int = 64,
+
+        # --- nouveaux poids de pertes ---
+        w_pw_raw: float = 1.0,
+        w_pw_d1:  float = 0.5,
+        w_pw_d2:  float = 0.25,
+        w_corr_raw: float = 0.10,
+        w_corr_d1:  float = 0.05,
+        w_corr_d2:  float = 0.05,
+        w_js_raw: float = 0.10,
+        w_js_d1:  float = 0.00,
+        w_js_d2:  float = 0.00,
     ):
         super().__init__()
 
@@ -947,34 +1218,54 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.n_points = n_points
         self.poly_freq_CH4 = poly_freq_CH4
         self.transitions_dict = transitions_dict
-        self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4"])
+        self.tipspy = tipspy
+        self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4", "tipspy"])
+        self.mlp_dropout = float(mlp_dropout)
+        self.refiner_mlp_dropout = float(refiner_mlp_dropout)
 
-        # --- optims / pondérations ---
+        # --- optims / pondérations globales ---
         self.lr = float(lr)
-        self.alpha_param = float(alpha_param); self.alpha_phys = float(alpha_phys)
-        self.huber_beta = float(huber_beta)
+        self.alpha_param = float(alpha_param)
+        self.alpha_phys  = float(alpha_phys)
+        self.huber_beta  = float(huber_beta)
 
         # --- raffinement ---
         self.refine_steps = int(refine_steps)
         self.refine_target = refine_target.lower(); assert self.refine_target in {"noisy", "clean"}
         self.refine_warmup_epochs = int(refine_warmup_epochs)
-        self.freeze_base_epochs = int(freeze_base_epochs)
-        self.base_lr = float(base_lr) if base_lr is not None else self.lr
+        self.freeze_base_epochs   = int(freeze_base_epochs)
+        self.base_lr    = float(base_lr)    if base_lr    is not None else self.lr
         self.refiner_lr = float(refiner_lr) if refiner_lr is not None else self.lr
         self._froze_base = False
 
-        self.stage3_lr_shrink = float(stage3_lr_shrink)
-        self.stage3_refine_steps = stage3_refine_steps
+        self.stage3_lr_shrink   = float(stage3_lr_shrink)
+        self.stage3_refine_steps= stage3_refine_steps
         self.stage3_delta_scale = stage3_delta_scale
-        self.stage3_alpha_phys = stage3_alpha_phys
+        self.stage3_alpha_phys  = stage3_alpha_phys
         self.stage3_alpha_param = stage3_alpha_param
 
         # --- pertes / métriques ---
         self.weight_mf = float(weight_mf)
         self.corr_mode = str(corr_mode).lower()
-        self.corr_savgol_win = int(corr_savgol_win)
+        self.corr_savgol_win  = int(corr_savgol_win)
         self.corr_savgol_poly = int(corr_savgol_poly)
         self.recon_max1 = bool(recon_max1)
+
+        # --- poids de pertes ---
+        self.w_pw_raw  = float(w_pw_raw)
+        self.w_pw_d1   = float(w_pw_d1)
+        self.w_pw_d2   = float(w_pw_d2)
+        self.w_corr_raw= float(w_corr_raw)
+        self.w_corr_d1 = float(w_corr_d1)
+        self.w_corr_d2 = float(w_corr_d2)
+        self.w_js_raw  = float(w_js_raw)
+        self.w_js_d1   = float(w_js_d1)
+        self.w_js_d2   = float(w_js_d2)
+
+        # --- débruiteur (optionnel) ---
+        self.use_denoiser = bool(use_denoiser)
+        self.denoiser_lr = float(denoiser_lr)
+        self.denoiser = Denoiser1D(in_ch=1, base_ch=int(denoiser_width), depth=6)
 
         # --- paramètres à prédire / fournis ---
         if predict_params is None:
@@ -991,14 +1282,16 @@ class PhysicallyInformedAE(pl.LightningModule):
             self.film_params = list(film_params)
         bad = set(self.film_params) - set(self.param_names)
         assert not bad, f"film_params inconnus: {bad}"
-        not_provided = set(self.film_params) - set(self.provided_params)
-        assert not not_provided, f"film_params doit ⊆ provided_params; conflits: {not_provided}"
+
+        # ✓ Vérifier que film_params existe dans param_names (peut être prédit OU fourni)
+        missing_film = set(self.film_params) - set(self.param_names)
+        assert not missing_film, f"film_params inconnus dans param_names: {missing_film}"
 
         self.name_to_idx = {n: i for i, n in enumerate(self.param_names)}
         self.predict_idx = [self.name_to_idx[p] for p in self.predict_params]
         self.provided_idx = [self.name_to_idx[p] for p in self.provided_params]
 
-        # ===== Backbone EfficientNet 1D (expose width/depth/stem/drop/se) =====
+        # ===== Backbone EfficientNet 1D =====
         self.backbone = EfficientNetEncoder(
             in_channels=1,
             variant=backbone_variant,
@@ -1014,17 +1307,23 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.shared_head = nn.Sequential(
             nn.Linear(feat_dim, hidden),
             nn.LayerNorm(hidden), nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden), nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
         )
 
         self.cond_dim = len(self.film_params)
         if self.cond_dim > 0:
-            self.film = nn.Sequential(nn.Linear(self.cond_dim, hidden), nn.Tanh(), nn.Linear(hidden, 2 * hidden))
+            self.film = nn.Sequential(
+                nn.Linear(self.cond_dim, hidden),
+                nn.Tanh(),
+                nn.Dropout(self.mlp_dropout),
+                nn.Linear(hidden, 2 * hidden)
+            )
         else:
             self.film = None
 
-        # ----- FiLM runtime switches -----
         self.use_film = True
         if self.cond_dim > 0:
             self.register_buffer("film_mask", torch.ones(self.cond_dim))
@@ -1037,8 +1336,8 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             self.out_heads = nn.ModuleDict({p: nn.Linear(hidden, 1) for p in self.predict_params})
 
-        # ===== Refiner EfficientNet 1D (expose width/depth/stem/drop/se & tête) =====
-        self.refiner = EfficientNetRefiner(
+        # ===== Raffineurs B/C/D =====
+        base_refiner = EfficientNetRefiner(
             m_params=len(self.predict_params),
             cond_dim=self.cond_dim,
             backbone_feat_dim=self.backbone.feat_dim,
@@ -1052,26 +1351,88 @@ class PhysicallyInformedAE(pl.LightningModule):
             encoder_se_ratio=refiner_se_ratio,
             feature_pool=refiner_feature_pool,
             shared_hidden_scale=refiner_shared_hidden_scale,
-            time_embed_dim=refiner_time_embed_dim,
+            mlp_dropout=self.refiner_mlp_dropout
         )
+        self.refiner = base_refiner
+        self.cascade_stages = 3
+        extra_refiners = [
+            EfficientNetRefiner(
+                m_params=len(self.predict_params),
+                cond_dim=self.cond_dim,
+                backbone_feat_dim=self.backbone.feat_dim,
+                delta_scale=refine_delta_scale,
+                max_refine_steps=max(3, self.refine_steps if isinstance(self.refine_steps, int) else 3),
+                encoder_variant=refiner_variant,
+                encoder_width_mult=refiner_width_mult,
+                encoder_depth_mult=refiner_depth_mult,
+                encoder_stem_channels=refiner_stem_channels,
+                encoder_drop_path=refiner_drop_path,
+                encoder_se_ratio=refiner_se_ratio,
+                feature_pool=refiner_feature_pool,
+                shared_hidden_scale=refiner_shared_hidden_scale,
+                mlp_dropout=self.refiner_mlp_dropout
+            )
+            for _ in range(self.cascade_stages - 1)
+        ]
+        self.refiners = nn.ModuleList([base_refiner] + extra_refiners)
 
         # ===== ReLoBRaLo =====
         self.loss_names_params = [f"param_{p}" for p in self.predict_params]
         self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
-        self.loss_names_top = ["phys_mse", "phys_corr", "param_group"]
+        self.loss_names_top = ["phys_pointwise", "phys_shape", "param_group"]
         self.relo_top = ReLoBRaLoLoss(self.loss_names_top, alpha=0.9, tau=1.0, history_len=10)
 
-        # ----- Stage override (A/B1/B2) -----
+        # ----- Stage override -----
         self._override_stage: Optional[str] = None
         self._override_refine_steps: Optional[int] = None
         self._override_delta_scale: Optional[float] = None
 
+        # ----- Masques de raffinement -----
+        def _target_mask(names: List[str]) -> torch.Tensor:
+            m = torch.zeros(len(self.predict_params), dtype=torch.float32)
+            idxs = [self.predict_params.index(n) for n in names if n in self.predict_params]
+            if idxs:
+                m[torch.tensor(idxs, dtype=torch.long)] = 1.0
+            return m
+
+        base_targets = ["sig0", "dsig", "mf_CH4", "mf_H2O"]
+        pt_targets   = base_targets + ["P", "T"]
+
+        self.register_buffer("refine_mask_base", _target_mask(base_targets))
+        self.register_buffer("refine_mask_with_PT", _target_mask(pt_targets))
+
+    # ==== Helpers baseline poly3 sur bords ====
+    @staticmethod
+    def _design_poly3(n: int, device, dtype):
+        x = torch.linspace(0.0, 1.0, n, device=device, dtype=dtype)
+        xc = x - x.mean()
+        X = torch.stack([torch.ones_like(xc), xc, xc**2, xc**3], dim=1)  # [N,4]
+        return X
+
+    @classmethod
+    def _baseline_poly3_from_edges(cls, resid: torch.Tensor, left_frac: float = 0.20, right_start: float = 0.75):
+        B, N = resid.shape
+        device, dtype = resid.device, resid.dtype
+        Xfull = cls._design_poly3(N, device, dtype)                # [N,4]
+        iL = torch.arange(0, max(1, int(N*left_frac)), device=device)
+        iR = torch.arange(int(N*right_start), N, device=device)
+        idx = torch.cat([iL, iR], dim=0)                           # [M]
+        X = Xfull[idx]                                             # [M,4]
+        Xt = X.t()                                                 # [4,M]
+        XtX = Xt @ X                                               # [4,4]
+        XtX = XtX + 1e-6 * torch.eye(4, device=device, dtype=dtype)
+        P = torch.linalg.solve(XtX, Xt)                            # [4,M]
+        y_edges = resid[:, idx]                                    # [B,M]
+        coeff = (P @ y_edges.T).T                                  # [B,4]
+        baseline = (Xfull @ coeff.transpose(0,1)).transpose(0,1)   # [B,N]
+        resid_corr = resid - baseline
+        return resid_corr, baseline
 
     # ==== FiLM runtime control ====
     def set_film_usage(self, use: bool = True):
         self.use_film = bool(use)
-        if hasattr(self, "refiner") and hasattr(self.refiner, "use_film"):
-            self.refiner.use_film = self.use_film
+        for r in self.refiners:
+            r.use_film = self.use_film
 
     def set_film_subset(self, names=None):
         if self.cond_dim == 0 or self.film_mask is None: return
@@ -1084,18 +1445,14 @@ class PhysicallyInformedAE(pl.LightningModule):
                 if n in allowed: mask[i] = 1.0
         self.film_mask.copy_(mask)
 
-    # ==== Stage override ====
     def set_stage_mode(self, mode: Optional[str], refine_steps: Optional[int]=None, delta_scale: Optional[float]=None):
-        """
-        mode: None / 'A' / 'B1' / 'B2'
-        """
         if mode is not None:
-            mode = mode.upper(); assert mode in {'A','B1','B2'}
+            mode = mode.upper(); assert mode in {'A','B1','B2','DEN'}
         self._override_stage = mode
         self._override_refine_steps = refine_steps
         self._override_delta_scale = delta_scale
         if delta_scale is not None:
-            self.refiner.delta_scale = float(delta_scale)
+            for r in self.refiners: r.delta_scale = float(delta_scale)
         if refine_steps is not None:
             self.refine_steps = int(refine_steps)
 
@@ -1121,6 +1478,38 @@ class PhysicallyInformedAE(pl.LightningModule):
         feat = self.feature_head(latent) if pooled else latent
         return feat.detach() if detach else feat
 
+    def _make_condition_from_norm(self, params_true_norm: torch.Tensor) -> torch.Tensor | None:
+        if self.cond_dim == 0 or not self.use_film:
+            return None
+        
+        cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.film_params]
+        cond = torch.stack(cols, dim=1)
+        
+        if getattr(self, "film_mask", None) is not None and self.film_mask.numel() == cond.shape[1]:
+            cond = cond * self.film_mask.unsqueeze(0).to(device=cond.device, dtype=cond.dtype)
+        return cond
+
+    @torch.no_grad()
+    def _make_condition_from_phys(self, provided_phys: dict, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> torch.Tensor | None:
+        if self.cond_dim == 0 or not self.use_film:
+            return None
+        dev = device or (self.device if hasattr(self, "device") else next(self.parameters()).device)
+        missing = [n for n in self.film_params if n not in provided_phys]
+        if missing:
+            raise KeyError(f"Il manque des clés dans provided_phys pour FiLM: {missing}")
+        cols = []
+        for name in self.film_params:
+            t = provided_phys[name]
+            t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t)
+            if t.ndim == 0:  t = t.unsqueeze(0)
+            t = t.to(device=dev, dtype=dtype)
+            t_norm = norm_param_torch(name, t)
+            cols.append(t_norm)
+        cond = torch.stack(cols, dim=1)
+        if getattr(self, "film_mask", None) is not None and self.film_mask.numel() == cond.shape[1]:
+            cond = cond * self.film_mask.unsqueeze(0).to(device=cond.device, dtype=cond.dtype)
+        return cond
+
     # ---- (dé)normalisation & physique ----
     def _denorm_params_subset(self, y_norm_subset: torch.Tensor, names: List[str]) -> torch.Tensor:
         cols = [unnorm_param_torch(n, y_norm_subset[:, i]) for i, n in enumerate(names)]
@@ -1138,133 +1527,54 @@ class PhysicallyInformedAE(pl.LightningModule):
         v_grid_idx = torch.arange(self.n_points, dtype=torch.float64, device=device)
         b0_idx = self.name_to_idx['baseline0']
         baseline_coeffs = y_phys_full[:, b0_idx:b0_idx+3]
+
+        mf_dict = {}
+        for mol in self.transitions_dict.keys():
+            key = f"mf_{mol}"
+            mf_dict[mol] = p[key] if key in p else torch.zeros_like(p['P'])
+
         spectra, _ = batch_physics_forward_multimol_vgrid(
             p['sig0'], p['dsig'], self.poly_freq_CH4, v_grid_idx,
-            baseline_coeffs, self.transitions_dict, p['P'], p['T'], {'CH4': p['mf_CH4']}, device=device
+            baseline_coeffs, self.transitions_dict, p['P'], p['T'], mf_dict,
+            tipspy=self.tipspy, device=device
         )
         spectra = spectra.to(torch.float32)
-
         scale_recon = lowess_value(spectra, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
         spectra = spectra / scale_recon
         return spectra
 
-    # ---- FiLM conditions ----
-    def _make_condition_from_norm(self, params_true_norm: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.cond_dim == 0: return None
-        cols = [params_true_norm[:, self.name_to_idx[n]].unsqueeze(1) for n in self.film_params]
-        return torch.cat(cols, dim=1)
-
-    def _make_condition_from_phys(self, provided_phys: dict, device, dtype=torch.float32) -> Optional[torch.Tensor]:
-        if self.cond_dim == 0: return None
-        missing = [n for n in self.film_params if n not in provided_phys]
-        if missing: raise ValueError(f"FiLM: manquants dans provided_phys: {missing}")
-        cols = []
-        for n in self.film_params:
-            v = provided_phys[n].to(device)
-            if v.ndim > 1: v = v.view(-1)
-            cols.append(norm_param_torch(n, v).unsqueeze(1))
-        return torch.cat(cols, dim=1).to(dtype)
-
-    # ---- Baseline-fix utils ----
-    def _fit_residual_baseline_poly(self, resid: torch.Tensor, degree: int, sideband: int) -> torch.Tensor:
-        B, N = resid.shape
-        device = resid.device; dtype = resid.dtype
-        degree = int(max(0, min(2, degree)))
-        sideband = int(max(1, min(N//2, sideband)))
-        mask = torch.zeros(N, dtype=torch.bool, device=device)
-        mask[:sideband] = True; mask[N - sideband:] = True
-        x = torch.arange(N, device=device, dtype=dtype)
-        Xcols = [torch.ones_like(x)]
-        if degree >= 1: Xcols.append(x)
-        if degree >= 2: Xcols.append(x * x)
-        X = torch.stack(Xcols, dim=1)
-        Xm = X[mask]
-        Y  = resid[:, mask]
-        XtX = Xm.T @ Xm
-        XtX_inv = torch.linalg.pinv(XtX)
-        XtY = Xm.T @ Y.T
-        coeffs = (XtX_inv @ XtY).T
-        return coeffs
-
-    # ---------- Savitzky–Golay derivative (torch, no SciPy) ----------
-    def _savgol_coeffs(self, window_length: int, polyorder: int, deriv: int = 1, delta: float = 1.0,
-                       device=None, dtype=torch.float64) -> torch.Tensor:
-        """
-        Returns 1D convolution coefficients (length W) to estimate the 'deriv' derivative
-        at the window center, for uniform sampling step 'delta'.
-        """
+    # ---------- Savitzky–Golay derivative (torch) ----------
+    def _savgol_coeffs(self, window_length: int, polyorder: int, deriv: int = 1, delta: float = 1.0, device=None, dtype=torch.float64) -> torch.Tensor:
         assert deriv >= 0
         W = int(window_length)
         P = int(polyorder)
-        if W % 2 == 0: W += 1                  # make odd
+        if W % 2 == 0: W += 1
         if W < 3: W = 3
         if P >= W: P = W - 1
         m = (W - 1) // 2
-
         dev = device or self.device
-        x = torch.arange(-m, m + 1, device=dev, dtype=dtype)  # [-m..m], shape [W]
-        # Design matrix: A[i, j] = x_i^j, shape [W, P+1]
-        A = torch.stack([x**j for j in range(P + 1)], dim=1)  # [W, P+1]
-        pinv = torch.linalg.pinv(A)                            # [P+1, W]
-        # derivative at 0: d! * coefficient of x^d
-        coeff = math.factorial(deriv) * pinv[deriv, :] / (delta ** deriv)  # [W]
+        x = torch.arange(-m, m + 1, device=dev, dtype=dtype)
+        A = torch.stack([x**j for j in range(P + 1)], dim=1)
+        pinv = torch.linalg.pinv(A)
+        coeff = math.factorial(deriv) * pinv[deriv, :] / (delta ** deriv)
         return coeff.to(dtype=torch.float32)
 
     def _savgol_deriv(self, y: torch.Tensor, window_length: int, polyorder: int, deriv: int = 1) -> torch.Tensor:
-        """
-        Apply SG derivative filter with 'reflect' padding. y: [B, N] -> [B, N]
-        """
         B, N = y.shape
-        # make parameters safe vs N
         W = int(window_length)
         if W % 2 == 0: W += 1
         if W > N:
             W = N if (N % 2 == 1) else (N - 1)
         W = max(W, 3)
         P = min(int(polyorder), W - 1)
-
         coeff = self._savgol_coeffs(W, P, deriv=deriv, device=y.device, dtype=torch.float64)  # [W]
-        coeff = coeff.view(1, 1, -1)  # [out_ch, in_ch, W]
-
+        coeff = coeff.view(1, 1, -1)
         pad = (W - 1) // 2
-        y1 = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect")  # [B,1,N+2*pad]
-        out = F.conv1d(y1, coeff).squeeze(1)                    # [B, N]
+        y1 = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect")
+        out = F.conv1d(y1, coeff).squeeze(1)
         return out
 
-    def _dx(self, y: torch.Tensor) -> torch.Tensor:
-        """Central difference derivative, same length via interior points + pad endpoints."""
-        # interior: centered diff
-        d = 0.5 * (y[:, 2:] - y[:, :-2])  # [B, N-2]
-        # pad ends by replication to keep same length
-        left  = d[:, :1]
-        right = d[:, -1:]
-        return torch.cat([left, d, right], dim=1)
-
-    def _pearson_corr_loss(self, y_hat: torch.Tensor, y: torch.Tensor,
-                           eps: float = 1e-8,
-                           derivative: str | bool = False,
-                           savgol_win: int = 11,
-                           savgol_poly: int = 3) -> torch.Tensor:
-        """
-        Pearson correlation loss. If derivative:
-          - "none"/False : on raw signal
-          - True/"central": on central-diff derivative
-          - "savgol": on Savitzky–Golay derivative (window/poly configurable)
-        """
-        mode = derivative
-        if isinstance(derivative, bool):
-            mode = "central" if derivative else "none"
-        mode = (mode or "none").lower()
-
-        if mode == "central":
-            y_hat = self._dx(y_hat)
-            y     = self._dx(y)
-
-        elif mode in ("savgol", "sg", "savitzky_golay", "savitzky-golay"):
-            y_hat = self._savgol_deriv(y_hat, savgol_win, savgol_poly, deriv=1)
-            y     = self._savgol_deriv(y,     savgol_win, savgol_poly, deriv=1)
-        # else "none": raw
-
+    def _pearson_corr_basic(self, y_hat: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
         y_hat = y_hat.float(); y = y.float()
         y_hat_c = y_hat - y_hat.mean(dim=1, keepdim=True)
         y_c     = y - y.mean(dim=1, keepdim=True)
@@ -1273,6 +1583,24 @@ class PhysicallyInformedAE(pl.LightningModule):
         corr = num / den
         return (1.0 - corr).mean()
 
+    @staticmethod
+    def _to_pdf(y: torch.Tensor, smooth_win: int = 0, eps: float = 1e-12) -> torch.Tensor:
+        if smooth_win and smooth_win > 1:
+            pad = (smooth_win - 1) // 2
+            k = torch.ones(1, 1, smooth_win, device=y.device, dtype=y.dtype) / float(smooth_win)
+            yy = F.pad(y.unsqueeze(1), (pad, pad), mode="reflect")
+            y = F.conv1d(yy, k).squeeze(1)
+        y = y.clamp_min(0)
+        return y / (y.sum(dim=1, keepdim=True) + eps)
+
+    @staticmethod
+    def _kl(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        a = a.clamp_min(eps); b = b.clamp_min(eps)
+        return (a * (a.log() - b.log())).sum(dim=1)
+
+    def _js(self, p: torch.Tensor, q: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        m = 0.5 * (p + q)
+        return 0.5 * self._kl(p, m, eps) + 0.5 * self._kl(q, m, eps)
 
     # ---- training/validation step ----
     def _common_step(self, batch, step_name: str):
@@ -1281,15 +1609,13 @@ class PhysicallyInformedAE(pl.LightningModule):
         if scale is not None:
             scale = scale.to(clean.device)
 
-        # FiLM condition (norm)
         cond_norm = self._make_condition_from_norm(params_true_norm)
 
-        # Encode + prédiction initiale (normée)
         latent, _ = self.backbone(noisy.unsqueeze(1))
         feat_shared = self.feature_head(latent)
         params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
 
-        # Tenseur des paramètres "fournis" (physiques)
+        # Params "fournis"
         if len(self.provided_params) > 0:
             provided_cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.provided_params]
             provided_norm_tensor = torch.stack(provided_cols, dim=1)
@@ -1306,48 +1632,80 @@ class PhysicallyInformedAE(pl.LightningModule):
 
         target_for_resid = noisy if self.refine_target == "noisy" else clean
 
-        # Boucle de raffinement (avec échelles par-paramètre prises en charge dans le raffineur)
-        # ======= BOUCLE DE RAFFINEMENT AVEC t_step =======
+        # === CASCADE B→C→D (résidu corrigé baseline, puis éventuellement débruité) ===
+        n_stages = min(effective_refine_steps, len(self.refiners))
+        mask_now = self.refine_mask_base.to(clean.device, dtype=params_pred_norm.dtype)
+
         spectra_recon = None
-        for s in range(effective_refine_steps):
+        for k in range(n_stages):
             pred_phys  = self._denorm_params_subset(params_pred_norm, self.predict_params)
             y_phys_full= self._compose_full_phys(pred_phys, provided_phys_tensor)
             spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
-            resid = spectra_recon - target_for_resid
 
-            # Raffineur → delta par paramètre (bounded + scaled inside)
-            delta = self.refiner(
+            resid = spectra_recon - target_for_resid
+            resid_corr, _ = self._baseline_poly3_from_edges(resid, left_frac=0.20, right_start=0.75)
+
+            # résidu pour le raffineur (optionnellement débruité)
+            resid_for_refiner = resid_corr
+            if self.use_denoiser and self._override_stage in (None, 'B1', 'B2'):
+                with torch.no_grad():  # gel pendant B/C/D
+                    resid_for_refiner = self.denoiser(resid_corr)
+
+            delta = self.refiners[k](
                 noisy=noisy,
-                resid=resid,
+                resid=resid_for_refiner,
                 params_pred_norm=params_pred_norm,
                 cond_norm=cond_norm,
                 feat_shared=feat_shared,
-                t_step=s,                    
             )
-            params_pred_norm = (params_pred_norm + delta).clamp(1e-4, 1-1e-4)
+
+            params_pred_norm = (params_pred_norm + delta * mask_now).clamp(1e-4, 1-1e-4)
 
         # Reconstruction finale
         pred_phys   = self._denorm_params_subset(params_pred_norm, self.predict_params)
         y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
         spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
 
-        # --- Pertes physiques : MSE + Huber (mélangées) + corrélation dérivée/SG si activée ---
-        #loss_phys_mse   = F.mse_loss(spectra_recon, clean)
-        loss_phys_huber = F.smooth_l1_loss(spectra_recon, clean, beta=self.huber_beta)
-        loss_phys_comb  = loss_phys_huber 
+        # ================== PERTES PHYSIQUES ==================
+        yh  = spectra_recon
+        yt  = clean
+        d1h = self._savgol_deriv(yh, self.corr_savgol_win, self.corr_savgol_poly, deriv=1)
+        d1t = self._savgol_deriv(yt, self.corr_savgol_win, self.corr_savgol_poly, deriv=1)
+        d2h = self._savgol_deriv(yh, self.corr_savgol_win, self.corr_savgol_poly, deriv=2)
+        d2t = self._savgol_deriv(yt, self.corr_savgol_win, self.corr_savgol_poly, deriv=2)
 
-        loss_phys_corr = self._pearson_corr_loss(
-            spectra_recon, clean,
-            derivative=self.corr_mode,
-            savgol_win=self.corr_savgol_win,
-            savgol_poly=self.corr_savgol_poly
-        )
+        loss_pw_raw = self.w_pw_raw * F.mse_loss(yh,  yt)
+        loss_pw_d1  = self.w_pw_d1  * F.mse_loss(d1h, d1t)
+        loss_pw_d2  = self.w_pw_d2  * F.mse_loss(d2h, d2t)
+        loss_phys_pointwise = loss_pw_raw + loss_pw_d1 + loss_pw_d2
 
-        # --- Pertes paramètres (groupe ReLoBRaLo inchangé) ---
+        loss_corr_raw = self.w_corr_raw * self._pearson_corr_basic(yh,  yt)
+        loss_corr_d1  = self.w_corr_d1  * self._pearson_corr_basic(d1h, d1t)
+        loss_corr_d2  = self.w_corr_d2  * self._pearson_corr_basic(d2h, d2t)
+        loss_phys_corr = loss_corr_raw + loss_corr_d1 + loss_corr_d2
+
+        pdf_h  = self._to_pdf(yh)
+        pdf_t  = self._to_pdf(yt)
+        loss_js_raw = self.w_js_raw * self._js(pdf_h, pdf_t).mean()
+        loss_js_d1 = torch.tensor(0.0, device=yh.device)
+        loss_js_d2 = torch.tensor(0.0, device=yh.device)
+        if self.w_js_d1 > 0:
+            pdf_d1h = self._to_pdf(d1h.abs())
+            pdf_d1t = self._to_pdf(d1t.abs())
+            loss_js_d1 = self.w_js_d1 * self._js(pdf_d1h, pdf_d1t).mean()
+        if self.w_js_d2 > 0:
+            pdf_d2h = self._to_pdf(d2h.abs())
+            pdf_d2t = self._to_pdf(d2t.abs())
+            loss_js_d2 = self.w_js_d2 * self._js(pdf_d2h, pdf_d2t).mean()
+
+        loss_phys_js = loss_js_raw + loss_js_d1 + loss_js_d2
+        loss_phys_shape = loss_phys_corr + loss_phys_js
+
+        # ================== PERTES PARAMÈTRES ==================
         per_param_losses = []
         for j, name in enumerate(self.predict_params):
             true_j = params_true_norm[:, self.name_to_idx[name]]
-            mult = self.weight_mf if name == "mf_CH4" else 1.0
+            mult = self.weight_mf if name in ("mf_CH4", "mf_H2O") else 1.0
             lp = mult * F.mse_loss(params_pred_norm[:, j], true_j)
             per_param_losses.append(lp)
 
@@ -1359,57 +1717,125 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             loss_param_group = torch.tensor(0.0, device=clean.device)
 
-        # --- Agrégation top (garde 3 têtes pour rester compatible avec self.relo_top) ---
-        top_vec = torch.stack([loss_phys_comb, loss_phys_corr, loss_param_group])  # [phys, corr, params]
+        # ================== AGRÉGATION TOP (ReLoBRaLo) ==================
+        top_vec = torch.stack([loss_phys_pointwise, loss_phys_shape, loss_param_group])
         w_top = self.relo_top.compute_weights(top_vec)
         priors_top = torch.tensor([self.alpha_phys, self.alpha_phys, self.alpha_param],
-                                device=top_vec.device, dtype=top_vec.dtype)
+                                  device=top_vec.device, dtype=top_vec.dtype)
         w_top = w_top * priors_top
         w_top = 3.0 * w_top / (w_top.sum() + 1e-12)
-        loss = torch.sum(w_top * top_vec)
+        loss_main = torch.sum(w_top * top_vec)
 
-        # Logs
+        # ======== Perte débruiteur (stage DEN uniquement) ========
+        if self._override_stage == 'DEN':
+            resid_den = spectra_recon - noisy
+            resid_den_corr, _ = self._baseline_poly3_from_edges(resid_den, left_frac=0.20, right_start=0.75)
+            resid_clean = spectra_recon - clean
+            resid_clean_corr, _ = self._baseline_poly3_from_edges(resid_clean, left_frac=0.20, right_start=0.75)
+            resid_hat = self.denoiser(resid_den_corr)
+            denoiser_loss = F.mse_loss(resid_hat, resid_clean_corr)
+            loss = denoiser_loss
+            self.log(f"{step_name}_loss_denoiser", denoiser_loss, on_epoch=True, sync_dist=True)
+        else:
+            loss = loss_main
+
+        # ================== LOGS ==================
         self.log(f"{step_name}_loss", loss, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_phys_huber",loss_phys_huber, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_phys_corr", loss_phys_corr,  on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_phys_pointwise", loss_phys_pointwise, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_pw_raw", loss_pw_raw, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_pw_d1",  loss_pw_d1,  on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_pw_d2",  loss_pw_d2,  on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_phys_corr", loss_phys_corr, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_corr_raw", loss_corr_raw, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_corr_d1",  loss_corr_d1,  on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_corr_d2",  loss_corr_d2,  on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_phys_js", loss_phys_js, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_js_raw", loss_js_raw, on_epoch=True, sync_dist=True)
+        if self.w_js_d1 > 0:
+            self.log(f"{step_name}_loss_js_d1", loss_js_d1, on_epoch=True, sync_dist=True)
+        if self.w_js_d2 > 0:
+            self.log(f"{step_name}_loss_js_d2", loss_js_d2, on_epoch=True, sync_dist=True)
         self.log(f"{step_name}_loss_param_group", loss_param_group, on_epoch=True, sync_dist=True)
         if len(per_param_losses) > 0:
             self.log(f"{step_name}_loss_param", torch.stack(per_param_losses).mean(), on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_phys",        w_top[0], on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_phys_corr",   w_top[1], on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_param_group", w_top[2], on_epoch=True, sync_dist=True)
         for j, name in enumerate(self.predict_params):
             self.log(f"{step_name}_loss_param_{name}", per_param_losses[j], on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_w_top_pointwise", w_top[0], on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_w_top_shape",     w_top[1], on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_w_top_param",     w_top[2], on_epoch=True, sync_dist=True)
 
         return loss
 
+    def training_step(self, batch, batch_idx):
+        return self._common_step(batch, "train")
 
-    def training_step(self, batch, batch_idx): return self._common_step(batch, "train")
-    def validation_step(self, batch, batch_idx): self._common_step(batch, "val")
+    def validation_step(self, batch, batch_idx):
+        self._common_step(batch, "val")
 
     def on_train_epoch_start(self):
-        # Stage override : si défini, on ignore le scheduler A/B1/B2 basé sur epochs
-        if self._override_stage is not None:
-            stage = self._override_stage
-            if stage == 'A':
-                self._set_requires_grad(self.refiner, False)
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], True)
-            elif stage == 'B1':
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], False)
-                self._set_requires_grad(self.refiner, True)
-            elif stage == 'B2':
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film, self.refiner], True)
-            return
+        def _freeze(mod, on: bool):
+            if mod is None: return
+            if isinstance(mod, nn.ModuleList):
+                mods = list(mod)
+            else:
+                mods = [mod]
+            for m in mods:
+                if m is None: continue
+                for p in m.parameters(): p.requires_grad_(on)
 
-        # sinon: plan automatique (optionnel si tu utilises un seul fit)
+        if self._override_stage is not None:
+            st = self._override_stage
+
+            if st == 'A':
+                _freeze(self.backbone, True)
+                _freeze(self.shared_head, True)
+                _freeze(getattr(self, "out_head", None), True)
+                if hasattr(self, "out_heads"):
+                    for _n, head in self.out_heads.items(): _freeze(head, True)
+                _freeze(self.film, True)
+                _freeze(self.refiners, False)
+                _freeze(self.denoiser, False)     # pas d'entraînement du denoiser pendant A
+                return
+
+            if st == 'DEN':
+                _freeze(self.backbone, False)
+                _freeze(self.shared_head, False)
+                _freeze(getattr(self, "out_head", None), False)
+                if hasattr(self, "out_heads"):
+                    for _n, head in self.out_heads.items(): _freeze(head, False)
+                _freeze(self.film, False)
+                _freeze(self.refiners, False)
+                _freeze(self.denoiser, True)      # on n’entraîne QUE le denoiser
+                return
+
+            if st == 'B1':
+                _freeze(self.backbone, False)
+                _freeze(self.shared_head, False)
+                _freeze(getattr(self, "out_head", None), False)
+                if hasattr(self, "out_heads"):
+                    for _n, head in self.out_heads.items(): _freeze(head, False)
+                _freeze(self.film, False)
+                _freeze(self.refiners, True)      # on entraîne les raffineurs
+                _freeze(self.denoiser, False)     # denoiser gelé (utilisable si use_denoiser=True)
+                return
+
+            if st == 'B2':
+                _freeze(self.backbone, True)
+                _freeze(self.shared_head, True)
+                _freeze(getattr(self, "out_head", None), True)
+                if hasattr(self, "out_heads"):
+                    for _n, head in self.out_heads.items(): _freeze(head, True)
+                _freeze(self.film, True)
+                _freeze(self.refiners, True)
+                _freeze(self.denoiser, True)
+                return
+
+        # --- fallback: planning en 3 phases (A warmup → B → B2) ---
         e = self.current_epoch
         stage3_start = self.refine_warmup_epochs + self.freeze_base_epochs
 
         if e < self.refine_warmup_epochs:
-            self._set_requires_grad(self.refiner, False)
+            self._set_requires_grad(self.refiners, False)
             self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
                                      getattr(self, "out_heads", None), self.film], True)
             self._froze_base = False
@@ -1417,48 +1843,50 @@ class PhysicallyInformedAE(pl.LightningModule):
             if not self._froze_base:
                 self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
                                          getattr(self, "out_heads", None), self.film], False)
-                self._set_requires_grad(self.refiner, True)
+                self._set_requires_grad(self.refiners, True)
                 self._froze_base = True
         else:
             self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                     getattr(self, "out_heads", None), self.film, self.refiner], True)
+                                     getattr(self, "out_heads", None), self.film, self.refiners], True)
             if e == stage3_start:
                 if hasattr(self.trainer, "optimizers") and len(self.trainer.optimizers) > 0:
                     opt = self.trainer.optimizers[0]
                     for pg in opt.param_groups: pg["lr"] *= self.stage3_lr_shrink
                 if self.stage3_refine_steps is not None: self.refine_steps = int(self.stage3_refine_steps)
-                if self.stage3_delta_scale is not None: self.refiner.delta_scale = float(self.stage3_delta_scale)
+                if self.stage3_delta_scale is not None:
+                    for r in self.refiners: r.delta_scale = float(self.stage3_delta_scale)
                 if self.stage3_alpha_phys is not None:  self.alpha_phys = float(self.stage3_alpha_phys)
                 if self.stage3_alpha_param is not None: self.alpha_param = float(self.stage3_alpha_param)
 
     def _set_requires_grad(self, modules, flag: bool):
         if modules is None: return
+        if isinstance(modules, nn.ModuleList):
+            modules = list(modules)
         if not isinstance(modules, (list, tuple)): modules = [modules]
         for m in modules:
             if m is None: continue
             for p in m.parameters(): p.requires_grad_(flag)
 
     def configure_optimizers(self):
-        # --- groupes de paramètres (comme dans ton code) ---
         base_params = list(self.backbone.parameters()) + list(self.shared_head.parameters())
         if hasattr(self, "out_head"):  base_params += list(self.out_head.parameters())
         if hasattr(self, "out_heads"): base_params += list(self.out_heads.parameters())
         if self.film is not None:      base_params += list(self.film.parameters())
-        refiner_params = list(self.refiner.parameters())
+        refiner_params = list(self.refiners.parameters())
 
         param_groups = [
             {"params": base_params,    "lr": float(getattr(self, "base_lr", self.lr))},
             {"params": refiner_params, "lr": float(getattr(self, "refiner_lr", self.lr))},
         ]
+        if getattr(self, "use_denoiser", False):
+            param_groups.append({"params": self.denoiser.parameters(), "lr": float(self.denoiser_lr)})
 
-        # --- sélection d'optimiseur ---
         opt_name = getattr(self.hparams, "optimizer", "adamw").lower()
         weight_decay = getattr(self, "weight_decay", 1e-4)
 
         if opt_name == "adamw":
             optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
         elif opt_name == "lion":
-            # betas par défaut Lion : (0.9, 0.99); tu peux les passer via self.hparams.betas si tu veux
             betas = getattr(self.hparams, "betas", (0.9, 0.99))
             optimizer = Lion(param_groups, betas=betas, weight_decay=weight_decay)
         elif opt_name == "radam":
@@ -1470,14 +1898,11 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             raise ValueError(f"Unknown optimizer: {opt_name}")
 
-        # --- scheduler identique à avant ---
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs if self.trainer is not None else 100,
-            eta_min=1e-11
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=10, T_mult=2, eta_min=1e-7
         )
+    
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
-
 
     @torch.no_grad()
     def infer(
@@ -1488,122 +1913,215 @@ class PhysicallyInformedAE(pl.LightningModule):
         refine: bool = True,
         resid_target: str = "input",
         scale: Optional[torch.Tensor] = None,
+        recon_PT: str = "pred",             # "pred" | "exp"
+        Pexp: Optional[torch.Tensor] = None,
+        Texp: Optional[torch.Tensor] = None,
+        cascade_stages_override: Optional[int] = None,
     ):
-        """
-        Inférence cohérente avec la pipeline de normalisation:
-
-        - 'spectra' (noisy) est déjà normalisé en entrée (par fenêtre gaussienne OU LOWESS),
-        on NE le re-normalise PAS ici.
-        - La reconstruction physique est renvoyée avec max(recon)=1 (cf. self.recon_max1=True).
-        - Le résidu utilisé par le raffineur est: recon(max=1) - spectra(normalisé).
-
-        Args:
-            spectra        : [B, N] (noisy déjà normalisé au chargement des données)
-            provided_phys  : dict des paramètres fournis (doit couvrir self.provided_params)
-            refine         : active le raffineur si True
-            resid_target   : "input"/"noisy" => cible du résidu = 'spectra' tel quel ; autre => pas de raffinage
-            scale          : ignoré ici (compat), conservé pour rétro-compatibilité
-
-        Returns:
-            dict:
-                - "params_pred_norm": [B, len(predict_params)] (dans [0,1])
-                - "y_phys_full"    : [B, len(PARAMS)] (physiques dénormalisés)
-                - "spectra_recon"  : [B, N] (reconstruction physique à max=1)
-                - "norm_scale"     : [B]    échelle d'entrée estimée (info/log uniquement)
-        """
         self.eval()
         device = spectra.device
         B = spectra.shape[0]
 
-        # 1) Vérif couverture des paramètres fournis
+        if recon_PT not in ("pred", "exp"):
+            raise ValueError("recon_PT doit être 'pred' ou 'exp'.")
+        if recon_PT == "exp":
+            if Pexp is None or Texp is None:
+                raise ValueError("En mode recon_PT='exp', fournir Pexp et Texp.")
+            Pexp = torch.as_tensor(Pexp, device=device, dtype=torch.float32).view(B)
+            Texp = torch.as_tensor(Texp, device=device, dtype=torch.float32).view(B)
+
         missing = [n for n in self.provided_params if n not in provided_phys]
         assert not missing, f"Manque des paramètres fournis: {missing}"
 
-        # 2) Condition FiLM (normalisée) depuis 'provided_phys'
         cond_norm = self._make_condition_from_phys(provided_phys, device, dtype=torch.float32)
 
-        # 3) Prédiction initiale (normée) depuis l'encodeur
         latent, _ = self.backbone(spectra.unsqueeze(1))
         feat_shared = self.feature_head(latent)
         params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
 
-        # 4) Tensor des paramètres fournis (physiques)
         if len(self.provided_params) > 0:
             provided_list = [provided_phys[n].to(device) for n in self.provided_params]
             provided_phys_tensor = torch.stack(provided_list, dim=1)
         else:
             provided_phys_tensor = params_pred_norm.new_zeros((B, 0))
 
-        # 5) Cible du résidu: on prend 'spectra' tel quel (déjà normalisé en amont)
         spectra_target = spectra if resid_target in ("input", "noisy") else None
-
-        # 6) Estimation d'échelle d'entrée (info/log) avec le MÊME estimateur que le dataset
         scale_est = lowess_value(spectra, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
 
-        # 7) Boucle de raffinement optionnelle
-        if refine and self.refine_steps > 0:
-            for s in range(self.refine_steps):
-                pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
-                y_full    = self._compose_full_phys(pred_phys, provided_phys_tensor)
-                recon     = self._physics_reconstruction(y_full, device, scale=None)  # max=1
+        def _compose_full_with_PT_override(pred_norm_subset: torch.Tensor) -> torch.Tensor:
+            pred_phys_subset = self._denorm_params_subset(pred_norm_subset, self.predict_params)
+            y_full = self._compose_full_phys(pred_phys_subset, provided_phys_tensor)
+            if recon_PT == "exp":
+                idxP = self.name_to_idx.get("P", None)
+                idxT = self.name_to_idx.get("T", None)
+                if idxP is not None: y_full[:, idxP] = Pexp
+                if idxT is not None: y_full[:, idxT] = Texp
+            return y_full
 
+        # masque de raffinement
+        if recon_PT == "exp":
+            mask_now = self.refine_mask_with_PT.to(device, dtype=params_pred_norm.dtype)
+        else:
+            mask_now = self.refine_mask_base.to(device, dtype=params_pred_norm.dtype)
+
+        # cascade
+        n_stages = cascade_stages_override if cascade_stages_override is not None else self.cascade_stages
+        n_stages = max(1, min(int(n_stages), len(self.refiners)))
+
+        if refine and n_stages > 0:
+            for k in range(n_stages):
+                y_full_k = _compose_full_with_PT_override(params_pred_norm)
+                recon_k  = self._physics_reconstruction(y_full_k, device, scale=None)
                 if spectra_target is None:
                     break
+                resid = recon_k - spectra_target
+                resid_corr, _ = self._baseline_poly3_from_edges(resid, left_frac=0.20, right_start=0.75)
 
-                resid = recon - spectra_target  # résidu dans le repère cohérent
+                resid_for_refiner = resid_corr
+                if self.use_denoiser:
+                    resid_for_refiner = self.denoiser(resid_corr)
 
-                delta = self.refiner(
+                delta_k = self.refiners[k](
                     noisy=spectra,
-                    resid=resid,
+                    resid=resid_for_refiner,
                     params_pred_norm=params_pred_norm,
                     cond_norm=cond_norm,
                     feat_shared=feat_shared,
-                    t_step=s,                
                 )
-                params_pred_norm = params_pred_norm.add(delta).clamp(1e-4, 1-1e-4)
 
-        # 8) Passage final par la physique
-        pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
-        y_full    = self._compose_full_phys(pred_phys, provided_phys_tensor)
-        recon     = self._physics_reconstruction(y_full, device, scale=None)  
+                params_pred_norm = params_pred_norm.add(delta_k * mask_now).clamp(1e-4, 1-1e-4)
+
+        y_full_final = _compose_full_with_PT_override(params_pred_norm)
+        recon_final  = self._physics_reconstruction(y_full_final, device, scale=None)
 
         return {
             "params_pred_norm": params_pred_norm,
-            "y_phys_full": y_full,
-            "spectra_recon": recon,
+            "y_phys_full": y_full_final,
+            "spectra_recon": recon_final,
             "norm_scale": scale_est,
         }
-
 
 # ============================================================
 # 8) Callbacks visu & epoch sync dataset
 # ============================================================
-class PlotAndMetricsCallback(Callback):
+class StageAwarePlotCallback(pl.Callback):
     """
-    Génère des figures et les sauvegarde en PNG à la fin de chaque epoch de validation.
-    - Aucune dépendance à IPython
-    - Rank 0 uniquement (multi-noeuds / multi-GPU safe)
-    - Dossier de sortie: ./figs_<SLURM_JOB_ID>/ par défaut
+    Callback de visualisation conscient de l'étape:
+      - A  : refine=False
+      - B1 : refine=True, cascade_stages_override=k+1
+      - B2 : refine=True, cascade_stages_override=3 (par défaut)
     """
-    def __init__(self, val_loader, param_names, num_examples: int = 1,
-                 save_dir: str | None = None, stage_tag: str | None = None):
+    def __init__(self, val_loader, param_names, *,
+                 num_examples: int = 1,
+                 save_dir: str | None = None,
+                 stage_tag: str = "stage",
+                 refine: bool = True,
+                 cascade_stages_override: int | None = None,
+                 use_gt_for_provided: bool = True,
+                 recon_PT: str = "pred",           # "pred" | "exp"
+                 Pexp: torch.Tensor | None = None,
+                 Texp: torch.Tensor | None = None,
+                 max_val_batches: int | None = None  # NEW: limite optionnelle
+                 ):
         super().__init__()
         self.val_loader = val_loader
         self.param_names = list(param_names)
         self.num_examples = int(num_examples)
-        if save_dir is None:
-            job_id = os.environ.get("SLURM_JOB_ID", "local")
-            save_dir = f"./figs_{job_id}"
-        self.stage_tag = stage_tag or "stage"
-        self.save_dir = os.path.join(save_dir, self.stage_tag)
+        job = os.environ.get("SLURM_JOB_ID", "local")
+        root = f"./figs_{job}" if save_dir is None else save_dir
+        self.stage_tag = stage_tag
+        self.save_dir = os.path.join(root, self.stage_tag)
+
+        self.refine = bool(refine)
+        self.cascade_stages_override = cascade_stages_override
+        self.use_gt_for_provided = bool(use_gt_for_provided)
+        self.recon_PT = recon_PT
+        self.Pexp, self.Texp = Pexp, Texp
+        self.max_val_batches = None if max_val_batches is None else int(max_val_batches)  # NEW
+
+    # NEW: petit utilitaire pour denormaliser un sous-ensemble dans l'ordre donné
+    def _denorm_subset(self, pl_module, y_norm: torch.Tensor, names: list[str]) -> torch.Tensor:
+        return pl_module._denorm_params_subset(y_norm, names)
+
+    # NEW: calcule MSE global et erreur moyenne (%) par paramètre sur tout le val_loader
+    @torch.no_grad()
+    def _compute_val_stats(self, pl_module) -> tuple[float, dict]:
+        device = pl_module.device
+        pred_names = list(getattr(pl_module, "predict_params", []))
+        if len(pred_names) == 0:
+            return float("nan"), {}
+
+        # Accumulateurs
+        mse_sum = 0.0
+        n_points_total = 0
+        err_sum = {p: 0.0 for p in pred_names}
+        err_cnt = 0
+        eps = 1e-12
+
+        for b_idx, batch in enumerate(self.val_loader):
+            noisy  = batch['noisy_spectra'].to(device)
+            clean  = batch['clean_spectra'].to(device)
+            p_norm = batch['params'].to(device)
+            B, N = noisy.shape
+
+            # provided_phys (GT) si demandé
+            provided_phys = {}
+            if self.use_gt_for_provided:
+                for name in getattr(pl_module, "provided_params", []):
+                    idx = pl_module.name_to_idx[name]
+                    v_phys = self._denorm_subset(pl_module, p_norm[:, idx].unsqueeze(1), [name])[:, 0]
+                    provided_phys[name] = v_phys
+
+            # infer avec les mêmes options que le panneau de visu
+            out = pl_module.infer(
+                noisy,
+                provided_phys=provided_phys,
+                refine=self.refine,
+                resid_target="input",
+                recon_PT=self.recon_PT,
+                Pexp=self.Pexp, Texp=self.Texp,
+                cascade_stages_override=self.cascade_stages_override,
+            )
+            recon = out["spectra_recon"]               # [B, N]
+            y_full_pred = out["y_phys_full"]           # [B, M]
+
+            # --- MSE global (sur tout le batch)
+            diff = (recon - clean).float()
+            mse_sum += float((diff * diff).sum().item())
+            n_points_total += B * N
+
+            # --- Erreurs % par paramètre
+            # GT (dénorm) pour les paramètres prédits
+            true_cols = [p_norm[:, pl_module.name_to_idx[n]] for n in pred_names]
+            true_norm_subset = torch.stack(true_cols, dim=1)                   # [B, P]
+            true_phys = self._denorm_subset(pl_module, true_norm_subset, pred_names)  # [B, P]
+
+            # Pred (dénorm) extraits de y_full_pred
+            pred_phys = torch.stack([y_full_pred[:, pl_module.name_to_idx[n]] for n in pred_names], dim=1)  # [B, P]
+
+            denom = torch.clamp(true_phys.abs(), min=eps)
+            err_pct = 100.0 * (pred_phys - true_phys).abs() / denom           # [B, P]
+
+            for j, name in enumerate(pred_names):
+                err_sum[name] += float(err_pct[:, j].sum().item())
+            err_cnt += B
+
+            # Option: limiter le coût si max_val_batches est fixé
+            if self.max_val_batches is not None and (b_idx + 1) >= self.max_val_batches:
+                break
+
+        mse_global = mse_sum / max(1, n_points_total)
+        mean_pct = {k: (v / max(1, err_cnt)) for k, v in err_sum.items()}
+        return mse_global, mean_pct
 
     @torch.no_grad()
     def on_validation_epoch_end(self, trainer, pl_module):
-        if not is_rank0():  # ne trace qu'une fois
+        if not is_rank0():
             return
-
         pl_module.eval()
         device = pl_module.device
+
+        # ---------- (A) Un exemple pour la figure principale ----------
         try:
             batch = next(iter(self.val_loader))
         except StopIteration:
@@ -1613,51 +2131,50 @@ class PlotAndMetricsCallback(Callback):
         clean  = batch['clean_spectra'][:self.num_examples].to(device)
         params_true_norm = batch['params'][:self.num_examples].to(device)
 
-        # Construire le dict des paramètres "fournis" (cohérent avec le modèle)
         provided_phys = {}
-        for name in getattr(pl_module, "provided_params", []):
-            idx = pl_module.name_to_idx[name]
-            v_norm = params_true_norm[:, idx]
-            v_phys = pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
-            provided_phys[name] = v_phys
+        if self.use_gt_for_provided:
+            for name in getattr(pl_module, "provided_params", []):
+                idx = pl_module.name_to_idx[name]
+                v_norm = params_true_norm[:, idx]
+                v_phys = pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
+                provided_phys[name] = v_phys
 
-        out = pl_module.infer(noisy, provided_phys=provided_phys, refine=True, resid_target="input")
+        out = pl_module.infer(
+            noisy, provided_phys=provided_phys,
+            refine=self.refine,
+            resid_target="input",
+            recon_PT=self.recon_PT,
+            Pexp=self.Pexp, Texp=self.Texp,
+            cascade_stages_override=self.cascade_stages_override,
+        )
+
         spectra_recon = out["spectra_recon"].detach().cpu()
-
         noisy_cpu, clean_cpu = noisy.detach().cpu(), clean.detach().cpu()
         x = np.arange(clean_cpu.shape[1])
 
-        # Récup métriques (safe)
+        # ---------- (B) Statistiques globales sur tout le val_loader ----------
+        val_mse, mean_pct = self._compute_val_stats(pl_module)   # NEW
+
+        # --- métriques Lightning (déjà loggées)
         m = trainer.callback_metrics
         def get_metric(name, default="-"):
             v = m.get(name, None)
             try: return f"{float(v):.6g}"
             except Exception: return default
 
-        val_loss        = get_metric("val_loss")
-        val_phys_huber  = get_metric("val_loss_phys_huber")
-        val_phys_corr   = get_metric("val_loss_phys_corr")
-        val_param_group = get_metric("val_loss_param_group")
-        train_loss      = get_metric("train_loss")
-
-        per_param_lines = []
-        for p in getattr(pl_module, "predict_params", self.param_names):
-            per_param_lines.append(f"{p:10s} : {get_metric(f'val_loss_param_{p}')}")
-        per_param_text = "\n".join(per_param_lines)
-
-        # Figure compacte avec specs + résidus + tableau de métriques
+        # ---------- (C) Figure ----------
         fig = plt.figure(figsize=(11, 6), constrained_layout=True)
         gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1.8], height_ratios=[3, 1], hspace=0.25, wspace=0.3)
         ax_spec = fig.add_subplot(gs[0, 0])
         ax_res  = fig.add_subplot(gs[1, 0], sharex=ax_spec)
         ax_tbl  = fig.add_subplot(gs[:, 1]); ax_tbl.axis("off")
 
-        i = 0  # on trace le premier exemple (tu peux faire une boucle si tu veux en sauver plusieurs)
-        ax_spec.plot(x, noisy_cpu[i],         label="Noisy",       lw=1, alpha=0.7)
-        ax_spec.plot(x, clean_cpu[i],         label="Clean (réel)",lw=1.5)
-        ax_spec.plot(x, spectra_recon[i],     label="Reconstruit", lw=1.2, ls="--")
+        i = 0
+        ax_spec.plot(x, noisy_cpu[i],     label="Noisy",       lw=1,   alpha=0.7)
+        ax_spec.plot(x, clean_cpu[i],     label="Clean (réel)",lw=1.5)
+        ax_spec.plot(x, spectra_recon[i], label="Reconstruit", lw=1.2, ls="--")
         ax_spec.set_ylabel("Transmission")
-        ax_spec.set_title(f"Epoch {trainer.current_epoch}")
+        ax_spec.set_title(f"{self.stage_tag} — Epoch {trainer.current_epoch}")
         ax_spec.legend(frameon=False, fontsize=9)
 
         resid_clean = spectra_recon[i] - clean_cpu[i]
@@ -1668,39 +2185,115 @@ class PlotAndMetricsCallback(Callback):
         ax_res.set_xlabel("Points spectraux"); ax_res.set_ylabel("Résidu")
         ax_res.legend(frameon=False, fontsize=9)
 
-        header = f"Métriques (epoch {trainer.current_epoch})"
-        lines  = [
-            f"train_loss : {train_loss}",
-            f"val_loss   : {val_loss}",
-            f"val_phys_huber : {val_phys_huber}",
-            f"val_corr   : {val_phys_corr}",
-            f"val_param_group : {val_param_group}",
-            "", "Pertes par paramètre (val) :", per_param_text
+        # ---------- (D) Panneau texte: logs + stats val ----------
+        # Ligne MSE + erreurs % moyennes par param
+        stats_lines = [f"VAL  MSE(clean,recon) : {val_mse:.6g}"]  # NEW
+        if len(mean_pct) > 0:
+            # tri par nom de param pour stabilité
+            for k in sorted(mean_pct.keys()):
+                stats_lines.append(f"VAL  err%({k})       : {mean_pct[k]:.3f} %")
+
+        lines = [
+            f"train_loss : {get_metric('train_loss')}",
+            f"val_loss   : {get_metric('val_loss')}",
+            f"val_point  : {get_metric('val_loss_phys_pointwise')}",
+            f"val_corr   : {get_metric('val_loss_phys_corr')}",
+            f"val_param_group : {get_metric('val_loss_param_group')}",
+            "",
+            *stats_lines,  # NEW
+            "",
+            f"refine={self.refine}, cascade={self.cascade_stages_override if self.cascade_stages_override else 'auto'}",
+            f"provided={'GT' if self.use_gt_for_provided else 'pred-only'}",
+            f"recon_PT={self.recon_PT}",
         ]
-        ax_tbl.text(0.02, 0.98, header, va="top", ha="left", fontsize=12, fontweight="bold")
-        ax_tbl.text(0.02, 0.90, "\n".join(lines), va="top", ha="left", fontsize=10, family="monospace")
+        ax_tbl.text(0.02, 0.98, f"Métriques (epoch {trainer.current_epoch})",
+                    va="top", ha="left", fontsize=12, fontweight="bold")
+        ax_tbl.text(0.02, 0.90, "\n".join(lines), va="top", ha="left",
+                    fontsize=10, family="monospace")
 
         for ax in (ax_spec, ax_res): ax.grid(alpha=0.25)
 
-        out_png = os.path.join(
-            self.save_dir, f"{self.stage_tag}_val_epoch{trainer.current_epoch:04d}.png"
-        )
+        os.makedirs(self.save_dir, exist_ok=True)
+        out_png = os.path.join(self.save_dir, f"{self.stage_tag}_val_epoch{trainer.current_epoch:04d}.png")
         save_fig(fig, out_png)
 
-class UpdateEpochInDataset(pl.Callback):
-    def on_train_epoch_start(self, trainer, pl_module):
-        ds = trainer.train_dataloaders.dataset if hasattr(trainer, "train_dataloaders") else trainer.train_dataloader.dataset
-        if hasattr(ds, "set_epoch"): ds.set_epoch(trainer.current_epoch)
 
-class AdvanceDistributedSamplerEpoch(pl.Callback):
+
+import pytorch_lightning as pl
+from torch.utils.data import DataLoader
+
+class UpdateEpochInDataset(pl.Callback):
+    """Met à jour l'epoch dans le dataset de train à chaque début d'epoch."""
     def on_train_epoch_start(self, trainer, pl_module):
-        loader = trainer.train_dataloader
-        try:
-            sampler = loader.sampler
-        except Exception:
-            sampler = getattr(trainer, "train_dataloader", None).sampler if hasattr(trainer, "train_dataloader") else None
+        # Accès robuste au dataloader de train
+        if hasattr(trainer, 'train_dataloader'):
+            # Récupérer le dataloader (peut être une fonction)
+            dl = trainer.train_dataloader
+            if callable(dl):
+                dl = dl()
+        elif hasattr(trainer, 'train_dataloaders'):
+            dl = trainer.train_dataloaders
+        else:
+            return
+        
+        # Gérer le cas d'une liste de dataloaders
+        if isinstance(dl, list):
+            dl = dl[0] if len(dl) > 0 else None
+        
+        if dl is not None:
+            ds = getattr(dl, 'dataset', None)
+            if ds is not None and hasattr(ds, 'set_epoch'):
+                ds.set_epoch(trainer.current_epoch)
+                if trainer.is_global_zero:
+                    print(f"✓ Train dataset epoch mis à jour: {trainer.current_epoch}")
+
+
+class UpdateEpochInValDataset(pl.Callback):
+    """Met à jour l'epoch dans le dataset de validation à chaque début d'epoch de val."""
+    def on_validation_epoch_start(self, trainer, pl_module):
+        # Accès robuste au(x) dataloader(s) de validation
+        if hasattr(trainer, 'val_dataloaders'):
+            dls = trainer.val_dataloaders
+        elif hasattr(trainer, 'val_dataloader'):
+            dls = trainer.val_dataloader
+            if callable(dls):
+                dls = dls()
+        else:
+            return
+        
+        # Normaliser en liste
+        if not isinstance(dls, list):
+            dls = [dls] if dls is not None else []
+        
+        for dl in dls:
+            if dl is None:
+                continue
+            ds = getattr(dl, 'dataset', None)
+            if ds is not None and hasattr(ds, 'set_epoch'):
+                ds.set_epoch(trainer.current_epoch)
+                if trainer.is_global_zero:
+                    print(f"✓ Val dataset epoch mis à jour: {trainer.current_epoch}")
+
+
+class AdvanceDistributedSamplerEpochAll(pl.Callback):
+    def on_train_epoch_start(self, trainer, pl_module):
+        dl = getattr(trainer, "train_dataloader", None)
+        sampler = getattr(dl, "sampler", None)
         if sampler is not None and hasattr(sampler, "set_epoch"):
             sampler.set_epoch(trainer.current_epoch)
+
+    def on_validation_epoch_start(self, trainer, pl_module):
+        dls = getattr(trainer, "val_dataloaders", None)
+        if not dls:
+            return
+        if not isinstance(dls, (list, tuple)):
+            dls = [dls]
+        for dl in dls:
+            sampler = getattr(dl, "sampler", None)
+            if sampler is not None and hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(trainer.current_epoch)
+
+
 
 # ============================================================
 # 9) Helpers ranges
@@ -1721,6 +2314,7 @@ def assert_subset(child: dict, parent: dict, name_child="child", name_parent="pa
     if bad:
         raise ValueError(f"{name_child} ⊄ {name_parent} pour: {bad}")
 
+
 # ============================================================
 # 10) Stages d'entraînement (A / B1 / B2), contrôle fin
 # ============================================================
@@ -1729,91 +2323,124 @@ def _freeze_all(model: PhysicallyInformedAE):
 
 def _set_trainable_heads(model: PhysicallyInformedAE, names: Optional[List[str]]):
     if model.head_mode == "single":
-        # on ne sait pas geler par colonne proprement → tout ON
         for p in model.out_head.parameters(): p.requires_grad_(True)
         return
-    # multi-head : on active uniquement les heads désirés
     want = set(names) if names is not None else set(model.predict_params)
     for n, head in model.out_heads.items():
         req = (n in want)
         for p in head.parameters(): p.requires_grad_(req)
 
+def freeze_module(m, req: bool):
+    if m is None: return
+    for p in m.parameters(): p.requires_grad_(req)
+
+def freeze_all_refiners_except(model: PhysicallyInformedAE, keep_idx: int):
+    """
+    Active l'entraînement du raffineur keep_idx (0=B, 1=C, 2=D) et gèle les autres.
+    """
+    for i, r in enumerate(model.refiners):
+        freeze_module(r, i == keep_idx)
+
+def train_refiner_idx(
+    model: PhysicallyInformedAE,
+    train_loader, val_loader,
+    k: int,                      # 0 -> B, 1 -> C, 2 -> D
+    *,
+    epochs: int = 40,
+    refiner_lr: float = 1e-4,
+    delta_scale: float = 0.10,
+    callbacks=None,
+    enable_progress_bar: bool = False,
+    ckpt_in: str | None = None,          # <— explicite ici
+    ckpt_out: str | None = None,         # <— explicite ici
+    use_denoiser_during_B: bool = False, # <— *** AJOUT ***
+    **trainer_kwargs
+):
+    import pytorch_lightning as pl
+
+    _load_weights_if_any(model, ckpt_in)
+
+    # activer/ désactiver le denoiser pendant B/C/D (il est déjà gelé côté A)
+    model.use_denoiser = bool(use_denoiser_during_B)
+
+    model.base_lr = 1e-8
+    model.refiner_lr = float(refiner_lr)
+    model.set_stage_mode('B1', refine_steps=int(k+1), delta_scale=float(delta_scale))
+
+    def freeze_module(m, trainable: bool):
+        if m is None: return
+        for p in m.parameters(): p.requires_grad_(trainable)
+
+    def freeze_all_refiners_except(model: PhysicallyInformedAE, keep_idx: int):
+        for i, r in enumerate(model.refiners):
+            freeze_module(r, i == keep_idx)
+
+    # geler A + heads + FiLM
+    freeze_module(model.backbone, False)
+    freeze_module(model.shared_head, False)
+    if hasattr(model, "out_head"):  freeze_module(model.out_head, False)
+    if hasattr(model, "out_heads"):
+        for _n, head in model.out_heads.items(): freeze_module(head, False)
+    if getattr(model, "film", None) is not None: freeze_module(model.film, False)
+
+    # ne laisser entraînable que le raffineur k
+    freeze_all_refiners_except(model, keep_idx=int(k))
+
+    # --- sanitization kwargs (évite doublons/ conflits)
+    try:
+        from pytorch_lightning.callbacks.progress import TQDMProgressBar
+        if callbacks is not None and enable_progress_bar is False:
+            callbacks = [cb for cb in callbacks if not isinstance(cb, TQDMProgressBar)]
+    except Exception:
+        pass
+
+    trainer_kwargs.setdefault("log_every_n_steps", 1)
+    from pytorch_lightning.strategies import Strategy
+    if isinstance(trainer_kwargs.get("strategy", None), Strategy):
+        trainer_kwargs.pop("accelerator", None)
+
+    trainer = pl.Trainer(
+        max_epochs=int(epochs),
+        enable_progress_bar=enable_progress_bar,
+        callbacks=callbacks or [],
+        **trainer_kwargs,
+    )
+
+    trainer.fit(model, train_loader, val_loader)
+    _save_checkpoint(trainer, ckpt_out)
+    return model
+
+
+
 def _apply_stage_freeze(model: PhysicallyInformedAE,
                         train_base: bool, train_heads: bool, train_film: bool, train_refiner: bool,
                         heads_subset: Optional[List[str]]):
-    # tout OFF
     _freeze_all(model)
-    # backbone + shared head
     if train_base:
         for p in model.backbone.parameters(): p.requires_grad_(True)
         for p in model.shared_head.parameters(): p.requires_grad_(True)
-    # heads
     if model.head_mode == "single":
         if train_heads:
             for p in model.out_head.parameters(): p.requires_grad_(True)
     else:
         _set_trainable_heads(model, heads_subset if train_heads else [])
-    # FiLM
     if model.film is not None and train_film:
         for p in model.film.parameters(): p.requires_grad_(True)
-    # refiner
     if train_refiner:
-        for p in model.refiner.parameters(): p.requires_grad_(True)
+        for p in model.refiners.parameters():
+            p.requires_grad_(True)
 
-def _load_weights_if_any(model, ckpt_path):
-    import os, torch
-    if not ckpt_path or not os.path.exists(ckpt_path):
-        print(f"[INFO] No checkpoint at {ckpt_path}; skipping.")
-        return
-
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state_dict = ckpt.get("state_dict", ckpt)
-
-    model_sd = model.state_dict()
-    compatible = {}
-    mismatched, unexpected = [], []
-
-    for k, v in state_dict.items():
-        if k in model_sd:
-            if v.shape == model_sd[k].shape:
-                compatible[k] = v
-            else:
-                mismatched.append((k, tuple(v.shape), tuple(model_sd[k].shape)))
-        else:
-            unexpected.append(k)
-
-    if not compatible:
-        print("[WARN] Checkpoint is architecturally incompatible (0 matching shapes). "
-              "Skipping weight loading for this run.")
-        return
-
-    # load the matching subset without erroring on the rest
-    model_sd.update(compatible)
-    model.load_state_dict(model_sd, strict=False)
-
-    print(f"[INFO] Loaded {len(compatible)} tensors from checkpoint; "
-          f"{len(mismatched)} mismatched, {len(unexpected)} unexpected, "
-          f"{len(model_sd) - len(compatible)} missing.")
-
+def _load_weights_if_any(model: PhysicallyInformedAE, ckpt_in: Optional[str]):
+    if ckpt_in:
+        sd = torch.load(ckpt_in, map_location="cpu")
+        state_dict = sd["state_dict"] if "state_dict" in sd else sd
+        model.load_state_dict(state_dict, strict=False)
+        print(f"✓ weights chargés depuis: {ckpt_in}")
 
 def _save_checkpoint(trainer: pl.Trainer, ckpt_out: Optional[str]):
-    if ckpt_out and on_rank_zero():
+    if ckpt_out:
         trainer.save_checkpoint(ckpt_out)
         print(f"✓ checkpoint sauvegardé: {ckpt_out}")
-
-def get_worker_info():
-    rank = int(os.environ.get("SLURM_PROCID") or os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or 0)
-    world = int(os.environ.get("SLURM_NTASKS") or os.environ.get("WORLD_SIZE") or 1)
-    return rank, world
-
-def wait_for_file(path, check_every=5, timeout=24*3600):
-    import time
-    t0 = time.time()
-    while not os.path.isfile(path):
-        if time.time() - t0 > timeout:
-            raise TimeoutError(f"Timeout en attendant {path}")
-        time.sleep(check_every)
-    return path
 
 def train_stage_custom(
     model: PhysicallyInformedAE,
@@ -1837,17 +2464,24 @@ def train_stage_custom(
     enable_progress_bar: bool = False,
     **trainer_kwargs,
 ):
+    """
+    Stage Lightning robuste:
+    - évite accelerator/strategy en double
+    - pas de plugins= → aucun conflit cluster_environment
+    """
+    import os
     import pytorch_lightning as pl
     from pytorch_lightning.strategies import Strategy
 
     print(f"\n===== Stage {stage_name} =====")
 
+    # --- EXTRA KW non-Lightning ---
     ckpt_in  = trainer_kwargs.pop("ckpt_in",  None)
     ckpt_out = trainer_kwargs.pop("ckpt_out", None)
 
     _load_weights_if_any(model, ckpt_in)
 
-    # Nettoyage de la barre de progression si demandé
+    # Progress bar optionnelle
     try:
         from pytorch_lightning.callbacks.progress import TQDMProgressBar
         if callbacks is not None and enable_progress_bar is False:
@@ -1870,14 +2504,16 @@ def train_stage_custom(
 
     trainer_kwargs.setdefault("log_every_n_steps", 1)
 
-    # Si l’appelant a fourni un objet Strategy, laisse Lightning déduire l’accélérateur
+    # 🔧 SANITIZE: si strategy est un objet, on laisse Lightning déduire l'accélérateur
     strat = trainer_kwargs.get("strategy", None)
     if isinstance(strat, Strategy):
         trainer_kwargs.pop("accelerator", None)
 
-    # ⚙️ IMPORTANT: DataLoaders distribués explicites (évite un remplacement auto par PL)
-    train_loader, val_loader = ensure_distributed_samplers(train_loader, val_loader)
+    # 🔧 Nettoie quelques variables d'env piégeuses
+    for env_key in ("PL_TRAINER_ACCELERATOR", "PL_TRAINER_MAX_EPOCHS"):
+        os.environ.pop(env_key, None)
 
+    # Construire le Trainer (sans plugins= → pas de conflit)
     trainer = pl.Trainer(
         max_epochs=epochs,
         enable_progress_bar=enable_progress_bar,
@@ -1889,30 +2525,59 @@ def train_stage_custom(
     _save_checkpoint(trainer, ckpt_out)
     return model
 
+def train_stage_DENOISER(
+    model: PhysicallyInformedAE,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    *,
+    epochs: int = 30,
+    denoiser_lr: float = 1e-4,
+    callbacks: Optional[list] = None,
+    enable_progress_bar: bool = False,
+    ckpt_in: str | None = None,
+    ckpt_out: str | None = None,
+    **trainer_kwargs,
+):
+    import pytorch_lightning as pl
 
+    if ckpt_in:
+        sd = torch.load(ckpt_in, map_location="cpu")
+        state_dict = sd.get("state_dict", sd)
+        model.load_state_dict(state_dict, strict=False)
+        print(f"✓ weights chargés depuis: {ckpt_in}")
 
-# --- helpers JSON best artefacts ---
-from pathlib import Path
-import json
+    model.use_denoiser = True
+    model.denoiser_lr = float(denoiser_lr)
+    model.set_stage_mode('DEN', refine_steps=0, delta_scale=None)
 
-def _dump_json(path: Path, obj: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False))
+    # --- sanitization kwargs pour éviter les doublons (strategy / accelerator, etc.)
+    try:
+        from pytorch_lightning.callbacks.progress import TQDMProgressBar
+        if callbacks is not None and enable_progress_bar is False:
+            callbacks = [cb for cb in callbacks if not isinstance(cb, TQDMProgressBar)]
+    except Exception:
+        pass
 
-def _save_best_params_json(stage: str, best_trial, ckpt_path: str, stage_dir: Path) -> str:
-    """
-    Écrit checkpoints/<stage>_best_params.json avec:
-      - stage, score, params (hyperparams Optuna), ckpt (chemin best .ckpt)
-    """
-    payload = {
-        "stage": stage,
-        "score": float(best_trial.value),
-        "params": dict(best_trial.params),
-        "ckpt": str(ckpt_path),
-    }
-    out = stage_dir / "checkpoints" / f"{stage}_best_params.json"
-    _dump_json(out, payload)
-    return str(out)
+    from pytorch_lightning.strategies import Strategy
+    if isinstance(trainer_kwargs.get("strategy", None), Strategy):
+        trainer_kwargs.pop("accelerator", None)
+
+    trainer_kwargs.setdefault("log_every_n_steps", 1)
+
+    # Ne pas imposer une strategy si déjà fournie via **trainer_kwargs
+    trainer = pl.Trainer(
+        max_epochs=int(epochs),
+        enable_progress_bar=enable_progress_bar,
+        callbacks=callbacks or [],
+        **trainer_kwargs,
+    )
+    trainer.fit(model, train_loader, val_loader)
+
+    if ckpt_out:
+        trainer.save_checkpoint(ckpt_out)
+        print(f"✓ checkpoint sauvegardé: {ckpt_out}")
+
+    return model
 
 
 # Facades conviviales
@@ -1924,7 +2589,7 @@ def train_stage_A(model, train_loader, val_loader, **kw):
         train_base=True, train_heads=True, train_film=False, train_refiner=False,
         refine_steps=0, delta_scale=0.1,
         use_film=False, film_subset=None, heads_subset=None,
-         enable_progress_bar=False
+        enable_progress_bar=False
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
 
@@ -1936,7 +2601,7 @@ def train_stage_B1(model, train_loader, val_loader, **kw):
         train_base=False, train_heads=False, train_film=False, train_refiner=True,
         refine_steps=2, delta_scale=0.12,
         use_film=True, film_subset=["T"], heads_subset=None,
-         enable_progress_bar=False
+        enable_progress_bar=False
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
 
@@ -1948,51 +2613,16 @@ def train_stage_B2(model, train_loader, val_loader, **kw):
         train_base=True, train_heads=True, train_film=True, train_refiner=True,
         refine_steps=2, delta_scale=0.08,
         use_film=True, film_subset=["P","T"], heads_subset=None,
-         enable_progress_bar=False
+        enable_progress_bar=False
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
 
-def export_param_errors_files(ckpt_path: str, which: str, *, refine: bool, split: str = "val",
-                              robust_smape: bool = False) -> dict:
-    """
-    Charge le modèle + données, restaure le checkpoint, puis écrit:
-      - eval/<which>_<split>_metrics.csv          (agrégé)
-      - eval/<which>_<split>_errors_per_sample.csv (par-échantillon)
-    Retourne les chemins des fichiers.
-    """
-    from pathlib import Path
-    run_dir = Path(make_run_dir())
-    stage_dir = get_stage_dir(run_dir, which)
-    out_dir = stage_dir / "eval"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Recrée un modèle compatible + loaders (puis load poids)
-    model, train_loader, val_loader = build_data_and_model()
-    _load_weights_if_any(model, ckpt_path)
-    loader = val_loader if split == "val" else train_loader
-    tag = f"{which}_{split}"
-
-    # Sauvegardes CSV à l’intérieur de evaluate_and_plot
-    _ = evaluate_and_plot(
-        model, loader,
-        n_show=3, refine=refine, robust_smape=robust_smape,
-        save_dir=str(out_dir), tag=tag, save_per_sample=True
-    )
-
-    return {
-        "metrics_csv": str(out_dir / f"{tag}_metrics.csv"),
-        "per_sample_csv": str(out_dir / f"{tag}_errors_per_sample.csv"),
-    }
-
 
 @torch.no_grad()
-def evaluate_and_plot(
-    model: PhysicallyInformedAE, loader: DataLoader, n_show: int = 5,
-    refine: bool = True, robust_smape: bool = False, eps: float = 1e-12, seed: int = 123,
-    baseline_correction: dict | None = None,
-    save_dir: str | None = None, tag: str | None = None,
-    save_per_sample: bool = True,        # ← NEW: écrit aussi un CSV par-échantillon
-):
+def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: int = 5,
+                      refine: bool = True, robust_smape: bool = False, eps: float = 1e-12, seed: int = 123,
+                      baseline_correction: dict | None = None,
+                      save_dir: str | None = None, tag: str | None = None):
     model.eval()
     device = model.device
     rng = random.Random(seed)
@@ -2003,8 +2633,6 @@ def evaluate_and_plot(
 
     per_param_err = {p: [] for p in pred_names}
     show_examples = []
-    per_sample_rows = []                    # ← NEW
-    sample_idx = 0                          # ← NEW compteur d’échantillons globaux
 
     for batch in loader:
         noisy  = batch["noisy_spectra"].to(device)
@@ -2036,20 +2664,9 @@ def evaluate_and_plot(
             denom = torch.clamp(true_phys.abs(), min=eps)
             err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
 
-        # agrégation par-paramètre
         for j, name in enumerate(pred_names):
             per_param_err[name].append(err_pct[:, j].detach().cpu())
 
-        # NEW: enregistrement par-échantillon
-        if save_per_sample:
-            for i in range(B):
-                row = {"sample": sample_idx + i}
-                for j, name in enumerate(pred_names):
-                    row[name] = float(err_pct[i, j])
-                per_sample_rows.append(row)
-            sample_idx += B
-
-        # (… le bloc show_examples inchangé …)
         for i in range(B):
             if len(show_examples) < n_show:
                 show_examples.append({
@@ -2062,7 +2679,6 @@ def evaluate_and_plot(
                 })
         if len(show_examples) >= n_show: break
 
-    # === Stats agrégées ===
     rows = []
     for name in pred_names:
         if len(per_param_err[name]) == 0: continue
@@ -2078,7 +2694,6 @@ def evaluate_and_plot(
     df = pd.DataFrame(rows).set_index("param").sort_index()
     print("\n=== Erreurs en % (globales, sur le loader) ==="); print(df.round(4))
 
-    # === Sauvegardes CSV ===
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         tag = tag or "eval"
@@ -2086,38 +2701,232 @@ def evaluate_and_plot(
         df.round(6).to_csv(csv_path)
         print(f"✓ Metrics CSV: {csv_path}")
 
-        if save_per_sample and len(per_sample_rows) > 0:
-            df_samples = pd.DataFrame(per_sample_rows)
-            csv_path2 = os.path.join(save_dir, f"{tag}_errors_per_sample.csv")
-            df_samples.to_csv(csv_path2, index=False)
-            print(f"✓ Per-sample CSV: {csv_path2}")
+    if len(show_examples) > 0:
+        R = len(show_examples)
+        fig, axes = plt.subplots(R, 2, figsize=(12, 2.8*R), sharex=False)
+        if R == 1: axes = np.array([axes])
+        for r, ex in enumerate(show_examples):
+            x = np.arange(ex["clean"].numel()); ax1, ax2 = axes[r, 0], axes[r, 1]
+            ax1.plot(x, ex["noisy"],  lw=0.9, alpha=0.7, label="Noisy")
+            ax1.plot(x, ex["clean"],  lw=1.2,              label="Clean")
+            ax1.plot(x, ex["recon"],  lw=1.0, ls="--",     label="Recon")
+            ax1.set_ylabel("Transmission")
+            err_txt = ", ".join([f"{k}: {ex['errpct'][k]:.2f}%" for k in pred_names])
+            ax1.set_title(f"Exemple {r+1} — erreurs % : {err_txt}", fontsize=10)
+            ax1.legend(frameon=False, fontsize=8)
 
-    # (… le reste de la fonction, les figures, inchangé …)
+            ax2.plot(x, ex["recon"] - ex["noisy"], lw=0.9, label="Recon - Noisy")
+            ax2.plot(x, ex["recon"] - ex["clean"], lw=0.9, label="Recon - Clean")
+            ax2.axhline(0, color="k", ls=":", lw=0.7)
+            ax2.set_ylabel("Résidu"); ax2.legend(frameon=False, fontsize=8)
+        axes[-1, 0].set_xlabel("Index spectral"); axes[-1, 1].set_xlabel("Index spectral")
+        for axrow in axes:
+            for ax in axrow: ax.grid(alpha=0.25)
+        fig.tight_layout()
+        if save_dir is not None:
+            png_path = os.path.join(save_dir, f"{tag}_examples.png")
+            save_fig(fig, png_path, dpi=160)
+            print(f"✓ Examples PNG: {png_path}")
+        else:
+            plt.show()
     return df
 
+import os, torch, numpy as np
+import matplotlib.pyplot as plt
+import pytorch_lightning as pl
+
+class PT_PredVsExp_VisuCallback(pl.Callback):
+    """
+    Visualise côte-à-côte:
+      - Recon (PT=pred) + résidus
+      - Recon (PT=exp)  + résidus
+    Les Pexp/Texp "exp" sont, par défaut, pris des GT du batch (dénormalisés).
+    """
+    def __init__(self, val_loader, save_dir="./figs_local", num_examples=1, tag="PT_pred_vs_exp",
+                 force_Pexp: torch.Tensor | None = None,
+                 force_Texp: torch.Tensor | None = None,
+                 use_gt_for_provided: bool = True):
+        super().__init__()
+        self.val_loader = val_loader
+        self.save_dir = save_dir
+        self.num_examples = int(num_examples)
+        self.tag = tag
+        self.force_Pexp = force_Pexp
+        self.force_Texp = force_Texp
+        self.use_gt_for_provided = bool(use_gt_for_provided)
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    @torch.no_grad()
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if hasattr(pl_module, "eval"): pl_module.eval()
+        device = pl_module.device
+        try:
+            batch = next(iter(self.val_loader))
+        except StopIteration:
+            return
+
+        noisy  = batch["noisy_spectra"][:self.num_examples].to(device)
+        clean  = batch["clean_spectra"][:self.num_examples].to(device)
+        p_norm = batch["params"][:self.num_examples].to(device)
+        B, N = noisy.shape
+        x = np.arange(N)
+
+        # ✓ FIX : Construire provided_phys avec TOUS les paramètres fournis
+        provided_phys = {}
+        
+        # Extraire tous les paramètres "provided" (ceux qui ne sont PAS prédits)
+        for name in getattr(pl_module, "provided_params", []):
+            idx = pl_module.name_to_idx[name]
+            v_norm = p_norm[:, idx]
+            v_phys = pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
+            provided_phys[name] = v_phys
+        
+        # ✓ IMPORTANT : Ajouter P et T pour FiLM (même s'ils sont prédits)
+        if "P" in pl_module.film_params:
+            idx_P = pl_module.name_to_idx["P"]
+            P_norm = p_norm[:, idx_P]
+            P_phys = pl_module._denorm_params_subset(P_norm.unsqueeze(1), ["P"])[:, 0]
+            provided_phys["P"] = P_phys
+        
+        if "T" in pl_module.film_params:
+            idx_T = pl_module.name_to_idx["T"]
+            T_norm = p_norm[:, idx_T]
+            T_phys = pl_module._denorm_params_subset(T_norm.unsqueeze(1), ["T"])[:, 0]
+            provided_phys["T"] = T_phys
+
+        # --- Pexp/Texp : soit forcés, soit pris des GT du batch
+        def _gt_phys(name: str):
+            idx = pl_module.name_to_idx[name]
+            v_norm = p_norm[:, idx]
+            return pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
+
+        if self.force_Pexp is not None and self.force_Texp is not None:
+            Pexp = self.force_Pexp.to(device).view(B)
+            Texp = self.force_Texp.to(device).view(B)
+        else:
+            # GT du batch (dénormalisés)
+            Pexp = _gt_phys("P").to(device)
+            Texp = _gt_phys("T").to(device)
+
+        # === Recon avec PT prédits
+        out_pred = pl_module.infer(
+            noisy, provided_phys=provided_phys,
+            refine=True,
+            resid_target="input",
+            recon_PT="pred",
+        )
+        recon_pred = out_pred["spectra_recon"]
+
+        # === Recon avec PT expérimentaux (forcés/GT)
+        out_exp = pl_module.infer(
+            noisy, provided_phys=provided_phys,
+            refine=True,
+            resid_target="input",
+            recon_PT="exp",
+            Pexp=Pexp, Texp=Texp,
+        )
+        recon_exp = out_exp["spectra_recon"]
+
+        # --- tracés (reste identique)
+        for i in range(B):
+            fig = plt.figure(figsize=(12, 6), constrained_layout=True)
+            gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], width_ratios=[1, 1], hspace=0.25, wspace=0.25)
+
+            ax0 = fig.add_subplot(gs[0, :])
+            ax0.plot(x, noisy[i].detach().cpu(),  lw=0.9, alpha=0.7, label="Noisy")
+            ax0.plot(x, clean[i].detach().cpu(),  lw=1.2,           label="Clean")
+            ax0.plot(x, recon_pred[i].detach().cpu(), lw=1.0, ls="--", label="Recon (PT=pred)")
+            ax0.plot(x, recon_exp[i].detach().cpu(),  lw=1.0, ls="-.", label="Recon (PT=exp)")
+            ax0.set_title(f"{self.tag} — epoch {trainer.current_epoch} — ex {i+1}")
+            ax0.set_ylabel("Transmission"); ax0.legend(frameon=False, fontsize=9); ax0.grid(alpha=0.3)
+
+            ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
+            ax1.plot(x, (recon_pred[i]-noisy[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Noisy")
+            ax1.plot(x, (recon_exp[i]-noisy[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Noisy")
+            ax1.axhline(0, ls=":", lw=0.8, color="k")
+            ax1.set_xlabel("Index spectral"); ax1.set_ylabel("Résidu"); ax1.legend(frameon=False, fontsize=8); ax1.grid(alpha=0.3)
+
+            ax2 = fig.add_subplot(gs[1, 1], sharex=ax0)
+            ax2.plot(x, (recon_pred[i]-clean[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Clean")
+            ax2.plot(x, (recon_exp[i]-clean[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Clean")
+            ax2.axhline(0, ls=":", lw=0.8, color="k")
+            ax2.set_xlabel("Index spectral"); ax2.set_ylabel("Résidu"); ax2.legend(frameon=False, fontsize=8); ax2.grid(alpha=0.3)
+
+            try:
+                Pp = float(out_pred["y_phys_full"][i, pl_module.name_to_idx["P"]])
+                Tp = float(out_pred["y_phys_full"][i, pl_module.name_to_idx["T"]])
+            except Exception:
+                Pp = Tp = float("nan")
+            ax0.text(0.01, 0.02, f"PT_pred≈({Pp:.2f} mbar, {Tp:.2f} K) | PT_exp=({float(Pexp[i]):.2f} mbar, {float(Texp[i]):.2f} K)",
+                     transform=ax0.transAxes, fontsize=9, ha="left", va="bottom")
+
+            fname = os.path.join(self.save_dir, f"{self.tag}_epoch{trainer.current_epoch:04d}_ex{i+1}.png")
+            fig.savefig(fname, dpi=160, bbox_inches="tight"); plt.close(fig)
+            print(f"✓ Figure sauvegardée : {fname}")
+
 # ============================================================
-# 12) Build data & modèle (exemple par défaut)
+# 11) Build data & modèle (exemple par défaut)
 # ============================================================
+
+def _to_serializable(x):
+    if isinstance(x, tuple):
+        return [_to_serializable(v) for v in x]
+    if isinstance(x, list):
+        return [_to_serializable(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _to_serializable(v) for k, v in x.items()}
+    if isinstance(x, (np.generic,)):
+        return x.item()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().tolist() if x.ndim else x.item()
+    return x
+
+class _NoAliasDumper(yaml.SafeDumper):
+    def ignore_aliases(self, data):
+        return True
+
+def save_config(run_dir_path, **cfg):
+    path = os.path.join(run_dir_path, "config.yaml")
+    clean = _to_serializable(cfg)
+    with open(path, "w") as f:
+        yaml.dump(
+            clean, f,
+            Dumper=_NoAliasDumper,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False
+        )
+    return path
+
 def build_data_and_model(
     *,
-    seed=42, n_points=800, n_train=100000, n_val=500, batch_size=16,
+    seed=42, n_points=800, n_train=500000, n_val=5000, batch_size=32,
     train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
     predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
     backbone_variant="s", refiner_variant="s",
-    backbone_width_mult=1.0, backbone_depth_mult=1.0,
+    backbone_width_mult=1, backbone_depth_mult=0.4,
     refiner_width_mult=1.0,  refiner_depth_mult=1.0,
     backbone_stem_channels=None, refiner_stem_channels=None,
     backbone_drop_path=0.0, refiner_drop_path=0.0,
     backbone_se_ratio=0.25,  refiner_se_ratio=0.25,
     refiner_feature_pool="avg", refiner_shared_hidden_scale=0.5,
     refiner_time_embed_dim=None,
-    huber_beta=0.002,  # pour la Huber
+    huber_beta=0.002,
+    qtpy_dir: str | None = None,  
 ):
     pl.seed_everything(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     is_windows = sys.platform == "win32"
     num_workers = 0 if is_windows else 4
 
+    # ---- QTpy (TIPS_2021) ----
+    if qtpy_dir is None:
+        qtpy_dir = os.environ.get("QTPY_DIR", "./QTpy")
+    tipspy = Tips2021QTpy(qtpy_dir, device='cpu')
+
+    # ---- Polynom de fréquence & transitions de démonstration ----
     poly_freq_CH4 = [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
     transitions_ch4_str = """6;1;3085.861015;1.013E-19;0.06;0.078;219.9411;0.73;-0.00712;0.0;0.0221;0.96;0.584;1.12
 6;1;3085.832038;1.693E-19;0.0597;0.078;219.9451;0.73;-0.00712;0.0;0.0222;0.91;0.173;1.11
@@ -2125,94 +2934,111 @@ def build_data_and_model(
 6;1;3086.030985;1.659E-19;0.0595;0.078;219.9197;0.73;-0.00711;0.0;0.0193;1.17;-0.204;0.97
 6;1;3086.071879;1.000E-19;0.0585;0.078;219.9149;0.73;-0.00703;0.0;0.0232;1.09;-0.0689;0.82
 6;1;3086.085994;6.671E-20;0.055;0.078;219.9133;0.70;-0.00610;0.0;0.0300;0.54;0.00;0.0"""
-    transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str)}
 
-    # Ranges par défaut
-    # default_val = {
-    #     'sig0': (3085.43, 3085.46),
-    #     'dsig': (0.001521, 0.00154),
-    #     'mf_CH4': (2e-6, 100e-6),
-    #     'baseline0': (1, 1.00000001),
-    #     'baseline1': (-0.0004, -0.0003),
-    #     'baseline2': (-4.0565E-08, -3.07117E-08),
-    #     'P': (400, 800),
-    #     'T': (273.15 + 0, 273.15 + 50),
-    # }
-    # expand_factors = {"_default": 1.0, 'sig0': 5.0, 'dsig': 7.0, 'mf_CH4': 2.0,
-    #                   "baseline0": 1, "baseline1": 10.0, "baseline2": 15.0, "P": 2.0, "T": 2.0}
-    
+    transitions_h2o_str = """1;2;3083.831748;2.874e-24;0.0971;0.460;78.9886;0.87;-0.00653
+1;1;3085.357520;9.562e-25;0.0452;0.282;2254.2838;0.51;0.001433
+1;1;3085.506609;1.396e-25;0.0662;0.344;2927.9412;0.63;0.00324
+1;1;3085.558839;3.186e-25;0.0491;0.293;2254.2844;0.82;-0.00464
+1;1;3085.689600;3.912e-25;0.0508;0.333;2612.7999;0.64;-0.00649
+1;1;3086.133208;2.369e-25;0.0457;0.272;2414.7234;0.44;-0.00591
+1;1;3087.192118;2.070e-22;0.0768;0.413;648.9787;0.60;-0.00803"""
+
+    transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str),
+                        'H2O': parse_csv_transitions(transitions_h2o_str)}
+
+    # ---- Ranges par défaut (val puis train étendu) ----
     default_val = {
         'sig0': (3085.43, 3085.46),
         'dsig': (0.001521, 0.00154),
-        'mf_CH4': (2e-6, 50e-6),
-        'baseline0': (0.99, 1.01),
+        'mf_CH4': (2e-6, 20e-6),
+        'mf_H2O': (0.004, 0.006),
+        'baseline0': (0.999999, 1.00001),
         'baseline1': (-0.0004, -0.0003),
         'baseline2': (-4.0565E-08, -3.07117E-08),
-        'P': (400, 600),
-        'T': (273.15 + 30, 273.15 + 40),
+        'P': (450, 550),
+        'T': (273.15 + 32, 273.15 + 37),
     }
-    expand_factors = {"_default": 1.0, 'sig0': 5.0, 'dsig': 7.0, 'mf_CH4': 2.0,
-                      "baseline0": 1, "baseline1": 3.0, "baseline2": 8.0, "P": 2.0, "T": 2.0}
-    
 
+    expand_factors = {"_default": 1.0, 'sig0': 4.0, 'dsig': 2.0, 'mf_CH4': 1.5, 'mf_H2O': 2,
+                      "baseline0": 1, "baseline1": 4, "baseline2": 8.0, "P": 1.5, "T":1.5}
+    
     default_train = map_ranges(default_val, expand_interval, per_param=expand_factors)
 
     # Plancher log
     lo, hi = default_train['mf_CH4']; default_train['mf_CH4'] = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
     lo, hi = default_val['mf_CH4'];   default_val['mf_CH4']   = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR*10))
 
+    # ---- NORM_PARAMS ----
     global NORM_PARAMS
     VAL_RANGES = val_ranges or default_val
     TRAIN_RANGES = train_ranges or default_train
     assert_subset(VAL_RANGES, TRAIN_RANGES, "VAL", "TRAIN")
     NORM_PARAMS = TRAIN_RANGES
 
+    # ---- Profils de bruit ----
     NOISE_TRAIN = noise_train or dict(
         std_add_range=(0, 1e-3), std_mult_range=(0, 1e-3),
-        p_drift=0.1, drift_sigma_range=(10.0, 120.0), drift_amp_range=(0.004, 0.05),
+        p_drift=0.2, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.001, 0.05),
         p_fringes=0.2, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
-        p_spikes=0.1, spikes_count_range=(1, 6), spike_amp_range=(0.002, 1), spike_width_range=(1.0, 200.0),
-        clip=(0.0, 1.1),
+        p_spikes=0.2, spikes_count_range=(1, 2), spike_amp_range=(0.001, 1), spike_width_range=(1.0, 200.0),
+        clip=(0.0, 1.5),
     )
+
     NOISE_VAL = noise_val or dict(
-        std_add_range=(0, 1e-5), std_mult_range=(0, 1e-5),
-        p_drift=0, drift_sigma_range=(20.0, 120.0), drift_amp_range=(0.0, 0.01),
-        p_fringes=0, n_fringes_range=(1, 2), fringe_freq_range=(0.5, 10.0), fringe_amp_range=(0.0, 0.004),
-        p_spikes=0.0, spikes_count_range=(1, 2), spike_amp_range=(0.0, 0.01), spike_width_range=(1.0, 3.0),
-        clip=(0.0, 1.1),
+        std_add_range=(0, 1e-3), std_mult_range=(0, 1e-3),
+        p_drift=0.2, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.001, 0.05),
+        p_fringes=0.2, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
+        p_spikes=0.2, spikes_count_range=(1, 2), spike_amp_range=(0.001, 1), spike_width_range=(1.0, 200.0),
+        clip=(0.0, 1.5),
     )
 
     dataset_train = SpectraDataset(n_samples=n_train, num_points=n_points,
                                    poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
                                    sample_ranges=TRAIN_RANGES, strict_check=True,
-                                   with_noise=True, noise_profile=NOISE_TRAIN, freeze_noise=False)
+                                   with_noise=True, noise_profile=NOISE_TRAIN, freeze_noise=False, tipspy=tipspy)
+    
     dataset_val = SpectraDataset(n_samples=n_val, num_points=n_points,
                                  poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
                                  sample_ranges=VAL_RANGES, strict_check=True,
-                                 with_noise=True, noise_profile=NOISE_VAL, freeze_noise=True)
+                                 with_noise=True, noise_profile=NOISE_VAL, freeze_noise=False, tipspy=tipspy)
 
     train_loader = DataLoader(dataset_train, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=(device == 'cuda'))
-    val_loader = DataLoader(dataset_val, batch_size=batch_size, shuffle=False,
+    val_loader = DataLoader(dataset_val, batch_size=batch_size, shuffle=True,
                             num_workers=num_workers, pin_memory=(device == 'cuda'))
 
     # baseline0 n'est PAS prédit (normalisation via max LOWESS)
-    predict_list = predict_list or ["sig0", "dsig", "mf_CH4", "P", "T", "baseline1", "baseline2"]
-    film_list = film_list or []
+    predict_list = predict_list or ["sig0", "dsig","P", "T", "mf_CH4", "mf_H2O", "baseline1", "baseline2"]
+    
+    film_list = []
 
     model = PhysicallyInformedAE(
-        n_points=n_points, param_names=PARAMS, poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
+        n_points=n_points, param_names=PARAMS,
+        poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
+
+        # --- optims & pondérations globales ---
         lr=lrs[0], alpha_param=0.3, alpha_phys=0.7, head_mode="multi",
+
+        # --- params à prédire / FiLM ---
         predict_params=predict_list, film_params=film_list,
+
+        # --- raffinement ---
         refine_steps=1, refine_delta_scale=0.1, refine_target="noisy",
         refine_warmup_epochs=30, freeze_base_epochs=20,
         base_lr=lrs[0], refiner_lr=lrs[1],
-        recon_max1=True,
-        corr_mode="none",
-        corr_savgol_win=15,
-        corr_savgol_poly=3,
-        huber_beta=huber_beta,
-        # ==== NOUVEAUX hyperparamètres vers backbone/refiner ====
+
+        # --- dérivées (Savitzky–Golay pour d1/d2) ---
+        corr_savgol_win=15, corr_savgol_poly=3, huber_beta=huber_beta,
+
+        # --- pondérations des pertes ---
+        w_pw_raw=1.0, w_pw_d1=0.3, w_pw_d2=0.3,
+        w_corr_raw=1.0, w_corr_d1=0.3, w_corr_d2=0.3,
+        w_js_raw=0, w_js_d1=0.0, w_js_d2=0.0,
+
+        mlp_dropout=0.20,           # A : backbone/têtes/FiLM
+        refiner_mlp_dropout=0.20,   # B/C/D : raffineurs
+
+        # --- backbones ---
         backbone_variant=backbone_variant,
         refiner_variant=refiner_variant,
         backbone_width_mult=backbone_width_mult,
@@ -2227,16 +3053,16 @@ def build_data_and_model(
         refiner_se_ratio=refiner_se_ratio,
         refiner_feature_pool=refiner_feature_pool,
         refiner_shared_hidden_scale=refiner_shared_hidden_scale,
-        refiner_time_embed_dim=refiner_time_embed_dim,
-        ranges_train=TRAIN_RANGES,
-        ranges_val=VAL_RANGES,
-        noise_train=NOISE_TRAIN,
-        noise_val=NOISE_VAL,
+
+        # --- data & TIPS ---
+        tipspy=tipspy,
     )
 
-    model.hparams.optimizer = "lion"        # "adamw" | "lion" | "radam" | "adabelief"
-    model.hparams.betas = (0.9, 0.99)       # Optionnel, seulement pour Lion
-    model.weight_decay = 1e-4    
+
+    model.hparams.optimizer = "lion"
+    model.hparams.betas = (0.9, 0.99)
+    model.weight_decay = 1e-4
+
 
     def _serializable_ranges(d):
         return {k: [float(d[k][0]), float(d[k][1])] for k in d}
@@ -2255,59 +3081,20 @@ def build_data_and_model(
             for k, v in extra_hparams.items():
                 setattr(model.hparams, k, v)
 
-
     return model, train_loader, val_loader
 
-# ------------- Utilitaires HPC -------------
 
-def _env_as_int(*keys: str, default: Optional[int] = None) -> Optional[int]:
-    """Parse first integer value from a list of environment variable keys."""
-    for key in keys:
-        raw = os.environ.get(key)
-        if not raw:
-            continue
-        raw = str(raw).strip()
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            match = re.search(r"\d+", raw)
-            if match:
-                try:
-                    return int(match.group(0))
-                except ValueError:
-                    continue
-    return default
-
-
-def _env_flag(*keys: str, default: bool = False) -> bool:
-    """Return True if any of the provided environment variables is truthy."""
-    truthy = {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
-    falsy = {"0", "false", "FALSE", "no", "NO", "off", "OFF"}
-    for key in keys:
-        raw = os.environ.get(key)
-        if raw is None:
-            continue
-        raw = str(raw).strip()
-        if raw in truthy:
-            return True
-        if raw in falsy:
-            return False
-    return bool(default)
-
-
+# ------------- Utilitaires HPC & DDP -------------
 def get_master_addr_and_port(default_port=12910):
-    # MASTER_ADDR pour SLURM : 1er hostname de la nodelist
     master_addr = os.environ.get("MASTER_ADDR")
     if not master_addr:
         nodelist = os.environ.get("SLURM_NODELIST") or os.environ.get("SLURM_JOB_NODELIST")
         if nodelist:
-            # méthode robuste: scontrol peut ne pas être dispo à l’intérieur; fallback simple
             try:
                 import subprocess, shlex
                 cmd = f"scontrol show hostnames {shlex.quote(nodelist)} | head -n 1"
                 master_addr = subprocess.check_output(cmd, shell=True).decode().strip()
             except Exception:
-                # dernier recours: hostname courant
                 master_addr = socket.gethostname()
         else:
             master_addr = socket.gethostname()
@@ -2318,22 +3105,20 @@ def get_master_addr_and_port(default_port=12910):
 
 def choose_precision():
     if torch.cuda.is_available():
-        # bf16 si supporté (A100/H100/Grace-Hopper…)
         if torch.cuda.is_bf16_supported():
             return "bf16-mixed"
-        # sinon fp16 mixte
-        if torch.cuda.get_device_capability(0)[0] >= 7:  # Volta+
+        if torch.cuda.get_device_capability(0)[0] >= 7:
             return "16-mixed"
     return "32-true"
 
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler as _DistributedSampler
 
 def _with_sampler(loader, shuffle_default):
     if loader is None: return None
-    if isinstance(getattr(loader, "sampler", None), DistributedSampler):
+    if isinstance(getattr(loader, "sampler", None), _DistributedSampler):
         return loader
     ds = loader.dataset
-    sampler = DistributedSampler(ds, shuffle=shuffle_default)
+    sampler = _DistributedSampler(ds, shuffle=shuffle_default)
     return DataLoader(
         ds,
         batch_size=loader.batch_size,
@@ -2341,99 +3126,45 @@ def _with_sampler(loader, shuffle_default):
         pin_memory=loader.pin_memory,
         drop_last=loader.drop_last,
         collate_fn=loader.collate_fn,
-        sampler=sampler,       
+        sampler=sampler,
         shuffle=False,
     )
 
 def ensure_distributed_samplers(train_loader, val_loader):
-    # On ne se base QUE sur l'init réelle de torch.distributed (pas les env SLURM).
-    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
         return train_loader, val_loader
     return _with_sampler(train_loader, True), _with_sampler(val_loader, False)
 
-def trainer_common_kwargs():
-    import pytorch_lightning as pl
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
 
-    precision = choose_precision()
+def trainer_common_kwargs():
+    try:
+        from lightning_fabric.plugins.environments import SLURMEnvironment
+        slurm_env = SLURMEnvironment(auto_requeue=True)
+    except Exception:
+        slurm_env = None
+
+    num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("NUM_NODES", "1")))
+    raw = os.environ.get("SLURM_NTASKS_PER_NODE", os.environ.get("SLURM_TASKS_PER_NODE", "1"))
+    tasks_per_node = int(str(raw).split('(')[0])
+
+    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    devices = tasks_per_node if accelerator == "gpu" else 1
+    precision = "32-true"
+
     default_dir = os.environ.get("SLURM_JOB_ID", "runs_local")
     default_root_dir = f"./lightning_logs/{default_dir}"
 
-    devices = 1
-    num_nodes = 1
-    strategy: Union[str, "pl.strategies.Strategy"] = "auto"
+    strategy = pl.strategies.DDPStrategy(
+        cluster_environment=slurm_env,
+        find_unused_parameters=False,
+        gradient_as_bucket_view=True,
+        static_graph=False,
+        process_group_backend="nccl" if accelerator == "gpu" else "gloo",
+    )
 
-    force_ddp = _env_flag("PHYS_AE_FORCE_DDP")
-    disable_ddp = _env_flag("PHYS_AE_DISABLE_DDP")
-
-    if accelerator == "gpu":
-        visible_devices = max(1, torch.cuda.device_count())
-        requested_devices = _env_as_int("PHYS_AE_DEVICES")
-        if requested_devices is None:
-            requested_devices = _env_as_int("LOCAL_WORLD_SIZE", "SLURM_GPUS_ON_NODE", "SLURM_GPUS_PER_NODE")
-        if requested_devices is not None:
-            devices = max(1, min(visible_devices, requested_devices))
-        else:
-            devices = visible_devices
-
-        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
-        if requested_nodes is None:
-            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
-        num_nodes = max(1, requested_nodes) if requested_nodes else 1
-
-        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
-        expected_world = max(1, devices * num_nodes)
-
-        should_enable_ddp = False
-        if not disable_ddp:
-            if force_ddp:
-                should_enable_ddp = expected_world > 1
-            elif expected_world > 1:
-                if world_size_env is None or world_size_env == expected_world:
-                    should_enable_ddp = True
-                else:
-                    if on_rank_zero():
-                        print(
-                            f"[INFO] WORLD_SIZE={world_size_env} != devices*num_nodes={expected_world}; "
-                            "skipping automatic DDP initialisation."
-                        )
-            elif world_size_env and world_size_env > 1:
-                if on_rank_zero():
-                    print(
-                        f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device setup; "
-                        "not enabling DDP automatically."
-                    )
-
-        if should_enable_ddp:
-            get_master_addr_and_port()
-            try:
-                from pytorch_lightning.strategies import DDPStrategy
-                strategy = DDPStrategy(find_unused_parameters=False)
-            except Exception:
-                strategy = "ddp_find_unused_parameters_false"
-    else:
-        devices = 1
-        requested_nodes = _env_as_int("PHYS_AE_NUM_NODES")
-        if requested_nodes is None:
-            requested_nodes = _env_as_int("SLURM_JOB_NUM_NODES", "SLURM_NNODES")
-        num_nodes = max(1, requested_nodes) if requested_nodes else 1
-        world_size_env = _env_as_int("WORLD_SIZE", "SLURM_NTASKS")
-        expected_world = max(1, devices * num_nodes)
-
-        should_enable_ddp = False
-        if not disable_ddp:
-            if force_ddp:
-                should_enable_ddp = expected_world > 1
-            elif expected_world > 1 and (world_size_env is None or world_size_env == expected_world):
-                should_enable_ddp = True
-            elif world_size_env and world_size_env > 1 and on_rank_zero():
-                print(
-                    f"[INFO] Detected WORLD_SIZE={world_size_env} but single-device CPU setup; "
-                    "not enabling DDP automatically."
-                )
-
-        if should_enable_ddp:
-            strategy = "ddp"
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
     return dict(
         accelerator=accelerator,
@@ -2451,1076 +3182,106 @@ def trainer_common_kwargs():
 
 
 def on_rank_zero():
-    """Return True uniquement pour le rank global 0.
-
-    Avant l'initialisation explicite de torch.distributed (ex: avant le premier
-    Trainer DDP), ``torch.distributed.is_initialized()`` retourne False sur tous
-    les processus, ce qui faisait croire à chaque worker qu'il était le rank 0.
-    On complète donc la détection en se basant sur les variables d'environnement
-    (SLURM, TorchElastic, etc.) lorsque le backend distribué n'est pas encore
-    prêt.
-    """
-
-    if torch.distributed.is_available():
-        if torch.distributed.is_initialized():
-            try:
-                return torch.distributed.get_rank() == 0
-            except RuntimeError:
-                # Peut lever si le backend est dispo mais pas encore configuré
-                pass
-
-    env_rank = _env_as_int("RANK", "SLURM_PROCID", "PMI_RANK", "MPI_RANK", "LOCAL_RANK")
-    if env_rank is not None:
-        return env_rank == 0
-
-    # Fallback mono-process: si aucune info dispo on considère qu'on est seul
-    return True
-
-def _ensure_stage_structure(stage_dir: Path):
-    for sub in ("trials", "checkpoints", "logs", "figs", "eval", "retrain"):
-        (stage_dir / sub).mkdir(parents=True, exist_ok=True)
-
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
 
 def make_run_dir(base="runs"):
-    existing = os.environ.get("PHYS_AE_RUN_DIR")
-    if existing:
-        Path(existing).mkdir(parents=True, exist_ok=True)
-        _ensure_stage_structure(Path(existing) / "A")
-        _ensure_stage_structure(Path(existing) / "B")
-        (Path(existing) / "finetune" / "checkpoints").mkdir(parents=True, exist_ok=True)
-        (Path(existing) / "finetune" / "logs").mkdir(parents=True, exist_ok=True)
-        (Path(existing) / "finetune" / "figs").mkdir(parents=True, exist_ok=True)
-        return existing
+    job = os.environ.get("SLURM_JOB_ID", "local")
+    run_dir = os.path.join(base, f"{job}")
+    os.makedirs(run_dir, exist_ok=True)
+    for d in ("checkpoints", "figs", "eval", "logs"):
+        os.makedirs(os.path.join(run_dir, d), exist_ok=True)
+    return run_dir
 
-    job = os.environ.get("SLURM_JOB_ID")
-    if job:
-        run_dir = Path(base) / f"study_{job}"
-    else:
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        run_dir = Path(base) / f"study_local_{stamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    for stage in ("A", "B"):
-        _ensure_stage_structure(run_dir / stage)
-
-    finetune_dir = run_dir / "finetune"
-    for sub in ("checkpoints", "logs", "figs"):
-        (finetune_dir / sub).mkdir(parents=True, exist_ok=True)
-
-    os.environ["PHYS_AE_RUN_DIR"] = str(run_dir)
-    return str(run_dir)
-
-
-def get_stage_dir(run_dir: Path, stage: str) -> Path:
-    stage_dir = Path(run_dir) / stage.upper()
-    _ensure_stage_structure(stage_dir)
-    return stage_dir
-
-import yaml
-import numpy as np
 import torch
 
-# --- A) rendre sérialisable: tuples -> listes, numpy/torch -> python ---
-def _to_serializable(x):
-    if isinstance(x, tuple):
-        return [_to_serializable(v) for v in x]
-    if isinstance(x, list):
-        return [_to_serializable(v) for v in x]
-    if isinstance(x, dict):
-        return {k: _to_serializable(v) for k, v in x.items()}
-    if isinstance(x, (np.generic,)):   # numpy scalars
-        return x.item()
-    if isinstance(x, np.ndarray):
-        return x.tolist()
-    if isinstance(x, torch.Tensor):
-        return x.detach().cpu().tolist() if x.ndim else x.item()
-    return x
-
-class _NoAliasDumper(yaml.SafeDumper):
-    def ignore_aliases(self, data):
-        return True
-
-def save_config(run_dir_path, **cfg):
-    path = os.path.join(run_dir_path, "config.yaml")
-    clean = _to_serializable(cfg)  # plus de !!python/tuple / objets non serializables
-    with open(path, "w") as f:
-        yaml.dump(
-            clean, f,
-            Dumper=_NoAliasDumper,   # plus de &id/*id
-            sort_keys=False,
-            allow_unicode=True,
-            default_flow_style=False
-        )
-    return path
-
-
-"""
-Optuna tuning pour les étapes A (backbone+heads) et B1 (refiner) de ton pipeline.
-
-Pré-requis: place ton gros fichier (celui que tu as collé) sous le nom `pipeline.py`
-dans le même dossier que ce script, OU adapte `PIPELINE_MODULE` ci‑dessous.
-
-Ce script:
-  1) optimise Stage A → écrit RUN_DIR/checkpoints/A_opt.ckpt
-  2) optimise Stage B1 en repartant du meilleur A → écrit RUN_DIR/checkpoints/B_opt.ckpt
-  3) (optionnel) lance un court B2 (fine‑tune global) en repartant de B1 best → RUN_DIR/checkpoints/B2_final.ckpt
-
-Usage minimal:
-  python optuna_tuner.py --trials-a 20 --trials-b 20 --epochs-a 50 --epochs-b 30
-
-Tu peux relancer: les studies sont stockées en SQLite dans RUN_DIR.
-"""
-import os
-import math
-import shutil
-import argparse
-from pathlib import Path
-
-import optuna
-from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner
-from optuna.storages.journal import JournalFileBackend
-from optuna.storages import JournalStorage
-
-
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-
-import json, os, shutil, time
-from pathlib import Path
-
-# ---- callback à mettre près de ton objective() ----
-import torch
-import optuna
-import pytorch_lightning as pl
-
-class LossHistory(pl.callbacks.Callback):
-    def __init__(self, trial: optuna.trial.Trial):
-        self.trial = trial
-        self.train_hist = []
-        self.val_hist = []
-
-    @staticmethod
-    def _to_float(x):
-        if x is None:
-            return None
-        if isinstance(x, torch.Tensor):
-            x = x.detach().cpu()
-            x = x.item() if x.ndim == 0 else float(x.mean().item())
-        return float(x)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        cm = trainer.callback_metrics
-        # suivant ta config, la clé peut être train_loss_epoch ou train_loss
-        v = cm.get("train_loss_epoch", cm.get("train_loss", None))
-        self.train_hist.append(self._to_float(v))
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        cm = trainer.callback_metrics
-        # idem pour la val : val_loss_epoch ou val_loss
-        v = cm.get("val_loss_epoch", cm.get("val_loss", None))
-        v = self._to_float(v)
-        self.val_hist.append(v)
-
-        # (optionnel) reporter la val_loss à Optuna pour pruning/traçage
-        step = len(self.val_hist) - 1
-        if v is not None:
-            self.trial.report(v, step)
-            if self.trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
-
-    def on_fit_end(self, trainer, pl_module):
-        # stocke les historiques dans le trial → récupérable après l’étude
-        self.trial.set_user_attr("train_loss_history", self.train_hist)
-        self.trial.set_user_attr("val_loss_history", self.val_hist)
-
-
-class OptunaCSVLogger:
-    """Enregistre chaque trial Optuna dans un CSV et maintient le top 5."""
-
-    def __init__(self, stage_dir: Path, stage: str, top_k: int = 5):
-        self.stage_dir = Path(stage_dir)
-        self.stage = stage.upper()
-        self.top_k = top_k
-        self.csv_path = self.stage_dir / "trials.csv"
-        self.top_path = self.stage_dir / "top5.json"
-        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def __call__(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial):
-        self._append_trial(trial)
-        self._update_top(study)
-
-    def _append_trial(self, trial: optuna.trial.FrozenTrial):
-        record = {
-            "trial": trial.number,
-            "timestamp": datetime.utcnow().isoformat(),
-            "state": trial.state.name if trial.state else "UNKNOWN",
-            "value": "" if trial.value is None else float(trial.value),
-            "duration_s": trial.duration.total_seconds() if trial.duration else "",
-            "params": json.dumps(trial.params, sort_keys=True, ensure_ascii=False),
-        }
-
-        file_exists = self.csv_path.exists()
-        with self.csv_path.open("a", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=list(record.keys()))
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(record)
-
-    def _update_top(self, study: optuna.study.Study):
-        try:
-            trials = study.get_trials(deepcopy=False, states=None)
-        except Exception:
-            trials = study.trials
-
-        completed = [
-            t for t in trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-        ]
-        if not completed:
-            return
-
-        direction = getattr(study, "direction", None)
-        if direction is None:
-            directions = getattr(study, "directions", None)
-            direction = directions[0] if directions else optuna.study.StudyDirection.MINIMIZE
-
-        reverse = direction == optuna.study.StudyDirection.MAXIMIZE
-        completed.sort(key=lambda t: t.value, reverse=reverse)
-        top = completed[: self.top_k]
-
-        ckpt_attr = "best_ckpt_A" if self.stage.startswith("A") else "best_ckpt_B1"
-        payload = [
-            {
-                "rank": rank,
-                "trial": t.number,
-                "value": float(t.value),
-                "params": dict(t.params),
-                "checkpoint": t.user_attrs.get(ckpt_attr, ""),
-            }
-            for rank, t in enumerate(top, start=1)
-        ]
-
-        self.top_path.parent.mkdir(parents=True, exist_ok=True)
-        self.top_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
-
-
-def get_worker_info():
-    rank = int(os.environ.get("SLURM_PROCID") or os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or 0)
-    world = int(os.environ.get("SLURM_NTASKS") or os.environ.get("WORLD_SIZE") or 1)
-    return rank, world
-
-def wait_for_file(path, check_every=5, timeout=24*3600):
-    t0 = time.time()
-    while not os.path.isfile(path):
-        if time.time() - t0 > timeout:
-            raise TimeoutError(f"Timeout en attendant {path}")
-        time.sleep(check_every)
-    return path
-
-from typing import Tuple, Union
-from pathlib import Path
-import json, os, shutil, time
-
-def _atomic_update_best_ckpt(
-    src_ckpt: Union[str, Path],
-    new_score: float,
-    dest_ckpt: Union[str, Path],
-    meta_path: Union[str, Path],
-    direction: str = "min",
-) -> Tuple[bool, str]:
-    """
-    Copie src_ckpt -> dest_ckpt si new_score est meilleur que 'score' dans meta_path.
-    direction: 'min' (par défaut) ou 'max'.
-    Retourne (is_new_best, str(dest_ckpt)).
-    """
-    if not src_ckpt:
-        return False, str(dest_ckpt)
-
-    dest_ckpt = Path(dest_ckpt)
-    meta_path = Path(meta_path)
-    dest_ckpt.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # petit verrou (optionnel) pour éviter les races entre ranks
-    lock_fh = None
-    lock_path = meta_path.with_suffix(meta_path.suffix + ".lock")
-    try:
-        try:
-            import fcntl
-            lock_fh = open(lock_path, "w")
-            fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        except Exception:
-            lock_fh = None
-
-        cur = None
-        if meta_path.exists():
-            try:
-                cur = float(json.loads(meta_path.read_text()).get("score", None))
-            except Exception:
-                cur = None
-
-        if direction not in ("min", "max"):
-            raise ValueError("direction must be 'min' or 'max'")
-
-        is_better = (cur is None) or (
-            (direction == "min" and new_score < cur) or
-            (direction == "max" and new_score > cur)
-        )
-
-        if is_better:
-            tmp = dest_ckpt.with_suffix(dest_ckpt.suffix + f".tmp.{os.getpid()}")
-            shutil.copy2(str(src_ckpt), tmp)
-            os.replace(tmp, dest_ckpt)
-            meta_path.write_text(json.dumps({
-                "score": float(new_score),
-                "path": str(dest_ckpt),
-                "time": time.time()
-            }))
-            return True, str(dest_ckpt)
-
-        return False, str(dest_ckpt) if dest_ckpt.exists() else ""
-
-    finally:
-        if lock_fh:
-            try:
-                import fcntl
-                fcntl.flock(lock_fh, fcntl.LOCK_UN)
-                lock_fh.close()
-            except Exception:
-                pass
-
-
-def _cleanup_trial_checkpoint(path: Union[str, Path]):
-    if not path:
-        return
-
-    p = Path(path)
-    try:
-        if p.exists():
-            p.unlink()
-    except Exception:
-        pass
-
-    parent = p.parent
-    try:
-        if parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
-    except Exception:
-        pass
-
-
-def _cleanup_trial_dir(root: Union[str, Path]):
-    if not root:
-        return
-
-    root = Path(root)
-    try:
-        if root.exists():
-            shutil.rmtree(root, ignore_errors=True)
-    except Exception:
-        pass
-
-    parent = root.parent
-    try:
-        if parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
-    except Exception:
-        pass
-
-
-def _register_trial_best(stage_dir: Path, stage_name: str, best_path: Optional[str], best_score: float,
-                         direction: str = "min") -> str:
-    if not best_path:
-        return ""
-
-    dest_ckpt = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.ckpt"
-    meta_path = stage_dir / "checkpoints" / f"{stage_name}_optuna_best.json"
-    is_new_best, final_ckpt = _atomic_update_best_ckpt(best_path, best_score, dest_ckpt, meta_path, direction=direction)
-
-    _cleanup_trial_checkpoint(best_path)
-
-    if final_ckpt and os.path.isfile(final_ckpt):
-        return final_ckpt
-
-    return ""
-
-
-def _trial_dirs(run_dir: Path, stage: str, trial_number: int) -> dict[str, Path]:
-    stage_dir = get_stage_dir(run_dir, stage)
-    root = stage_dir / "trials" / f"trial_{trial_number:04d}"
-    ck   = root / "ckpts"
-    fig  = root / "figs"
-    for p in (root, ck, fig):
-        p.mkdir(parents=True, exist_ok=True)
-    return {"root": root, "ckpts": ck, "figs": fig}
-
-
-def _common_callbacks(stage: str, val_loader, fig_dir: Path, monitor: str = "val_loss",
-                      patience: int = 15, ckpt_dir: Optional[Path] = None) -> list:
-    if ckpt_dir is not None:
-        ckpt_dir = Path(ckpt_dir)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckp = ModelCheckpoint(
-        monitor=monitor,
-        mode="min",
-        save_top_k=1,
-        filename=f"best-{stage}",
-        save_last=False,
-        auto_insert_metric_name=False,
-        dirpath=str(ckpt_dir) if ckpt_dir is not None else None,
-    )
-    early = EarlyStopping(monitor=monitor, mode="min", patience=patience)
-    plot = PlotAndMetricsCallback(val_loader, PARAMS, num_examples=1, save_dir=str(fig_dir), stage_tag=f"stage_{stage}")
-    return [ckp, early, plot, UpdateEpochInDataset(), AdvanceDistributedSamplerEpoch()]
-
-
-def _score_from_callbacks(callbacks: list, fallback: float | None = None) -> tuple[float, str | None]:
-    ckps = [c for c in callbacks if isinstance(c, ModelCheckpoint)]
-    if ckps and ckps[0].best_model_path:
-        score = ckps[0].best_model_score
-        if score is not None:
-            try:
-                return float(score.cpu().item()), ckps[0].best_model_path
-            except Exception:
-                return float(score), ckps[0].best_model_path
-    # fallback (ex: aucune amélioration)
-    return (float("inf") if fallback is None else float(fallback), None)
-
-
-def _copy_ckpt(src_path: str | Path, dst_path: str | Path):
-    Path(dst_path).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(src_path), str(dst_path))
-
-
-def _cleanup_artifacts(paths: Iterable[Path | str]):
-    for p in paths:
-        if not p:
-            continue
-        path = Path(p)
-        if path.is_file():
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        elif path.is_dir():
-            shutil.rmtree(path, ignore_errors=True)
-
-
-# ===================== OBJECTIVE: STAGE A =====================
-
-def objective_stage_A(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int,
-                      n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
-    # --- Search space ---
-    base_lr = trial.suggest_float("base_lr", 1e-5, 5e-4, log=True)
-    backbone_variant = trial.suggest_categorical("backbone_variant", ["s"])  # compacité vs capacité
-    backbone_width_mult = trial.suggest_float("backbone_width_mult", 0.8, 1.3)
-    backbone_depth_mult = trial.suggest_float("backbone_depth_mult", 0.85, 1.35)
-    backbone_drop_path  = trial.suggest_float("backbone_drop_path", 0.0, 0.2)
-    backbone_se_ratio   = trial.suggest_float("backbone_se_ratio", 0.15, 0.35)
-    huber_beta          = trial.suggest_float("huber_beta", 5e-4, 5e-3, log=True)
-    batch_size          = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
-
-    # Dossiers dédiés au trial
-    stage_dir = get_stage_dir(run_dir, "A")
-    dirs = _trial_dirs(run_dir, stage="A", trial_number=trial.number)
-
-    # Construire data + modèle avec HPs trial
-    model, train_loader, val_loader = build_data_and_model(
-        seed=seed,
-        n_train=n_train_samples,
-        n_val=n_val_samples,
-        batch_size=batch_size,
-        huber_beta=huber_beta,
-        backbone_variant=backbone_variant,
-        backbone_width_mult=backbone_width_mult,
-        backbone_depth_mult=backbone_depth_mult,
-        backbone_drop_path=backbone_drop_path,
-        backbone_se_ratio=backbone_se_ratio,
+def choose_precision():
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            return "bf16-mixed"
+        if torch.cuda.get_device_capability(0)[0] >= 7:
+            return "16-mixed"
+    return "32-true"
+
+def trainer_common_kwargs():
+    return dict(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,                     # 1 seul GPU local
+        # PAS de 'strategy' ici
+        precision=choose_precision(),
+        default_root_dir="./lightning_logs_notebook",
+        enable_progress_bar=True,
+        log_every_n_steps=5,
+        deterministic=False,
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
     )
 
-    # Trainer kwargs (on force 1 device pour éviter des essais multi-GPU par trial)
-    tkw = trainer_common_kwargs()
-    tkw["devices"] = 1
-    tkw["num_nodes"] = 1
-    tkw["strategy"] = "auto"
-    tkw["default_root_dir"] = str(dirs["root"] / "logs")
 
-    # Callbacks
-    callbacks = _common_callbacks("A", val_loader, fig_dir=dirs["figs"], patience=12, ckpt_dir=dirs["ckpts"])
-    callbacks = [LossHistory(trial), *callbacks] 
-    # Lancement stage A
-    train_stage_A(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        base_lr=base_lr,
-        callbacks=callbacks,
-        # ckpt_out facultatif ici (ModelCheckpoint gère l'early/best)
-        **tkw,
-    )
 
-    # Récup meilleure val_loss + ckpt
-    # Récup meilleure val_loss + ckpt
-    best_score, best_path = _score_from_callbacks(callbacks)
-    global_ckpt = _register_trial_best(stage_dir, "A", best_path, best_score, direction="min")
 
-    trial.set_user_attr("best_ckpt_A", global_ckpt)
-    trial.set_user_attr("best_val_A", best_score)
+tkw = trainer_common_kwargs()
+
+
+# 1) Build avec P,T prédits ET dans FiLM
+model, train_loader, val_loader = build_data_and_model(
+    seed=42,
+    n_points=800,
+    n_train=5000,       
+    n_val=500,          
+    batch_size=32,
+    backbone_variant="s",
+    backbone_width_mult=1.2,
+    backbone_depth_mult=0.8,
+    refiner_variant="s",
+    refiner_width_mult=1.2,
+    refiner_depth_mult=0.8,
+    qtpy_dir="C:/Users/goff0007/Documents/Aerolab/Python_code/PINN/QTpy",
+    predict_list=["sig0", "dsig", "mf_CH4", "mf_H2O", "baseline1", "baseline2", "P", "T"],  # ✓
+    film_list=[],  # ✓
+)
+
+# 1) Crée les callbacks de visu/epoch
+cb_visu_stage = StageAwarePlotCallback(
+    val_loader=val_loader,
+    param_names=model.param_names,     # <- important
+    num_examples=1,
+    save_dir="./figs_local/stageA",    # où sauvegarder les PNG
+    stage_tag="StageA",                # titre sur la figure
+    refine=False,                      # Stage A = pas de raffinement
+    cascade_stages_override=None,      # auto
+    use_gt_for_provided=True,          # mêmes conventions que ton code
+    recon_PT="pred",                   # PT issus du modèle
+    max_val_batches=None               # optionnel (ex: 10 pour accélérer)
+)
+
+cb_pt_compare = PT_PredVsExp_VisuCallback(
+    val_loader,
+    save_dir="./figs_local/PT",
+    num_examples=1,
+    tag="PT_pred_vs_exp",
+    use_gt_for_provided=True
+)
+cb_pt_compare.refine = False      # <- clé : désactiver le refine pour ce callback en Stage A
+
+callbacks = [
+    cb_visu_stage,            # <- affiche MSE global + erreurs % par param sur la figure
+    cb_pt_compare,            # comparaison PT=pred vs PT=exp
+    UpdateEpochInDataset(),   # keep
+    UpdateEpochInValDataset() # keep
+]
+
+# 2) Entraînement Stage A
+model = train_stage_A(
+    model, train_loader, val_loader,
+    epochs=100,
+    base_lr=1e-4,
+    train_film=False,     # on entraîne FiLM en A (comme tu voulais)
+    use_film=False,       # on l’active
+    film_subset=[],
+    heads_subset=["sig0","dsig","P","T","mf_CH4","mf_H2O","baseline1","baseline2"],
+    callbacks=callbacks,  # <- utilise la liste corrigée
+    **tkw,
+)
 
-    _cleanup_trial_dir(dirs.get("root"))
-    return best_score
-
-
-
-
-# ===================== OBJECTIVE: STAGE B1 =====================
-
-def objective_stage_B1(trial: optuna.Trial, *, run_dir: Path, epochs: int, seed: int, ckpt_A: str,
-                       n_train_samples: int = 100_000, n_val_samples: int = 500) -> float:
-    # --- Search space (refiner-centric) ---
-    refiner_lr = trial.suggest_float("refiner_lr", 1e-6, 3e-4, log=True)
-    refine_steps = trial.suggest_int("refine_steps", 1, 1)
-    delta_scale  = trial.suggest_float("delta_scale", 0.02, 0.15)
-    refiner_variant = trial.suggest_categorical("refiner_variant", ["s"])
-    refiner_width_mult = trial.suggest_float("refiner_width_mult", 0.85, 1.35)
-    refiner_depth_mult = trial.suggest_float("refiner_depth_mult", 0.85, 1.35)
-    refiner_feature_pool = trial.suggest_categorical("refiner_feature_pool", ["avg"])
-    refiner_shared_hidden_scale = trial.suggest_float("refiner_shared_hidden_scale", 0.35, 0.8)
-    refiner_time_embed_dim = trial.suggest_categorical("refiner_time_embed_dim", [16, 24, 32, 48, 64])
-
-    batch_size = trial.suggest_categorical("batch_size", [8, 12, 16, 24, 32])
-
-    stage_dir = get_stage_dir(run_dir, "B")
-    dirs = _trial_dirs(run_dir, stage="B", trial_number=trial.number)
-
-    # IMPORTANT: reconstruit le modèle avec les HP refiner (le backbone peut rester celui du meilleur A)
-    model, train_loader, val_loader = build_data_and_model(
-        seed=seed,
-        n_train=n_train_samples,
-        n_val=n_val_samples,
-        batch_size=batch_size,
-        refiner_variant=refiner_variant,
-        refiner_width_mult=refiner_width_mult,
-        refiner_depth_mult=refiner_depth_mult,
-        refiner_feature_pool=refiner_feature_pool,
-        refiner_shared_hidden_scale=refiner_shared_hidden_scale,
-        refiner_time_embed_dim=refiner_time_embed_dim,
-    )
-
-    # Trainer kwargs
-    tkw = trainer_common_kwargs()
-    tkw["devices"] = 1
-    tkw["num_nodes"] = 1
-    tkw["strategy"] = "auto"
-    tkw["default_root_dir"] = str(dirs["root"] / "logs")
-
-    callbacks = _common_callbacks("B1", val_loader, fig_dir=dirs["figs"], patience=10, ckpt_dir=dirs["ckpts"])
-    callbacks = [LossHistory(trial), *callbacks] 
-
-
-    # Lancement B1 en repartant de A
-    train_stage_B1(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        refiner_lr=refiner_lr,
-        refine_steps=refine_steps,
-        delta_scale=delta_scale,
-        callbacks=callbacks,
-        ckpt_in=ckpt_A,
-        **tkw,
-    )
-
-    # Récup meilleure val_loss + ckpt
-    best_score, best_path = _score_from_callbacks(callbacks)
-    global_ckpt = _register_trial_best(stage_dir, "B1", best_path, best_score, direction="min")
-
-    trial.set_user_attr("best_ckpt_B1", global_ckpt)
-    trial.set_user_attr("best_val_B1", best_score)
-
-    _cleanup_trial_dir(dirs.get("root"))
-    return best_score
-
-
-
-# ===================== RUNNERS =====================
-
-def run_optuna_stage_A(n_trials: int, epochs: int, seed: int,
-                       n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
-    run_dir = Path(make_run_dir())
-    stage_dir = get_stage_dir(run_dir, "A")
-    optuna_dir = stage_dir / "optuna"
-    optuna_dir.mkdir(parents=True, exist_ok=True)
-    journal_path = optuna_dir / "journal.log"
-    storage = JournalStorage(JournalFileBackend(str(journal_path)))
-
-    study = optuna.create_study(
-        study_name="stage_A_opt",
-        storage=storage,
-        direction="minimize",
-        sampler=TPESampler(seed=seed),
-        pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
-        load_if_exists=True,
-    )
-
-    def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_A(
-            trial,
-            run_dir=run_dir,
-            epochs=epochs,
-            seed=seed,
-            n_train_samples=n_train_samples,
-            n_val_samples=n_val_samples,
-        )
-
-    csv_logger = OptunaCSVLogger(stage_dir, stage="A")
-    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
-
-    # ► meilleur global (tous workers) + artefacts
-    best = study.best_trial
-    best_ckpt_src = best.user_attrs.get("best_ckpt_A", "")
-    if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
-        raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de A.")
-
-    dest_ckpt = stage_dir / "checkpoints" / "A_opt.ckpt"
-    meta_path = stage_dir / "checkpoints" / "A_best.json"
-    _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
-
-    # ► JSON des meilleurs hyperparams d'A
-    if on_rank_zero():
-        _save_best_params_json("A", best, str(dest_ckpt), stage_dir)
-
-    print(f"✓ A_opt prêt: {dest_ckpt}")
-    return str(dest_ckpt), float(best.value), dict(best.params)
-
-def run_optuna_stage_B1(n_trials: int, epochs: int, seed: int, ckpt_A_path: str,
-                        n_train_samples: int, n_val_samples: int) -> tuple[str, float, dict]:
-    run_dir = Path(make_run_dir())
-    stage_dir = get_stage_dir(run_dir, "B")
-    optuna_dir = stage_dir / "optuna"
-    optuna_dir.mkdir(parents=True, exist_ok=True)
-    journal_path = optuna_dir / "journal.log"
-    storage = JournalStorage(JournalFileBackend(str(journal_path)))
-
-    study = optuna.create_study(
-        study_name="stage_B1_opt",
-        storage=storage,
-        direction="minimize",
-        sampler=TPESampler(seed=seed),
-        pruner=MedianPruner(n_startup_trials=4, n_warmup_steps=0),
-        load_if_exists=True,
-    )
-
-    def _obj(trial: optuna.Trial) -> float:
-        return objective_stage_B1(
-            trial,
-            run_dir=run_dir,
-            epochs=epochs,
-            seed=seed,
-            ckpt_A=ckpt_A_path,
-            n_train_samples=n_train_samples,
-            n_val_samples=n_val_samples,
-        )
-
-    csv_logger = OptunaCSVLogger(stage_dir, stage="B")
-    study.optimize(_obj, n_trials=n_trials, callbacks=[csv_logger], show_progress_bar=True)
-
-    best = study.best_trial
-    best_ckpt_src = best.user_attrs.get("best_ckpt_B1", "")
-    if not best_ckpt_src or not os.path.isfile(best_ckpt_src):
-        raise RuntimeError("Aucune checkpoint valide trouvée après l'optimisation de B1.")
-
-    dest_ckpt = stage_dir / "checkpoints" / "B_opt.ckpt"
-    meta_path = stage_dir / "checkpoints" / "B_best.json"
-    _atomic_update_best_ckpt(best_ckpt_src, float(best.value), dest_ckpt, meta_path, direction="min")
-
-    # ► JSON des meilleurs hyperparams de B (B1)
-    if on_rank_zero():
-        _save_best_params_json("B", best, str(dest_ckpt), stage_dir)
-
-    print(f"✓ B_opt prêt: {dest_ckpt}")
-    return str(dest_ckpt), float(best.value), dict(best.params)
-
-
-def _best_source_from_callbacks(callbacks: list, fallback_ckpt: Optional[Path]) -> tuple[str, float]:
-    score, path = _score_from_callbacks(callbacks)
-    if path and os.path.isfile(path):
-        return path, float(score)
-    if fallback_ckpt is not None and fallback_ckpt.exists():
-        return str(fallback_ckpt), float(score)
-    return "", float(score)
-
-
-def retrain_stage_A(best_params: dict, *, epochs: int, seed: int, n_train: int = 1_000_000) -> tuple[str, float]:
-    run_dir = Path(make_run_dir())
-    stage_dir = get_stage_dir(run_dir, "A")
-    retrain_dir = stage_dir / "retrain"
-    logs_dir = retrain_dir / "logs"
-    figs_dir = retrain_dir / "figs"
-    ckpts_dir = retrain_dir / "ckpts"
-    for p in (logs_dir, figs_dir, ckpts_dir):
-        p.mkdir(parents=True, exist_ok=True)
-
-    batch_size = int(best_params.get("batch_size", 16))
-    model, train_loader, val_loader = build_data_and_model(
-        seed=seed,
-        n_train=n_train,
-        batch_size=batch_size,
-        huber_beta=float(best_params.get("huber_beta", 0.002)),
-        backbone_variant=best_params.get("backbone_variant", "s"),
-        backbone_width_mult=float(best_params.get("backbone_width_mult", 1.0)),
-        backbone_depth_mult=float(best_params.get("backbone_depth_mult", 1.0)),
-        backbone_drop_path=float(best_params.get("backbone_drop_path", 0.0)),
-        backbone_se_ratio=float(best_params.get("backbone_se_ratio", 0.25)),
-    )
-
-    tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
-
-    callbacks = _common_callbacks("A_retrain", val_loader, fig_dir=figs_dir, patience=15, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "A_fine_tuned_last.ckpt"
-
-    train_stage_A(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        base_lr=float(best_params.get("base_lr", 2e-4)),
-        callbacks=callbacks,
-        ckpt_out=str(ckpt_last),
-        **tkw,
-    )
-
-    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
-
-    dest_ckpt = stage_dir / "checkpoints" / "A_fine_tuned.ckpt"
-    meta_path = stage_dir / "checkpoints" / "A_fine_tuned.json"
-    if best_src:
-        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
-
-    _cleanup_artifacts([ckpt_last, ckpts_dir])
-
-    _dump_json(stage_dir / "checkpoints" / "A_fine_tuned_params.json", {
-        "params": dict(best_params),
-        "epochs": epochs,
-        "n_train": n_train,
-        "batch_size": batch_size,
-        "source_checkpoint": best_src,
-    })
-
-    return str(dest_ckpt), best_score
-
-
-def retrain_stage_B(best_params: dict, stage_a_params: dict, stage_a_ckpt: str, *, epochs: int, seed: int,
-                    n_train: int = 1_000_000) -> tuple[str, float]:
-    run_dir = Path(make_run_dir())
-    stage_dir = get_stage_dir(run_dir, "B")
-    retrain_dir = stage_dir / "retrain"
-    logs_dir = retrain_dir / "logs"
-    figs_dir = retrain_dir / "figs"
-    ckpts_dir = retrain_dir / "ckpts"
-    for p in (logs_dir, figs_dir, ckpts_dir):
-        p.mkdir(parents=True, exist_ok=True)
-
-    batch_size = int(best_params.get("batch_size", stage_a_params.get("batch_size", 16)))
-    model, train_loader, val_loader = build_data_and_model(
-        seed=seed,
-        n_train=n_train,
-        batch_size=batch_size,
-        huber_beta=float(stage_a_params.get("huber_beta", 0.002)),
-        backbone_variant=stage_a_params.get("backbone_variant", "s"),
-        backbone_width_mult=float(stage_a_params.get("backbone_width_mult", 1.0)),
-        backbone_depth_mult=float(stage_a_params.get("backbone_depth_mult", 1.0)),
-        backbone_drop_path=float(stage_a_params.get("backbone_drop_path", 0.0)),
-        backbone_se_ratio=float(stage_a_params.get("backbone_se_ratio", 0.25)),
-        refiner_variant=best_params.get("refiner_variant", "s"),
-        refiner_width_mult=float(best_params.get("refiner_width_mult", 1.0)),
-        refiner_depth_mult=float(best_params.get("refiner_depth_mult", 1.0)),
-        refiner_feature_pool=best_params.get("refiner_feature_pool", "avg"),
-        refiner_shared_hidden_scale=float(best_params.get("refiner_shared_hidden_scale", 0.5)),
-        refiner_time_embed_dim=best_params.get("refiner_time_embed_dim", None),
-    )
-
-    tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
-
-    callbacks = _common_callbacks("B_retrain", val_loader, fig_dir=figs_dir, patience=12, ckpt_dir=ckpts_dir)
-    ckpt_last = retrain_dir / "B_fine_tuned_last.ckpt"
-
-    train_stage_B1(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        refiner_lr=float(best_params.get("refiner_lr", 1e-5)),
-        refine_steps=int(best_params.get("refine_steps", 1)),
-        delta_scale=float(best_params.get("delta_scale", 0.1)),
-        callbacks=callbacks,
-        ckpt_in=stage_a_ckpt,
-        ckpt_out=str(ckpt_last),
-        **tkw,
-    )
-
-    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
-
-    dest_ckpt = stage_dir / "checkpoints" / "B_fine_tuned.ckpt"
-    meta_path = stage_dir / "checkpoints" / "B_fine_tuned.json"
-    if best_src:
-        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
-
-    _cleanup_artifacts([ckpt_last, ckpts_dir])
-
-    _dump_json(stage_dir / "checkpoints" / "B_fine_tuned_params.json", {
-        "params": dict(best_params),
-        "epochs": epochs,
-        "n_train": n_train,
-        "batch_size": batch_size,
-        "stage_a_checkpoint": stage_a_ckpt,
-        "source_checkpoint": best_src,
-    })
-
-    return str(dest_ckpt), best_score
-
-
-def finetune_ensemble(ckpt_B_path: str, best_a_params: dict, best_b_params: dict, *, epochs: int, seed: int,
-                      n_train: int = 1_000_000) -> tuple[str, float]:
-    run_dir = Path(make_run_dir())
-    finetune_dir = Path(run_dir) / "finetune"
-    logs_dir = finetune_dir / "logs"
-    figs_dir = finetune_dir / "figs"
-    tmp_ckpt_dir = finetune_dir / "tmp_ckpts"
-    for p in (logs_dir, figs_dir):
-        p.mkdir(parents=True, exist_ok=True)
-
-    batch_size = int(best_b_params.get("batch_size", best_a_params.get("batch_size", 16)))
-    model, train_loader, val_loader = build_data_and_model(
-        seed=seed,
-        n_train=n_train,
-        batch_size=batch_size,
-        huber_beta=float(best_a_params.get("huber_beta", 0.002)),
-        backbone_variant=best_a_params.get("backbone_variant", "s"),
-        backbone_width_mult=float(best_a_params.get("backbone_width_mult", 1.0)),
-        backbone_depth_mult=float(best_a_params.get("backbone_depth_mult", 1.0)),
-        backbone_drop_path=float(best_a_params.get("backbone_drop_path", 0.0)),
-        backbone_se_ratio=float(best_a_params.get("backbone_se_ratio", 0.25)),
-        refiner_variant=best_b_params.get("refiner_variant", "s"),
-        refiner_width_mult=float(best_b_params.get("refiner_width_mult", 1.0)),
-        refiner_depth_mult=float(best_b_params.get("refiner_depth_mult", 1.0)),
-        refiner_feature_pool=best_b_params.get("refiner_feature_pool", "avg"),
-        refiner_shared_hidden_scale=float(best_b_params.get("refiner_shared_hidden_scale", 0.5)),
-        refiner_time_embed_dim=best_b_params.get("refiner_time_embed_dim", None),
-    )
-
-    tkw = trainer_common_kwargs()
-    tkw["default_root_dir"] = str(logs_dir)
-
-    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    callbacks = _common_callbacks("B2_finetune", val_loader, fig_dir=figs_dir, patience=10, ckpt_dir=tmp_ckpt_dir)
-    ckpt_last = finetune_dir / "checkpoints" / "finetune_last.ckpt"
-
-    train_stage_B2(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        base_lr=float(best_a_params.get("base_lr", 3e-5)),
-        refiner_lr=float(best_b_params.get("refiner_lr", 3e-6)),
-        refine_steps=int(best_b_params.get("refine_steps", 1)),
-        delta_scale=float(best_b_params.get("delta_scale", 0.1)),
-        callbacks=callbacks,
-        ckpt_in=ckpt_B_path,
-        ckpt_out=str(ckpt_last),
-        **tkw,
-    )
-
-    best_src, best_score = _best_source_from_callbacks(callbacks, ckpt_last)
-
-    dest_ckpt = finetune_dir / "checkpoints" / "ensemble_best.ckpt"
-    meta_path = finetune_dir / "checkpoints" / "ensemble_best.json"
-    if best_src:
-        _atomic_update_best_ckpt(best_src, best_score, dest_ckpt, meta_path, direction="min")
-
-    _dump_json(finetune_dir / "checkpoints" / "ensemble_finetune_params.json", {
-        "stage_A_params": dict(best_a_params),
-        "stage_B_params": dict(best_b_params),
-        "epochs": epochs,
-        "n_train": n_train,
-        "batch_size": batch_size,
-        "source_checkpoint": ckpt_B_path,
-        "selected_checkpoint": best_src,
-    })
-
-    return str(dest_ckpt), best_score
-
-
-def optional_finetune_B2(ckpt_B1_path: str, epochs: int = 20):
-    """Fine-tune global court (B2) en repartant du meilleur B1."""
-    run_dir = Path(make_run_dir())
-
-    model, train_loader, val_loader = build_data_and_model()
-
-    tkw = trainer_common_kwargs()
-    tkw["devices"] = 1
-    tkw["num_nodes"] = 1
-    tkw["strategy"] = "auto"
-    ft_dir = Path(run_dir) / "finetune"
-    tkw["default_root_dir"] = str(ft_dir / "logs")
-
-    tmp_ckpt_dir = ft_dir / "tmp_ckpts"
-    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    out_path = ft_dir / "checkpoints" / "B2_optional.ckpt"
-    callbacks = _common_callbacks("B2_optional", val_loader, fig_dir=ft_dir / "figs", patience=8, ckpt_dir=tmp_ckpt_dir)
-
-    train_stage_B2(
-        model, train_loader, val_loader,
-        epochs=epochs,
-        base_lr=3e-5, refiner_lr=3e-6,
-        refine_steps=1, delta_scale=0.08,
-        callbacks=callbacks,
-        ckpt_in=ckpt_B1_path,
-        ckpt_out=str(out_path),
-        **tkw,
-    )
-
-    best_score, best_path = _score_from_callbacks(callbacks)
-    print(f"\n✓ B2 terminé — best val_loss={best_score:.6g}; ckpt={best_path or out_path}")
-
-if __name__ == "__main__":
-    import argparse, math, json, os
-    from pathlib import Path
-
-    parser = argparse.ArgumentParser(description="Optuna tuner pour stages A et B1")
-    parser.add_argument("--trials-a", type=int, default=200, help="Nombre d'essais Optuna pour A")
-    parser.add_argument("--trials-b", type=int, default=200, help="Nombre d'essais Optuna pour B1")
-    parser.add_argument("--epochs-a", type=int, default=50, help="Epochs par essai pour A")
-    parser.add_argument("--epochs-b", type=int, default=50, help="Epochs par essai pour B1")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train-samples", type=int, default=100_000,
-                        help="Nombre d'échantillons synthétiques pour chaque essai (train)")
-    parser.add_argument("--val-samples", type=int, default=500,
-                        help="Nombre d'échantillons synthétiques pour la validation des essais")
-    parser.add_argument("--retrain-samples", type=int, default=1_000_000,
-                        help="Nombre d'échantillons synthétiques pour les ré-entraînements finaux")
-    # Par défaut on NE lance PAS B2 ; pour l'activer, passer --run-b2
-    parser.add_argument("--run-b2", action="store_true", help="Lancer le fine-tune B2 final")
-    args = parser.parse_args()
-
-    run_dir = Path(make_run_dir())
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-
-    # Répartition des trials entre workers (un process ~ un GPU)
-    rank, world = get_worker_info()
-    world = max(1, world)
-
-    trials_a_each = max(1, math.ceil(args.trials_a / world))
-    trials_b_each = max(1, math.ceil(args.trials_b / world))
-
-    if on_rank_zero():
-        print(f"[stage A] essais totaux demandés={args.trials_a} → par worker={trials_a_each}")
-    a_ckpt, a_best, a_params = run_optuna_stage_A(
-        n_trials=trials_a_each,
-        epochs=args.epochs_a,
-        seed=args.seed,
-        n_train_samples=args.train_samples,
-        n_val_samples=args.val_samples,
-    )
-
-    # S'assure que le meilleur ckpt A est bien écrit (cas multi-workers)
-    wait_for_file(a_ckpt)
-
-    if on_rank_zero():
-        print(f"[stage B] essais totaux demandés={args.trials_b} → par worker={trials_b_each}")
-    b_ckpt, b_best, b_params = run_optuna_stage_B1(
-        n_trials=trials_b_each,
-        epochs=args.epochs_b,
-        seed=args.seed,
-        ckpt_A_path=a_ckpt,
-        n_train_samples=args.train_samples,
-        n_val_samples=args.val_samples,
-    )
-
-    wait_for_file(b_ckpt)
-
-    if on_rank_zero():
-        print("\n========== RÉ-ENTRAÎNEMENT STAGE A ==========")
-        a_re_ckpt, a_re_score = retrain_stage_A(
-            a_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(a_re_ckpt)
-
-        print("\n========== RÉ-ENTRAÎNEMENT STAGE B ==========")
-        b_re_ckpt, b_re_score = retrain_stage_B(
-            b_params, a_params, a_re_ckpt, epochs=5, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(b_re_ckpt)
-
-        print("\n========== FINE-TUNE ENSEMBLE ==========")
-        ensemble_ckpt, ensemble_score = finetune_ensemble(
-            b_re_ckpt, a_params, b_params, epochs=5, seed=args.seed, n_train=args.retrain_samples
-        )
-        wait_for_file(ensemble_ckpt)
-
-        stage_dir_A = get_stage_dir(run_dir, "A")
-        stage_dir_B = get_stage_dir(run_dir, "B")
-
-        a_err_files = {}
-        b_err_files = {}
-        try:
-            a_err_files = export_param_errors_files(
-                a_re_ckpt, "A", refine=False, split="val", robust_smape=False
-            )
-        except Exception as e:
-            print(f"[warn] export erreurs A a échoué: {e}")
-        try:
-            b_err_files = export_param_errors_files(
-                ensemble_ckpt, "B", refine=True, split="val", robust_smape=False
-            )
-        except Exception as e:
-            print(f"[warn] export erreurs B a échoué: {e}")
-
-        summary = {
-            "study_root": str(run_dir),
-            "A": {
-                "optuna": {
-                    "ckpt": a_ckpt,
-                    "best_val_loss": a_best,
-                    "best_params": a_params,
-                },
-                "retrain": {
-                    "ckpt": a_re_ckpt,
-                    "best_val_loss": a_re_score,
-                    "epochs": 5,
-                    "n_train": args.retrain_samples,
-                },
-                "trials_csv": str(stage_dir_A / "trials.csv"),
-                "top5_params": str(stage_dir_A / "top5.json"),
-                "errors_files": a_err_files,
-            },
-            "B": {
-                "optuna": {
-                    "ckpt": b_ckpt,
-                    "best_val_loss": b_best,
-                    "best_params": b_params,
-                },
-                "retrain": {
-                    "ckpt": b_re_ckpt,
-                    "best_val_loss": b_re_score,
-                    "epochs": 5,
-                    "n_train": args.retrain_samples,
-                },
-                "trials_csv": str(stage_dir_B / "trials.csv"),
-                "top5_params": str(stage_dir_B / "top5.json"),
-                "errors_files": b_err_files,
-            },
-            "ensemble": {
-                "ckpt": ensemble_ckpt,
-                "best_val_loss": ensemble_score,
-                "epochs": 5,
-                "n_train": args.retrain_samples,
-            },
-        }
-
-        out_summary = run_dir / "summary.json"
-        out_summary.parent.mkdir(parents=True, exist_ok=True)
-        out_summary.write_text(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
-
-        print(json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=False))
-
-    # Fine-tune B2 optionnel, seulement sur le rank 0
-    if args.run_b2 and rank == 0:
-        print("\n========== OPTIONAL FINE-TUNE B2 ==========")
-        optional_finetune_B2(b_ckpt, epochs=20)
