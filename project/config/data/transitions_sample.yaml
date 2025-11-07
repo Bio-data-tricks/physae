@@ -45,3 +45,5 @@ transitions:
       nDicke: 0.27
       lmf: 0.005
       nlmf: 0.60
+poly_frequency:
+  CH4: [5995.0, 0.009765625, 0.0]

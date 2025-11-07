@@ -136,22 +136,18 @@ num_points = 1024      # Spectral resolution (pixels)
 
 ### Frequency Grid
 
-The frequency grid maps pixel indices to wavenumber positions:
+The frequency grid maps pixel indices to wavenumber positions. Provide the
+calibration polynomial alongside your transitions YAML using the
+``poly_frequency`` section:
 
-```python
-poly_freq_CH4 = [
-    5995.0,              # Starting wavenumber [cm^-1]
-    10.0 / 1024,         # Wavenumber per pixel [cm^-1/pixel]
-    0.0                  # Curvature (0 for linear)
-]
+```yaml
+poly_frequency:
+  CH4: [5995.0, 0.009765625, 0.0]  # [offset, slope, curvature, ...]
 ```
 
-This defines: wavenumber(pixel) = 5995.0 + (10.0/1024) × pixel
-
-For non-linear grids (e.g., from calibration), add higher-order terms:
-```python
-poly_freq_CH4 = [c0, c1, c2, c3, ...]  # Higher order polynomial
-```
+When omitted, the training pipeline falls back to the linear grid defined by
+the predicted ``sig0`` and ``dsig`` parameters, matching the original
+``physae.py`` behaviour when no calibration polynomial is available.
 
 ## Model Configuration
 

@@ -55,8 +55,10 @@ def create_datasets(args):
         # 'H2O': transitions_H2O,
     }
 
-    # TODO: Define polynomial frequency coefficients
-    poly_freq_CH4 = []  # Your coefficients here
+    # TODO: Define polynomial frequency coefficients. Provide the exact values
+    # from your spectrometer calibration; pass ``None`` to rely on a linear grid
+    # when no correction is available.
+    poly_freq_CH4 = None
 
     # Create datasets
     train_dataset = SpectraDataset(
@@ -113,7 +115,7 @@ def main():
 
     # TODO: Load transitions data
     transitions_dict = {}
-    poly_freq_CH4 = []
+    poly_freq_CH4 = None
 
     # Create model
     print("Creating model...")

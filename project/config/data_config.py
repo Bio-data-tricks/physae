@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Tuple
 
 from utils.io import load_config
 from config.params import PARAMS, NORM_PARAMS, LOG_SCALE_PARAMS
@@ -108,16 +108,24 @@ def load_noise_profile(path: str | Path) -> Dict[str, float | Iterable[float] | 
     return dict(noise)
 
 
-def load_transitions(path: str | Path) -> Dict[str, list[dict]]:
+def load_transitions(
+    path: str | Path,
+    *,
+    include_poly_freq: bool = False,
+) -> Dict[str, list[dict]] | Tuple[Dict[str, list[dict]], Dict[str, list[float]]]:
     """Load molecular transitions from YAML configuration.
 
     Args:
         path: Path to the YAML file describing molecular transitions.
+        include_poly_freq: When ``True``, also return polynomial frequency
+            coefficients parsed from the optional ``poly_frequency`` mapping in
+            the YAML file.
 
     Returns:
-        Dictionary mapping molecule identifiers (e.g. ``"CH4"``) to a list of
-        transition dictionaries compatible with
-        :func:`physics.transitions.transitions_to_tensors`.
+        If ``include_poly_freq`` is ``False`` (default), only the transitions
+        dictionary is returned.  When ``True``, a tuple ``(transitions,
+        poly_frequency)`` is produced where ``poly_frequency`` maps molecule
+        names to lists of polynomial coefficients.
     """
 
     cfg = load_config(str(_as_path(path)))
@@ -162,6 +170,26 @@ def load_transitions(path: str | Path) -> Dict[str, list[dict]]:
                 }
             )
         transitions_dict[mol] = parsed_entries
+
+    raw_poly = cfg.get("poly_frequency", {})
+    if raw_poly is None:
+        raw_poly = {}
+    if not isinstance(raw_poly, Mapping):
+        raise ValueError("'poly_frequency' must be a mapping of molecule -> coefficients")
+
+    poly_freq: Dict[str, list[float]] = {}
+    for mol, coeffs in raw_poly.items():
+        if coeffs is None:
+            continue
+        if not isinstance(coeffs, Iterable) or isinstance(coeffs, (str, bytes)):
+            raise ValueError(
+                f"Polynomial frequency coefficients for molecule '{mol}' must be an iterable of numbers"
+            )
+        parsed = [float(c) for c in coeffs]
+        poly_freq[mol] = parsed
+
+    if include_poly_freq:
+        return transitions_dict, poly_freq
     return transitions_dict
 
 

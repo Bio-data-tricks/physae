@@ -3,7 +3,7 @@ Physically Informed Autoencoder (Lightning Module).
 
 Complete implementation extracted from the original physae.py file.
 """
-from typing import List, Optional
+from typing import List, Optional, Sequence
 import math
 import torch
 import torch.nn as nn
@@ -60,7 +60,7 @@ class PhysicallyInformedAE(pl.LightningModule):
         self,
         n_points: int,
         param_names: List[str],
-        poly_freq_CH4,
+        poly_freq_CH4: Sequence[float] | torch.Tensor | None,
         transitions_dict,
         mlp_dropout: float = 0.10,
         refiner_mlp_dropout: float = 0.10,

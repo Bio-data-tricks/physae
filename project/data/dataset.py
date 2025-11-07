@@ -1,7 +1,7 @@
 """
 PyTorch Dataset for synthetic spectral data generation with physics simulation.
 """
-from typing import Optional, Dict
+from typing import Optional, Dict, Sequence
 import torch
 from torch.utils.data import Dataset
 from config.params import PARAMS, NORM_PARAMS
@@ -19,7 +19,8 @@ class SpectraDataset(Dataset):
     Args:
         n_samples: Number of samples in the dataset.
         num_points: Number of spectral points per sample.
-        poly_freq_CH4: Polynomial frequency coefficients for CH4.
+        poly_freq_CH4: Polynomial frequency coefficients for CH4. Pass ``None``
+            to use a purely linear grid defined by ``sig0`` and ``dsig``.
         transitions_dict: Dictionary of transitions per molecule.
         sample_ranges: Parameter sampling ranges (default: NORM_PARAMS).
         strict_check: Check if sample ranges are within NORM_PARAMS (default: True).
@@ -29,10 +30,19 @@ class SpectraDataset(Dataset):
         tipspy: Tips2021QTpy object for partition functions (default: None).
     """
 
-    def __init__(self, n_samples, num_points, poly_freq_CH4, transitions_dict,
-                 sample_ranges: Optional[dict] = None, strict_check: bool = True,
-                 with_noise: bool = True, noise_profile: Optional[dict] = None,
-                 freeze_noise: bool = False, tipspy: Tips2021QTpy | None = None):
+    def __init__(
+        self,
+        n_samples,
+        num_points,
+        poly_freq_CH4: Sequence[float] | torch.Tensor | None,
+        transitions_dict,
+        sample_ranges: Optional[dict] = None,
+        strict_check: bool = True,
+        with_noise: bool = True,
+        noise_profile: Optional[dict] = None,
+        freeze_noise: bool = False,
+        tipspy: Tips2021QTpy | None = None,
+    ):
         self.n_samples = n_samples
         self.num_points = num_points
         self.poly_freq_CH4 = poly_freq_CH4

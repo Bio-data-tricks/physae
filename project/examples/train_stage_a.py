@@ -62,27 +62,30 @@ def setup_parameter_ranges(parameters_config: str | None):
 
 
 def load_transitions_data(transitions_config: str | None):
-    """Load spectroscopic transitions from a YAML configuration file.
+    """Load spectroscopic transitions and optional frequency polynomials.
 
     Args:
         transitions_config: Optional custom YAML path. When ``None``, a small
             synthetic example bundled with the repository is used.
 
     Returns:
-        Dictionary mapping molecule identifiers (e.g. ``"CH4"``) to transition
-        entries compatible with :mod:`physics.forward`.
+        Tuple ``(transitions, poly_freq_map)`` where ``poly_freq_map`` contains
+        per-molecule polynomial coefficients (if any) declared in the YAML
+        ``poly_frequency`` section.
     """
 
     default_path = Path(__file__).parent.parent / "config" / "data" / "transitions_sample.yaml"
     config_path = Path(transitions_config) if transitions_config else default_path
 
     try:
-        transitions_dict = load_transitions(config_path)
+        transitions_dict, poly_freq_map = load_transitions(
+            config_path, include_poly_freq=True
+        )
     except FileNotFoundError:
         if transitions_config:
             raise
         print("\nWARNING: No transitions configuration found; using empty dictionary.")
-        return {}
+        return {}, {}
     except ValueError as exc:
         raise RuntimeError(f"Invalid transitions configuration '{config_path}': {exc}") from exc
 
@@ -94,46 +97,12 @@ def load_transitions_data(transitions_config: str | None):
         for mol, entries in transitions_dict.items():
             print(f"  {mol}: {len(entries)} lines")
 
-    return transitions_dict
+    if poly_freq_map:
+        print("Polynomial frequency coefficients available for:")
+        for mol, coeffs in poly_freq_map.items():
+            print(f"  {mol}: degree {len(coeffs) - 1}")
 
-
-def setup_frequency_grid():
-    """
-    Define the polynomial coefficients for frequency grid mapping.
-
-    The frequency grid is defined by a polynomial that maps pixel indices
-    to wavenumber positions:
-        wavenumber(pixel) = sum(coeff[i] * pixel^i for i in range(len(coeff)))
-
-    Returns:
-        List of polynomial coefficients [c0, c1, c2, ...] where:
-        - c0: constant offset (cm^-1)
-        - c1: linear term (cm^-1/pixel)
-        - c2: quadratic term (cm^-1/pixel^2)
-        - etc.
-
-    Example for 1024 pixels spanning ~10 cm^-1 centered at 6000 cm^-1:
-    - Linear approximation: wavenumber ≈ 5995 + (10/1024) * pixel
-    """
-    # Example: Linear frequency grid from 5995 to 6005 cm^-1 over 1024 pixels
-    # poly_freq = [5995.0, 10.0/1024, 0.0]  # [offset, slope, curvature]
-
-    # For this example, we use a simple linear grid
-    num_pixels = 1024
-    freq_start = 5995.0  # cm^-1
-    freq_end = 6005.0    # cm^-1
-    freq_range = freq_end - freq_start
-
-    poly_freq = [
-        freq_start,              # c0: starting frequency
-        freq_range / num_pixels, # c1: frequency per pixel
-        0.0                      # c2: no curvature
-    ]
-
-    print(f"Frequency grid: {num_pixels} pixels from {freq_start} to {freq_end} cm^-1")
-    print(f"  Polynomial coefficients: {poly_freq}")
-
-    return poly_freq
+    return transitions_dict, poly_freq_map
 
 
 def load_noise_profile_config(noise_config: str | None):
@@ -162,7 +131,8 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
 
     Args:
         args: Command line arguments.
-        poly_freq_CH4: Polynomial frequency grid coefficients.
+        poly_freq_CH4: Polynomial frequency grid coefficients. ``None`` falls
+            back to a linear grid defined by ``sig0`` and ``dsig``.
         transitions_dict: Dictionary of transition data.
         noise_profile: Noise augmentation configuration dictionary.
         tipspy: TIPS partition function calculator.
@@ -215,7 +185,8 @@ def create_model(args, poly_freq_CH4, transitions_dict):
 
     Args:
         args: Command line arguments.
-        poly_freq_CH4: Polynomial frequency grid coefficients.
+        poly_freq_CH4: Polynomial frequency grid coefficients. ``None`` uses a
+            purely linear grid during physics reconstruction.
         transitions_dict: Dictionary of transition data.
 
     Returns:
@@ -359,14 +330,14 @@ def main():
     # Setup parameter ranges
     setup_parameter_ranges(args.parameters_config)
 
-    # Setup frequency grid
-    poly_freq_CH4 = setup_frequency_grid()
-
     # Load noise profile
     noise_profile = load_noise_profile_config(args.noise_config)
 
     # Load transitions data (or use placeholder)
-    transitions_dict = load_transitions_data(args.transitions_config)
+    transitions_dict, poly_freq_map = load_transitions_data(args.transitions_config)
+    poly_freq_CH4 = poly_freq_map.get("CH4")
+    if poly_freq_CH4 is None:
+        print("\nNo polynomial frequency provided for CH4 — defaulting to linear grid.")
 
     # Initialize TIPS partition functions
     print(f"\nInitializing TIPS partition functions...")
