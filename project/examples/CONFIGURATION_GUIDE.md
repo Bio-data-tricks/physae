@@ -165,7 +165,8 @@ default: every call to ``__getitem__`` resamples the physical parameters,
 so the training set effectively changes at each epoch.  When you want a
 fixed dataset, call :meth:`freeze_parameter_draws(True) <data.dataset.SpectraDataset.freeze_parameter_draws>`
 after instantiation (and optionally ``freeze_noise=True`` for deterministic
-noise).
+noise).  For older scripts you can still pass ``freeze_parameters=True``
+to the constructor; the keyword remains supported for compatibility.
 
 ```python
 train_dataset = SpectraDataset(

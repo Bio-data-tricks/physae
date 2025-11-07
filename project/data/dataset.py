@@ -29,7 +29,8 @@ class SpectraDataset(Dataset):
         freeze_parameters: Pre-sample parameter draws once so each index
             returns the same physical conditions at every epoch. When
             ``False`` (default), parameters are resampled on-the-fly like in
-            ``physae.py``.
+            ``physae.py``. The legacy keyword ``freeze_parameter_draws`` is
+            also accepted for backwards compatibility.
         freeze_noise: Use fixed noise seed per sample (default: False).
         tipspy: Tips2021QTpy object for partition functions (default: None).
             When ``None``, the dataset attempts to locate a QTpy directory
@@ -49,7 +50,20 @@ class SpectraDataset(Dataset):
         freeze_parameters: bool = False,
         freeze_noise: bool = False,
         tipspy: Tips2021QTpy | None = None,
+        **legacy_kwargs,
     ):
+        if "freeze_parameter_draws" in legacy_kwargs:
+            legacy_value = bool(legacy_kwargs.pop("freeze_parameter_draws"))
+            if freeze_parameters and not legacy_value:
+                raise ValueError(
+                    "freeze_parameters=True conflicts with freeze_parameter_draws=False"
+                )
+            freeze_parameters = legacy_value or freeze_parameters
+
+        if legacy_kwargs:
+            unexpected = ", ".join(sorted(legacy_kwargs))
+            raise TypeError(f"Unexpected keyword argument(s): {unexpected}")
+
         self.n_samples = n_samples
         self.num_points = num_points
         self.poly_freq_CH4 = poly_freq_CH4
