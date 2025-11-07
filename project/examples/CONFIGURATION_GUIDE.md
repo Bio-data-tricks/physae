@@ -77,6 +77,27 @@ NORM_PARAMS = {
      - Industrial: 273-373 K (0-100°C)
    - Notes: Affects line intensities via partition functions and Boltzmann distribution
 
+### Reference Ranges from physae.py
+
+The original `physae.py` script trains the autoencoder on the following
+parameter intervals:
+
+```python
+NORM_PARAMS = {
+    'sig0': (3085.37, 3085.52),
+    'dsig': (0.001502, 0.001559),
+    'mf_CH4': (1e-7, 2.9e-5),
+    'baseline0': (0.999999, 1.00001),
+    'baseline1': (-5.0e-4, -2.0e-4),
+    'baseline2': (-7.505155e-8, 3.77485e-9),
+    'P': (400.0, 600.0),
+    'T': (302.65, 312.65),
+}
+```
+
+These values are bundled in `project/config/data/parameters_default.yaml` and
+match the `build_data_and_model` helper shipped with the monolithic script.
+
 ### Alternative Configuration Examples
 
 #### Example 1: Atmospheric Monitoring
@@ -124,15 +145,15 @@ NORM_PARAMS = {
 ### Dataset Size
 
 ```python
-train_samples = 10000  # Number of synthetic training spectra
-val_samples = 1000     # Number of validation spectra
-num_points = 1024      # Spectral resolution (pixels)
+train_samples = 500_000  # Training spectra (Stage A reference setup)
+val_samples = 5_000      # Validation spectra
+num_points = 800         # Spectral resolution (pixels)
 ```
 
 **Recommendations:**
-- Small dataset (fast iteration): 5,000 train / 500 val
-- Medium dataset (default): 10,000 train / 1,000 val
-- Large dataset (best performance): 50,000+ train / 5,000+ val
+- Fast iteration: 10,000 train / 1,000 val
+- Balanced: 50,000 train / 5,000 val
+- Full reference: 500,000 train / 5,000 val (physae.py default)
 
 ### Frequency Grid
 
@@ -142,7 +163,7 @@ calibration polynomial alongside your transitions YAML using the
 
 ```yaml
 poly_frequency:
-  CH4: [5995.0, 0.009765625, 0.0]  # [offset, slope, curvature, ...]
+  CH4: [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
 ```
 
 When omitted, the training pipeline falls back to the linear grid defined by

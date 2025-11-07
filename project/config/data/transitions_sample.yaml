@@ -1,49 +1,190 @@
-# Exemple de transitions spectroscopiques réduites pour CH4 et H2O.
-# Les valeurs sont synthétiques et servent de gabarit pour préparer vos propres fichiers.
+# Exemple de transitions spectroscopiques calquées sur physae.py.
+# Ces coefficients correspondent aux jeux de données de démonstration
+# utilisés par le script d'origine.
 transitions:
   CH4:
     - mid: 6
       lid: 1
-      center: 5998.1234
-      amplitude: 1.20e-20
-      gamma_air: 0.070
-      gamma_self: 0.090
-      e0: 120.5
-      n_air: 0.75
-      shift_air: -0.005
-      abundance: 0.999
-      gDicke: 0.015
-      nDicke: 0.25
-      lmf: 0.010
-      nlmf: 0.70
+      center: 3085.861015
+      amplitude: 1.013e-19
+      gamma_air: 0.06
+      gamma_self: 0.078
+      e0: 219.9411
+      n_air: 0.73
+      shift_air: -0.00712
+      abundance: 0.0
+      gDicke: 0.0221
+      nDicke: 0.96
+      lmf: 0.584
+      nlmf: 1.12
     - mid: 6
-      lid: 2
-      center: 6001.8765
-      amplitude: 8.50e-21
-      gamma_air: 0.066
-      gamma_self: 0.085
-      e0: 98.1
-      n_air: 0.74
-      shift_air: -0.004
-      abundance: 0.999
-      gDicke: 0.012
-      nDicke: 0.22
-      lmf: -0.008
-      nlmf: 0.65
+      lid: 1
+      center: 3085.832038
+      amplitude: 1.693e-19
+      gamma_air: 0.0597
+      gamma_self: 0.078
+      e0: 219.9451
+      n_air: 0.73
+      shift_air: -0.00712
+      abundance: 0.0
+      gDicke: 0.0222
+      nDicke: 0.91
+      lmf: 0.173
+      nlmf: 1.11
+    - mid: 6
+      lid: 1
+      center: 3085.893769
+      amplitude: 1.011e-19
+      gamma_air: 0.0602
+      gamma_self: 0.078
+      e0: 219.9366
+      n_air: 0.73
+      shift_air: -0.00711
+      abundance: 0.0
+      gDicke: 0.0184
+      nDicke: 1.14
+      lmf: -0.516
+      nlmf: 1.37
+    - mid: 6
+      lid: 1
+      center: 3086.030985
+      amplitude: 1.659e-19
+      gamma_air: 0.0595
+      gamma_self: 0.078
+      e0: 219.9197
+      n_air: 0.73
+      shift_air: -0.00711
+      abundance: 0.0
+      gDicke: 0.0193
+      nDicke: 1.17
+      lmf: -0.204
+      nlmf: 0.97
+    - mid: 6
+      lid: 1
+      center: 3086.071879
+      amplitude: 1.0e-19
+      gamma_air: 0.0585
+      gamma_self: 0.078
+      e0: 219.9149
+      n_air: 0.73
+      shift_air: -0.00703
+      abundance: 0.0
+      gDicke: 0.0232
+      nDicke: 1.09
+      lmf: -0.0689
+      nlmf: 0.82
+    - mid: 6
+      lid: 1
+      center: 3086.085994
+      amplitude: 6.671e-20
+      gamma_air: 0.055
+      gamma_self: 0.078
+      e0: 219.9133
+      n_air: 0.7
+      shift_air: -0.0061
+      abundance: 0.0
+      gDicke: 0.03
+      nDicke: 0.54
+      lmf: 0.0
+      nlmf: 0.0
   H2O:
     - mid: 1
+      lid: 2
+      center: 3083.831748
+      amplitude: 2.874e-24
+      gamma_air: 0.0971
+      gamma_self: 0.46
+      e0: 78.9886
+      n_air: 0.87
+      shift_air: -0.00653
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
       lid: 1
-      center: 6000.4321
-      amplitude: 4.10e-21
-      gamma_air: 0.080
-      gamma_self: 0.095
-      e0: 156.2
-      n_air: 0.76
-      shift_air: -0.006
-      abundance: 0.997
-      gDicke: 0.018
-      nDicke: 0.27
-      lmf: 0.005
-      nlmf: 0.60
+      center: 3085.35752
+      amplitude: 9.562e-25
+      gamma_air: 0.0452
+      gamma_self: 0.282
+      e0: 2254.2838
+      n_air: 0.51
+      shift_air: 0.001433
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
+      lid: 1
+      center: 3085.506609
+      amplitude: 1.396e-25
+      gamma_air: 0.0662
+      gamma_self: 0.344
+      e0: 2927.9412
+      n_air: 0.63
+      shift_air: 0.00324
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
+      lid: 1
+      center: 3085.558839
+      amplitude: 3.186e-25
+      gamma_air: 0.0491
+      gamma_self: 0.293
+      e0: 2254.2844
+      n_air: 0.82
+      shift_air: -0.00464
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
+      lid: 1
+      center: 3085.6896
+      amplitude: 3.912e-25
+      gamma_air: 0.0508
+      gamma_self: 0.333
+      e0: 2612.7999
+      n_air: 0.64
+      shift_air: -0.00649
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
+      lid: 1
+      center: 3086.133208
+      amplitude: 2.369e-25
+      gamma_air: 0.0457
+      gamma_self: 0.272
+      e0: 2414.7234
+      n_air: 0.44
+      shift_air: -0.00591
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
+    - mid: 1
+      lid: 1
+      center: 3087.192118
+      amplitude: 2.07e-22
+      gamma_air: 0.0768
+      gamma_self: 0.413
+      e0: 648.9787
+      n_air: 0.6
+      shift_air: -0.00803
+      abundance: 0.0
+      gDicke: 0.0
+      nDicke: 0.0
+      lmf: 0.0
+      nlmf: 0.0
 poly_frequency:
-  CH4: [5995.0, 0.009765625, 0.0]
+  CH4: [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
