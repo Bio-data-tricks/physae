@@ -186,6 +186,54 @@ The Stage A example script exposes ``--static-training-set`` and
 command line, while the YAML-driven notebook highlights the same
 parameters in the dataset construction cell.
 
+### Noise Profiles
+
+Noise augmentation follows the ``add_noise_variety`` helper ported from
+``physae.py`` and now supports richer artefacts.  The baseline keys
+(``std_add_range``, ``p_drift``, ``p_fringes``, etc.) drive the legacy
+additive/multiplicative model.  To reproduce the advanced perturbations
+from the monolithic script, add a ``complex`` block:
+
+```yaml
+noise:
+  std_add_range: [0.0, 0.005]
+  std_mult_range: [0.0, 0.005]
+  p_drift: 0.2
+  # ... paramètres historiques ...
+  complex:
+    probability: 0.75        # mélange aléatoire par lot
+    noise_types: [gaussian, shot, flicker, etaloning, glitches]
+    noise_type_weights: [0.25, 0.15, 0.20, 0.15, 0.25]
+    noise_level_range: [0.4, 1.6]
+    max_rel_to_line: 0.10    # profondeur relative visée (10 %)
+    mode: blend              # replace | add | blend
+    blend_alpha: 0.35        # mélange 35 % complexe / 65 % hérité
+    clip: [0.0, 1.5]
+```
+
+Key options:
+
+- ``probability``: fréquence d’application du bruit complexe (0 → jamais,
+  1 → toujours).
+- ``noise_types`` / ``noise_type_weights``: distribution des profils
+  (gaussien, bruit de tir, flicker 1/f, franges d’etalonnage,
+  glitches quasi-transitoires).
+- ``noise_level`` ou ``noise_level_range``: échelle RMS relative,
+  convertie automatiquement en amplitude via la profondeur de raie (98ᵉ
+  centile).
+- ``mode``: ``replace`` (par défaut) remplace complètement le bruit
+  hérité, ``add`` ajoute les artefacts complexes en plus du bruit
+  historique, ``blend`` interpole entre les deux.
+- ``blend_alpha``: poids de l’artefact complexe lorsqu’on est en mode
+  ``blend``.
+- ``clip``: plage finale autorisée, identique au comportement du profil
+  historique.
+
+Les notebooks et scripts d’exemple utilisent cette structure pour
+illustrer comment activer ou doser les artefacts, tout en conservant la
+compatibilité avec les anciens fichiers YAML dépourvus du bloc
+``complex``.
+
 ### Frequency Grid
 
 The frequency grid maps pixel indices to wavenumber positions. Provide the

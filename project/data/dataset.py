@@ -196,10 +196,18 @@ class SpectraDataset(Dataset):
         )
         spectra_clean = spectra_clean.to(torch.float32)
 
+        # Baseline reference for both noise and clean normalisation
+        baseline_norm = lowess_value(spectra_clean, kind="start", win=30).clamp_min(1e-8)
+
         # Add noise
         if self.with_noise:
             g = self._make_generator(idx)
-            spectra_noisy = add_noise_variety(spectra_clean, generator=g, **self.noise_profile)
+            spectra_noisy = add_noise_variety(
+                spectra_clean,
+                generator=g,
+                baseline_norm=baseline_norm,
+                **self.noise_profile,
+            )
         else:
             spectra_noisy = spectra_clean
 
@@ -207,9 +215,8 @@ class SpectraDataset(Dataset):
         scale_noisy = lowess_value(spectra_noisy, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
         noisy_spectra = spectra_noisy / scale_noisy
 
-        # Max on clean
-        max_clean = lowess_value(spectra_clean, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
-        clean_spectra = spectra_clean / max_clean
+        # Max on clean (reuse baseline estimation)
+        clean_spectra = spectra_clean / baseline_norm.unsqueeze(1)
 
         return {
             'noisy_spectra': noisy_spectra[0].detach(),

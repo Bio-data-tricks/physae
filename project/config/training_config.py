@@ -70,6 +70,22 @@ def _default_noise_profile(train: bool) -> dict:
             "spike_amp_range": (1e-3, 1.0),
             "spike_width_range": (1.0, 200.0),
             "clip": (0.0, 1.5),
+            "complex": {
+                "probability": 0.7,
+                "noise_types": [
+                    "gaussian",
+                    "shot",
+                    "flicker",
+                    "etaloning",
+                    "glitches",
+                ],
+                "noise_type_weights": [0.25, 0.15, 0.2, 0.15, 0.25],
+                "noise_level_range": (0.4, 1.6),
+                "max_rel_to_line": 0.10,
+                "mode": "blend",
+                "blend_alpha": 0.35,
+                "clip": (0.0, 1.5),
+            },
         }
     return {
         "std_add_range": (0.0, 1e-3),
@@ -86,6 +102,14 @@ def _default_noise_profile(train: bool) -> dict:
         "spike_amp_range": (1e-4, 1.0),
         "spike_width_range": (1.0, 200.0),
         "clip": (0.0, 1.5),
+        "complex": {
+            "probability": 0.0,
+            "noise_types": ["gaussian", "shot", "flicker", "etaloning", "glitches"],
+            "noise_level_range": (0.2, 1.0),
+            "max_rel_to_line": 0.08,
+            "mode": "replace",
+            "clip": (0.0, 1.5),
+        },
     }
 
 
