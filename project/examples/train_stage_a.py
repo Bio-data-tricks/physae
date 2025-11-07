@@ -161,10 +161,11 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
         sample_ranges=NORM_PARAMS,
         with_noise=True,
         noise_profile=noise_profile,
-        freeze_parameters=args.static_training_set,
         freeze_noise=False,  # Random noise each epoch
         tipspy=tipspy,
     )
+
+    train_dataset.freeze_parameter_draws(args.static_training_set)
 
     val_dataset = SpectraDataset(
         n_samples=args.val_samples,
@@ -174,10 +175,11 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
         sample_ranges=NORM_PARAMS,
         with_noise=True,
         noise_profile=noise_profile,
-        freeze_parameters=args.static_validation_set,
         freeze_noise=True,  # Fixed noise for consistent validation
         tipspy=tipspy,
     )
+
+    val_dataset.freeze_parameter_draws(args.static_validation_set)
 
     return train_dataset, val_dataset
 

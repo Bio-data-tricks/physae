@@ -163,20 +163,21 @@ num_points = 800         # Spectral resolution (pixels)
 The refactored :class:`SpectraDataset` mirrors the original script by
 default: every call to ``__getitem__`` resamples the physical parameters,
 so the training set effectively changes at each epoch.  When you want a
-fixed dataset, pass ``freeze_parameters=True`` when constructing the
-dataset (and optionally ``freeze_noise=True`` for deterministic noise).
+fixed dataset, call :meth:`freeze_parameter_draws(True) <data.dataset.SpectraDataset.freeze_parameter_draws>`
+after instantiation (and optionally ``freeze_noise=True`` for deterministic
+noise).
 
 ```python
 train_dataset = SpectraDataset(
     ...,  # configuration identique
-    freeze_parameters=False,  # True => échantillon figé
 )
+train_dataset.freeze_parameter_draws(False)  # True => échantillon figé
 
 val_dataset = SpectraDataset(
     ...,  # même configuration
-    freeze_parameters=True,   # Validation figée par défaut
     freeze_noise=True,
 )
+val_dataset.freeze_parameter_draws(True)   # Validation figée par défaut
 ```
 
 The Stage A example script exposes ``--static-training-set`` and

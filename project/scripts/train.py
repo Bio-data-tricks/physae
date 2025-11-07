@@ -72,9 +72,10 @@ def create_datasets(args):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
-        freeze_parameters=args.static_train_set,
         tipspy=tipspy,
     )
+
+    train_dataset.freeze_parameter_draws(args.static_train_set)
 
     val_dataset = SpectraDataset(
         n_samples=1000,
@@ -83,10 +84,11 @@ def create_datasets(args):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
-        freeze_parameters=args.static_val_set,
         freeze_noise=True,  # Fixed noise for validation
         tipspy=tipspy,
     )
+
+    val_dataset.freeze_parameter_draws(args.static_val_set)
 
     return train_dataset, val_dataset
 

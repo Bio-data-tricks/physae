@@ -78,15 +78,53 @@ class SpectraDataset(Dataset):
                     )
 
         if self.freeze_parameters:
-            frozen: dict[str, torch.Tensor] = {}
-            for k in PARAMS:
-                lo, hi = self.sample_ranges[k]
-                frozen[k] = torch.empty(self.n_samples, dtype=torch.float32).uniform_(lo, hi)
-            self._frozen_params = frozen
+            self.freeze_parameter_draws(True)
 
     def set_epoch(self, e: int):
         """Set current epoch for noise generation."""
         self.epoch = int(e)
+
+    def freeze_parameter_draws(
+        self,
+        freeze: bool = True,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> None:
+        """Toggle deterministic parameter draws across epochs.
+
+        When ``freeze`` is ``True``, the dataset samples and stores the parameter
+        vectors for every index so repeated epochs return identical physical
+        conditions. When ``False``, the cached draws are cleared and future
+        iterations resample parameters on-the-fly.
+
+        Args:
+            freeze: Enable (``True``) or disable (``False``) parameter freezing.
+            generator: Optional random generator used when (re-)sampling frozen
+                parameters. When ``None`` the global RNG state is used.
+        """
+
+        freeze = bool(freeze)
+        self.freeze_parameters = freeze
+        if not freeze:
+            self._frozen_params = None
+            return
+
+        frozen: dict[str, torch.Tensor] = {}
+        for k in PARAMS:
+            lo, hi = self.sample_ranges[k]
+            tens = torch.empty(self.n_samples, dtype=torch.float32)
+            tens.uniform_(lo, hi, generator=generator)
+            frozen[k] = tens
+        self._frozen_params = frozen
+
+    def refresh_frozen_parameters(self, generator: torch.Generator | None = None) -> None:
+        """Resample cached parameters when freezing is enabled."""
+
+        if not self.freeze_parameters:
+            raise RuntimeError(
+                "refresh_frozen_parameters() called while freeze_parameters is disabled."
+            )
+        self.freeze_parameter_draws(True, generator=generator)
 
     def _make_generator(self, idx: int) -> torch.Generator:
         """Create random generator for reproducible noise."""
@@ -106,7 +144,9 @@ class SpectraDataset(Dataset):
         device, dtype = 'cpu', torch.float32
 
         # Sample parameters
-        if self.freeze_parameters and self._frozen_params is not None:
+        if self.freeze_parameters:
+            if self._frozen_params is None:
+                self.freeze_parameter_draws(True)
             sampled = {
                 k: self._frozen_params[k][idx].to(dtype).view(1)
                 for k in PARAMS
