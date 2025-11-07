@@ -3,7 +3,8 @@ from __future__ import annotations
 import math, random, sys, os, socket, pickle, json, yaml
 from typing import Optional, List, Dict
 from pathlib import Path
-
+import torch
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,9 +40,9 @@ def save_fig(fig, path, dpi=150):
 # ============================================================
 # 1) Configs globaux & normalisation
 # ============================================================
-PARAMS = ['sig0', 'dsig', 'mf_CH4', 'mf_H2O', 'baseline0', 'baseline1', 'baseline2', 'P', 'T']
+PARAMS = ['sig0', 'dsig', 'mf_CH4',  'baseline0', 'baseline1', 'baseline2', 'P', 'T'] #'mf_H2O',
 PARAM_TO_IDX = {n:i for i,n in enumerate(PARAMS)}
-LOG_SCALE_PARAMS = {'mf_CH4','mf_H2O'}
+LOG_SCALE_PARAMS = {'mf_CH4'} #'mf_H2O'
 LOG_FLOOR = 1e-7
 NORM_PARAMS: Dict[str, tuple] = {}
 
@@ -589,10 +590,19 @@ def add_noise_variety(spectra, *, generator=None, **cfg):
 
     std_add  = r(*std_add_range)
     std_mult = r(*std_mult_range)
-    add  = torch.randn(y.shape, device=dev, dtype=dtype, generator=g) * std_add
-    add  = add - add.mean(dim=-1, keepdim=True)
-    mult = 1.0 + torch.randn(y.shape, device=dev, dtype=dtype, generator=g) * std_mult
-    mult = mult / mult.mean(dim=-1, keepdim=True)
+    add = torch.randn(y.shape, device=dev, dtype=dtype, generator=g)
+    add = add - add.mean(dim=-1, keepdim=True)
+    add_std = add.std(dim=-1, keepdim=True)
+    add_std = torch.where(add_std < 1e-8, torch.ones_like(add_std), add_std)
+    add = add / add_std * std_add
+
+    mult_noise = torch.randn(y.shape, device=dev, dtype=dtype, generator=g)
+    mult_noise = mult_noise - mult_noise.mean(dim=-1, keepdim=True)
+    mult_std = mult_noise.std(dim=-1, keepdim=True)
+    mult_std = torch.where(mult_std < 1e-8, torch.ones_like(mult_std), mult_std)
+    mult_noise = mult_noise / mult_std * std_mult
+    mult = 1.0 + mult_noise
+
     out = y * mult + add
 
     if rbool(p_drift):
@@ -613,6 +623,14 @@ def add_noise_variety(spectra, *, generator=None, **cfg):
         for _ in range(ri(*n_fringes_range)):
             f, phi, amp = r(*fringe_freq_range), r(0.0, 2 * math.pi), r(*fringe_amp_range)
             fringes = fringes + amp * torch.sin(2 * math.pi * f * t + phi)
+        # Normalisation : on retire le biais DC puis on met à l'échelle
+        fringes = fringes - fringes.mean(dim=-1, keepdim=True)
+        std = fringes.std(dim=-1, keepdim=True)
+        std = torch.where(std < 1e-8, torch.ones_like(std), std)
+        fringes = fringes / std
+        span = (y.max(dim=-1, keepdim=True).values - y.min(dim=-1, keepdim=True).values).clamp_min(1e-6)
+        final_amp = r(*fringe_amp_range)
+        fringes = fringes * (final_amp * span)
         out = out + fringes
 
     if rbool(p_spikes):
@@ -746,12 +764,25 @@ def Norm1d(c):
     groups = 8 if c >= 8 else 1
     return nn.GroupNorm(groups, c)
 
+# --- replace / étendre ton ConvBNAct1d ---
 class ConvBNAct1d(nn.Sequential):
-    def __init__(self, in_c, out_c, k=1, s=1, p=None, g=1, bias=False, act=True):
-        if p is None: p = k // 2
-        mods = [nn.Conv1d(in_c, out_c, k, s, p, groups=g, bias=bias), Norm1d(out_c)]
+    def __init__(self, in_c, out_c, k=1, s=1, p=None, g=1, bias=False, act=True, d=1):
+        if p is None:
+            p = ((k - 1) // 2) * d
+        mods = [nn.Conv1d(in_c, out_c, k, s, p, dilation=d, groups=g, bias=bias), Norm1d(out_c)]
         if act: mods.append(SiLU())
         super().__init__(*mods)
+
+# --- nouveau: BlurPool anti-alias ---
+class BlurPool1D(nn.Module):
+    def __init__(self, c, kernel=(1,4,6,4,1)):
+        super().__init__()
+        k = torch.tensor(kernel, dtype=torch.float32)
+        k = (k / k.sum()).view(1,1,-1).repeat(c,1,1)
+        self.register_buffer('k', k)
+    def forward(self, x):  # x: [B,C,N]
+        return F.conv1d(x, self.k, stride=2, padding=self.k.shape[-1]//2, groups=x.size(1))
+
 
 class SE1d(nn.Module):
     def __init__(self, c, se_ratio=0.25):
@@ -767,29 +798,129 @@ class SE1d(nn.Module):
         s = self.fc2(self.act(self.fc1(s)))
         return x * self.gate(s)
 
+
+
+
+class ChannelAttention1d(nn.Module):
+    """Squeeze-and-Excitation amélioré avec contexte global"""
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        hidden = max(8, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.Conv1d(channels, hidden, 1, bias=False),
+            nn.GELU(),
+            nn.Conv1d(hidden, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return x * self.sigmoid(avg_out + max_out)
+
+class GatedSharedHead(nn.Module):
+    def __init__(self, feat_dim: int, hidden: int, p_drop: float):
+        super().__init__()
+        self.short_head = nn.Linear(feat_dim, hidden)
+        self.deep_head = nn.Sequential(
+            nn.Linear(feat_dim, hidden),
+            nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(p_drop),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(p_drop),
+        )
+        self.gate_head = nn.Sequential(nn.Linear(feat_dim, 1), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        g = self.gate_head(x)
+        return g * self.deep_head(x) + (1 - g) * self.short_head(x)
+
+
+class SpatialAttention1d(nn.Module):
+    """Attention sur la dimension temporelle/spectrale"""
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv1d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        concat = torch.cat([avg_out, max_out], dim=1)
+        return x * self.sigmoid(self.conv(concat))
+
+# class CBAM1d(nn.Module):
+#     """Convolutional Block Attention Module pour 1D"""
+#     def __init__(self, channels, reduction=16, kernel_size=7):
+#         super().__init__()
+#         self.channel_att = ChannelAttention1d(channels, reduction)
+#         self.spatial_att = SpatialAttention1d(kernel_size)
+    
+#     def forward(self, x):
+#         x = self.channel_att(x)
+#         x = self.spatial_att(x)
+#         return x
+
+# class MBConv1d(nn.Module):
+#     def __init__(self, in_c, out_c, k, s, expand_ratio, se_ratio=0.25, 
+#                  drop_path=0.0, use_cbam=True):  # <- NEW
+#         super().__init__()
+#         mid = int(in_c * expand_ratio)
+#         self.use_res = (s == 1 and in_c == out_c)
+        
+#         layers = []
+#         if expand_ratio != 1:
+#             layers.append(ConvBNAct1d(in_c, mid, k=1, s=1, act=True))
+        
+#         layers.append(ConvBNAct1d(mid, mid, k=k, s=s, p=k//2, g=mid, act=True))
+        
+#         # CHOIX: SE1d OU CBAM (CBAM généralement meilleur)
+#         if use_cbam:
+#             layers.append(CBAM1d(mid, reduction=max(4, mid//16)))
+#         elif se_ratio is not None and se_ratio > 0:
+#             layers.append(SE1d(mid, se_ratio=se_ratio))
+        
+#         layers.append(ConvBNAct1d(mid, out_c, k=1, s=1, act=False))
+#         self.block = nn.Sequential(*layers)
+#         self.drop = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+    
+#     def forward(self, x):
+#         y = self.block(x)
+#         if self.use_res:
+#             y = self.drop(y) + x
+#         return y
+
+# MBConc normal (sans CBAM)
+
 class FusedMBConv1d(nn.Module):
     def __init__(self, in_c, out_c, k, s, expand_ratio, drop_path=0.0):
         super().__init__()
         mid = int(in_c * expand_ratio)
         self.use_res = (s == 1 and in_c == out_c)
+
         if expand_ratio != 1:
             self.fused = nn.Sequential(
-                ConvBNAct1d(in_c, mid, k=k, s=s, p=k//2, g=1, act=True),
+                ConvBNAct1d(in_c, mid, k=k, s=s, p=None, g=1, act=True),
                 ConvBNAct1d(mid, out_c, k=1, s=1, act=False),
             )
         else:
             self.fused = nn.Sequential(
-                ConvBNAct1d(in_c, out_c, k=k, s=s, p=k//2, g=1, act=True),
+                ConvBNAct1d(in_c, out_c, k=k, s=s, p=None, g=1, act=True),
             )
         self.drop = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        # LayerScale (gamma) — démarre proche de l'identité
+        self.gamma = nn.Parameter(torch.ones(1, out_c, 1) * 1e-3)
+
     def forward(self, x):
         y = self.fused(x)
         if self.use_res:
-            y = self.drop(y) + x
+            y = x + self.drop(self.gamma * y)
         return y
 
+
 class MBConv1d(nn.Module):
-    def __init__(self, in_c, out_c, k, s, expand_ratio, se_ratio=0.25, drop_path=0.0):
+    def __init__(self, in_c, out_c, k, s, expand_ratio, se_ratio=0.25, drop_path=0.0, dw_dilation: int = 1):
         super().__init__()
         mid = int(in_c * expand_ratio)
         self.use_res = (s == 1 and in_c == out_c)
@@ -798,20 +929,22 @@ class MBConv1d(nn.Module):
         if expand_ratio != 1:
             layers.append(ConvBNAct1d(in_c, mid, k=1, s=1, act=True))
 
-        # depthwise
-        layers.append(ConvBNAct1d(mid, mid, k=k, s=s, p=k//2, g=mid, act=True))
+        # depthwise (dilatation modérée configurable)
+        layers.append(ConvBNAct1d(mid, mid, k=k, s=s, g=mid, act=True, d=dw_dilation))
+
         if se_ratio is not None and se_ratio > 0:
             layers.append(SE1d(mid, se_ratio=se_ratio))
 
-        # project
         layers.append(ConvBNAct1d(mid, out_c, k=1, s=1, act=False))
         self.block = nn.Sequential(*layers)
+
         self.drop = DropPath(drop_path) if drop_path > 0 else nn.Identity()
+        self.gamma = nn.Parameter(torch.ones(1, out_c, 1) * 1e-3)
 
     def forward(self, x):
         y = self.block(x)
         if self.use_res:
-            y = self.drop(y) + x
+            y = x + self.drop(self.gamma * y)
         return y
 
 _EFFV2_CFGS = {
@@ -842,11 +975,6 @@ _EFFV2_CFGS = {
 }
 
 class EfficientNetEncoder(nn.Module):
-    """
-    Drop-in encoder pour ton pipeline:
-      - retourne (features_1d, None)
-      - attribut self.feat_dim pour les têtes
-    """
     def __init__(
         self,
         in_channels=1,
@@ -856,35 +984,56 @@ class EfficientNetEncoder(nn.Module):
         se_ratio: float = 0.25,
         drop_path_rate: float = 0.1,
         stem_channels: int | None = None,
+        use_blurpool: bool = True,
+        mb_dilate_from_stage: int = 3,   # à partir de ce "stage" (0-index) pour les 'mb'
+        mb_dilation_value: int = 2,
     ):
         super().__init__()
         cfg = _EFFV2_CFGS[variant]
+        stem_c = stem_channels or 32
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, stem_channels or 32, kernel_size=3, stride=2, padding=1, bias=False),
-            Norm1d(stem_channels or 32),
+            nn.Conv1d(in_channels, stem_c, kernel_size=3, stride=2, padding=1, bias=False),
+            Norm1d(stem_c),
             SiLU()
         )
-        in_c = stem_channels or 32
+        in_c = stem_c
 
         blocks = []
         total_blocks = sum(int(math.ceil(r * depth_mult)) for (_, r, *_ ) in cfg)
         b_idx = 0
+        stage_idx = -1
         for (kind, repeats, out_c, k, s, exp) in cfg:
+            stage_idx += 1
             out_c = _make_divisible(out_c * width_mult, 8)
             repeats = int(math.ceil(repeats * depth_mult))
+
             for i in range(repeats):
                 stride = s if i == 0 else 1
                 dp = drop_path_rate * b_idx / max(1, total_blocks - 1)
+
+                # --- anti-alias downsample: BlurPool avant le bloc, et bloc en stride=1
+                pre = []
+                if use_blurpool and stride == 2:
+                    pre.append(BlurPool1D(in_c))
+                    stride = 1  # le bloc reste stride=1 grâce au BlurPool
+
+                # --- dilatation sur certains MBConv profonds
+                dw_dil = 1
+                if kind == "mb" and stage_idx >= mb_dilate_from_stage:
+                    dw_dil = mb_dilation_value  # ex: 2
+
                 if kind == "fused":
                     block = FusedMBConv1d(in_c, out_c, k=k, s=stride, expand_ratio=exp, drop_path=dp)
                 else:
                     block = MBConv1d(in_c, out_c, k=k, s=stride, expand_ratio=exp,
-                                     se_ratio=se_ratio, drop_path=dp)
-                blocks.append(block)
+                                     se_ratio=se_ratio, drop_path=dp, dw_dilation=dw_dil)
+
+                blocks += pre + [block]
                 in_c = out_c
                 b_idx += 1
+
         self.blocks = nn.Sequential(*blocks)
-        self.head = nn.Identity()  # garde la résolution temporelle courante
+        self.head = nn.Identity()
         self.feat_dim = in_c
 
     def forward(self, x):  # x: [B, C, N]
@@ -900,40 +1049,90 @@ class EfficientNetEncoder(nn.Module):
 class ReLoBRaLoLoss:
     """
     ReLoBRaLo avec tirage Torch déterministe (DDP friendly).
+    Supporte à la fois num_losses (int) et loss_names (list) pour compatibilité.
     """
-    def __init__(self, loss_names, alpha=0.9, tau=1.0, history_len=10, seed=12345):
-        self.loss_names = list(loss_names)
+    def __init__(self, num_losses=None, loss_names=None, alpha=0.9, tau=1.0, history_len=10, seed=12345):
+        """
+        Args:
+            num_losses: Nombre de losses (int) - recommandé
+            loss_names: Liste des noms (list) - pour compatibilité ancienne API
+            alpha: Facteur de lissage EMA
+            tau: Température pour softmax
+            history_len: Longueur de l'historique
+            seed: Seed pour reproductibilité
+        """
+        # ✅ Compatibilité avec les deux signatures
+        if num_losses is not None:
+            self.num_losses = int(num_losses)
+            self.loss_names = [f"loss_{i}" for i in range(self.num_losses)]
+        elif loss_names is not None:
+            self.loss_names = list(loss_names)
+            self.num_losses = len(self.loss_names)
+        else:
+            raise ValueError("Fournir soit num_losses (int) soit loss_names (list)")
+        
         self.alpha = float(alpha)
         self.tau = float(tau)
         self.history_len = int(history_len)
         self.loss_history = {name: [] for name in self.loss_names}
-        self.weights = torch.ones(len(self.loss_names), dtype=torch.float32)
+        self.weights = torch.ones(self.num_losses, dtype=torch.float32)
+        self.last_weights = torch.ones(self.num_losses, dtype=torch.float32) / self.num_losses  # ← AJOUTÉ
         self._g = torch.Generator(device="cpu")
         if seed is not None:
             self._g.manual_seed(int(seed))
-
+    
     def set_seed(self, seed: int):
         self._g.manual_seed(int(seed))
-
+    
     def to(self, device=None, dtype=None):
         if device is not None or dtype is not None:
-            self.weights = self.weights.to(device=device or self.weights.device,
-                                           dtype=dtype or self.weights.dtype)
+            self.weights = self.weights.to(
+                device=device or self.weights.device,
+                dtype=dtype or self.weights.dtype
+            )
+            self.last_weights = self.last_weights.to(  # ← AJOUTÉ
+                device=device or self.last_weights.device,
+                dtype=dtype or self.last_weights.dtype
+            )
         return self
-
+    
     def _append_history(self, current_losses):
+        """Ajoute les losses courantes à l'historique"""
         for i, name in enumerate(self.loss_names):
-            self.loss_history[name].append(float(current_losses[i].detach().cpu()))
-            if len(self.loss_history[name]) > self.history_len:
-                self.loss_history[name].pop(0)
-
+            if i < len(current_losses):
+                self.loss_history[name].append(float(current_losses[i].detach().cpu()))
+                if len(self.loss_history[name]) > self.history_len:
+                    self.loss_history[name].pop(0)
+    
     @torch.no_grad()
     def compute_weights(self, current_losses: torch.Tensor) -> torch.Tensor:
+        """
+        Calcule les poids adaptatifs pour les losses.
+        
+        Args:
+            current_losses: [N] tensor des losses individuelles
+        
+        Returns:
+            weights: [N] poids pondérés
+        """
         device = current_losses.device
-        dtype  = current_losses.dtype
+        dtype = current_losses.dtype
+        
+        # ✅ Vérifier la cohérence
+        if current_losses.shape[0] != self.num_losses:
+            raise ValueError(
+                f"Nombre de losses incohérent: attendu {self.num_losses}, "
+                f"reçu {current_losses.shape[0]}"
+            )
+        
         self._append_history(current_losses)
+        
+        # Besoin d'au moins 2 valeurs
         if len(self.loss_history[self.loss_names[0]]) < 2:
-            return self.weights.to(device=device, dtype=dtype)
+            w = self.weights.to(device=device, dtype=dtype)
+            self.last_weights = w.detach().cpu()  # ← AJOUTÉ
+            return w
+        
         ratios = []
         for name in self.loss_names:
             hist = self.loss_history[name]
@@ -941,48 +1140,70 @@ class ReLoBRaLoLoss:
             num = float(hist[-1])
             den = float(hist[j]) + 1e-8
             ratios.append(num / den)
+        
         ratios_t = torch.tensor(ratios, device=device, dtype=dtype)
         mean_rel = ratios_t.mean()
         balancing = mean_rel / (ratios_t + 1e-8)
-        K = len(self.loss_names)
+        
+        K = self.num_losses
         new_w = K * torch.softmax(balancing / self.tau, dim=0)
+        
         w_old = self.weights.to(device=device, dtype=dtype)
         w_new = self.alpha * w_old + (1.0 - self.alpha) * new_w
+        
         self.weights = w_new.detach().cpu()
+        self.last_weights = w_new.detach().cpu()  # ← AJOUTÉ
+        
         return w_new
-
-
+    
+    def __call__(self, current_losses: torch.Tensor) -> torch.Tensor:
+        """
+        Calcule la loss totale pondérée par ReLoBRaLo.
+        
+        Args:
+            current_losses: [N] tensor des losses individuelles
+        
+        Returns:
+            total_loss: Scalar tensor de la loss totale pondérée
+        """
+        weights = self.compute_weights(current_losses)
+        total_loss = (weights * current_losses).sum()
+        return total_loss
+    
+    def forward(self, current_losses: torch.Tensor) -> torch.Tensor:
+        """Alias pour __call__ (compatibilité nn.Module style)"""
+        return self.__call__(current_losses)
 # ============================================================
 # 6) Raffineur type EfficientNet (paramétrable)
 # ============================================================
 class EfficientNetRefiner(nn.Module):
+    """
+    Raffineur simplifié : prend UNIQUEMENT le résidu en entrée.
+    Prédit directement les corrections delta à partir du résidu.
+    """
     def __init__(
         self,
         m_params: int,
-        cond_dim: int,
-        backbone_feat_dim: int,
         *,
         delta_scale: float = 0.1,
-        max_refine_steps: int = 3,
         encoder_variant: str = "s",
         encoder_width_mult: float = 1.0,
         encoder_depth_mult: float = 1.0,
         encoder_stem_channels: int | None = None,
         encoder_drop_path: float = 0.1,
         encoder_se_ratio: float = 0.25,
-        feature_pool: str = "avg",           # {"avg","max","avgmax"}
-        shared_hidden_scale: float = 0.5,    # H = max(64, D * scale)
+        feature_pool: str = "avg",
+        hidden_dim: int = 128,
         mlp_dropout: float = 0.10,
     ):
         super().__init__()
         self.delta_scale = float(delta_scale)
         self.m_params = int(m_params)
-        self.cond_dim = int(cond_dim)
-        self.use_film = True
         self.mlp_dropout = float(mlp_dropout)
 
+        # ✅ Encodeur : 1 seul canal (résidu)
         self.encoder = EfficientNetEncoder(
-            in_channels=2,
+            in_channels=1,
             variant=encoder_variant,
             width_mult=encoder_width_mult,
             depth_mult=encoder_depth_mult,
@@ -993,7 +1214,8 @@ class EfficientNetRefiner(nn.Module):
 
         D = self.encoder.feat_dim
         pool = feature_pool.lower()
-        self._feature_pool_mode = pool  # <<< important
+        self._feature_pool_mode = pool
+        
         if pool == "avg":
             self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
         elif pool == "max":
@@ -1003,33 +1225,27 @@ class EfficientNetRefiner(nn.Module):
         else:
             raise ValueError(f"feature_pool inconnu: {feature_pool}")
 
-        H = max(64, int(round(D * float(shared_hidden_scale))))
-        in_shared = D if pool != "avgmax" else 2 * D
+        in_dim = D if pool != "avgmax" else 2 * D
+        H = hidden_dim
 
-        self.shared_head = nn.Sequential(
-            nn.Linear(in_shared, H), nn.LayerNorm(H), nn.GELU(),
+        # ✅ MLP : features → hidden
+        self.mlp_hidden = nn.Sequential(
+            nn.Linear(in_dim, H),
+            nn.LayerNorm(H),
+            nn.GELU(),
             nn.Dropout(self.mlp_dropout),
-            nn.Linear(H, H), nn.LayerNorm(H), nn.GELU(),
+            
+            nn.Linear(H, H),
+            nn.LayerNorm(H),
+            nn.GELU(),
             nn.Dropout(self.mlp_dropout),
         )
-
-        # plus d'index temporel → film_in = cond_dim uniquement
-        film_in = self.cond_dim
-        self.film_time = nn.Sequential(
-            nn.Linear(film_in, H), nn.Tanh(),
-            nn.Dropout(self.mlp_dropout),
-            nn.Linear(H, 2 * H)  # -> gamma, beta
-        )
-
+        
+        # ✅ Gate adaptatif par paramètre (APRÈS le MLP)
         self.scale_gate = nn.Linear(H, m_params)
-
-        self.delta_head = nn.Sequential(
-            nn.Linear(H + backbone_feat_dim + m_params, H),
-            nn.LayerNorm(H), nn.GELU(),
-            nn.Dropout(self.mlp_dropout),
-            nn.Linear(H, m_params)
-        )
-
+        
+        # ✅ Tête de prédiction des deltas
+        self.delta_head = nn.Linear(H, m_params)
 
     def _pool_features(self, latent: torch.Tensor) -> torch.Tensor:
         if self._feature_pool_mode == "avg":
@@ -1041,28 +1257,34 @@ class EfficientNetRefiner(nn.Module):
         m = maxp(latent).flatten(1)
         return torch.cat([a, m], dim=1)
 
-
-    def forward(self, noisy, resid, params_pred_norm, cond_norm, feat_shared):
-        x = torch.stack([noisy, resid], dim=1)
-        latent, _ = self.encoder(x)
-        feat = self._pool_features(latent)
-        h = self.shared_head(feat)
-
-        # FiLM sans temps
-        if cond_norm is None:
-            raise RuntimeError("cond_norm ne doit pas être None quand FiLM est activé.")
-        gamma_beta = self.film_time(cond_norm)
-        gamma, beta = gamma_beta[:, :h.shape[1]], gamma_beta[:, h.shape[1]:]
-        h = h * (1 + 0.1 * gamma) + 0.1 * beta
-
-        gate = torch.sigmoid(self.scale_gate(h))
+    def forward(self, resid: torch.Tensor) -> torch.Tensor:
+        """
+        ✅ SIMPLE : uniquement le résidu en entrée
+        
+        Args:
+            resid: [B, N] résidu (recon - target)
+        
+        Returns:
+            delta: [B, M] corrections des paramètres
+        """
+        # Encoder le résidu
+        x = resid.unsqueeze(1)  # [B, 1, N]
+        latent, _ = self.encoder(x)  # [B, D, N']
+        feat = self._pool_features(latent)  # [B, in_dim]
+        
+        # Passer par le MLP
+        h = self.mlp_hidden(feat)  # [B, H]
+        
+        # Gate adaptatif (contrôle l'amplitude par paramètre)
+        gate = torch.sigmoid(self.scale_gate(h))  # [B, M]
         scale = self.delta_scale * gate
-
-        z = torch.cat([h, feat_shared, params_pred_norm], dim=1)
-        raw = self.delta_head(z)
-        delta = torch.tanh(raw) * scale
+        
+        # Prédire les corrections brutes
+        raw_delta = self.delta_head(h)  # [B, M]
+        
+        # Corrections bornées
+        delta = torch.tanh(raw_delta) * scale  # [B, M]
         return delta
-
 
 class ResidualBlock1D(nn.Module):
     def __init__(self, c, k=7, d=1, p=None):
@@ -1139,6 +1361,311 @@ def baseline_poly3_from_edges(resid: torch.Tensor, left_frac: float = 0.20, righ
     resid_corr = resid - baseline
     return resid_corr, baseline
 
+# ============================================================
+# LOSS FUNCTIONS AMÉLIORÉES - CONFIGURATION MINIMALE
+# ============================================================
+
+class SpectralAngleLoss(nn.Module):
+    """
+    Mesure l'angle entre spectres (insensible à l'échelle).
+    Plus robuste que MSE pour les variations d'amplitude globales.
+    Remplace: w_corr_raw, w_corr_d1, w_corr_d2
+    """
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+    
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, N] spectres prédits
+            target: [B, N] spectres cibles
+        Returns:
+            loss scalaire (moyenne sur le batch)
+        """
+        # Normalisation L2
+        pred_norm = F.normalize(pred, p=2, dim=1, eps=self.eps)
+        target_norm = F.normalize(target, p=2, dim=1, eps=self.eps)
+        
+        # Similarité cosinus
+        cosine_sim = (pred_norm * target_norm).sum(dim=1)
+        
+        # Clamp pour stabilité numérique
+        cosine_sim = torch.clamp(cosine_sim, -1.0 + self.eps, 1.0 - self.eps)
+        
+        # Convertir en loss (1 - similarité)
+        return (1.0 - cosine_sim).mean()
+
+# ============================================================
+# APRÈS LES IMPORTS, AVANT LES AUTRES CLASSES
+# ============================================================
+from torch.optim.lr_scheduler import _LRScheduler
+
+# ============================================================
+# CLASSE DU SCHEDULER (à ajouter au début de votre fichier principal)
+# ============================================================
+
+class CosineAnnealingWarmRestartsWithDecayAndLinearWarmup(_LRScheduler):
+    """
+    Cosine Annealing avec Warm Restarts, Decay progressif et Linear Warmup
+    """
+    def __init__(
+        self,
+        optimizer,
+        T_0: int,
+        T_mult: float = 1,
+        eta_min: float = 0,
+        decay_factor: float = 1.0,
+        warmup_epochs: int = 0,
+        last_epoch: int = -1,
+        verbose: bool = False
+    ):
+        self.T_0 = T_0
+        self.T_i = float(T_0)
+        self.T_mult = float(T_mult)
+        self.eta_min = eta_min
+        self.decay_factor = decay_factor
+        self.warmup_epochs = warmup_epochs
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+        self.current_max_lrs = self.base_lrs.copy()
+        self.T_cur = 0
+        self.restart_count = 0
+        super().__init__(optimizer, last_epoch, verbose)
+    
+    def get_lr(self):
+        current_epoch = self.last_epoch
+        
+        # Phase warmup
+        if current_epoch < self.warmup_epochs:
+            warmup_factor = (current_epoch + 1) / self.warmup_epochs
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        
+        # Phase cosine
+        adjusted_epoch = current_epoch - self.warmup_epochs
+        
+        if adjusted_epoch == 0:
+            self.T_cur = 0
+            self.T_i = float(self.T_0)
+        elif self.T_cur >= int(self.T_i):
+            self.restart_count += 1
+            self.T_cur = 0
+            self.current_max_lrs = [lr * self.decay_factor for lr in self.current_max_lrs]
+            self.T_i = self.T_i * self.T_mult
+        
+        lrs = []
+        for max_lr in self.current_max_lrs:
+            lr = self.eta_min + (max_lr - self.eta_min) * (
+                1 + math.cos(math.pi * self.T_cur / self.T_i)
+            ) / 2
+            lrs.append(lr)
+        
+        self.T_cur += 1
+        return lrs
+    
+    def get_schedule_info(self, max_epochs: int) -> dict:
+        """Simule le schedule pour visualisation"""
+        original_state = {
+            'last_epoch': self.last_epoch,
+            'T_cur': self.T_cur,
+            'T_i': self.T_i,
+            'restart_count': self.restart_count,
+            'current_max_lrs': self.current_max_lrs.copy(),
+        }
+        
+        self.last_epoch = -1
+        self.T_cur = 0
+        self.T_i = float(self.T_0)
+        self.restart_count = 0
+        self.current_max_lrs = self.base_lrs.copy()
+        
+        epochs = []
+        lrs = []
+        restart_epochs = []
+        
+        for epoch in range(max_epochs):
+            self.step()
+            epochs.append(epoch)
+            lrs.append(self.get_last_lr()[0])
+            
+            adjusted_epoch = epoch - self.warmup_epochs
+            if adjusted_epoch > 0 and self.T_cur == 1:
+                restart_epochs.append(epoch)
+        
+        # Restaurer l'état
+        self.last_epoch = original_state['last_epoch']
+        self.T_cur = original_state['T_cur']
+        self.T_i = original_state['T_i']
+        self.restart_count = original_state['restart_count']
+        self.current_max_lrs = original_state['current_max_lrs']
+        
+        return {
+            'epochs': epochs,
+            'lrs': lrs,
+            'restart_epochs': restart_epochs,
+            'warmup_end': self.warmup_epochs - 1 if self.warmup_epochs > 0 else None,
+        }
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PeakWeightedMSELoss(nn.Module):
+    """
+    Pondération par détection de pics via dérivées (100% PyTorch) :
+      - lissage gaussien AVANT dérivées,
+      - dérivées one-sided aux bords + atténuation cosine,
+      - carte de saillance 'soft' (0..1) lissée (+ gamma),
+      - élargissement optionnel (gaussian / maxpool),
+      - conversion en poids puis MSE pondérée.
+    """
+    def __init__(
+        self,
+        peak_weight: float = 4.0,
+        baseline_weight: float = 1.0,
+        pre_smooth_sigma: float = 1.3,        # points
+        salience_smooth_sigma: float = 1.8,   # points
+        peak_kind: str = "min",               # "min" (absorption) ou "max"
+        curv_scale_k: float = 2.2,
+        border_policy: str = "taper",         # "taper" ou "zero"
+        border_extra_margin: int = 2,
+        weight_normalize: str = "mean",       # "mean" ou "none"
+        renorm_after_smoothing: bool = True,
+        salience_gamma: float = 0.9,
+        spread_kind: str | None = "gaussian", # "gaussian", "maxpool", ou None
+        spread_sigma: float = 2.5,            # si gaussian (← un peu large par défaut)
+        spread_kernel: int = 11,              # si maxpool (impair)
+    ):
+        super().__init__()
+        self.peak_weight = float(peak_weight)
+        self.baseline_weight = float(baseline_weight)
+        self.pre_smooth_sigma = float(pre_smooth_sigma)
+        self.salience_smooth_sigma = float(salience_smooth_sigma)
+        self.peak_kind = str(peak_kind)
+        self.curv_scale_k = float(curv_scale_k)
+        self.border_policy = str(border_policy)
+        self.border_extra_margin = int(border_extra_margin)
+        self.weight_normalize = str(weight_normalize).lower()
+        self.renorm_after_smoothing = bool(renorm_after_smoothing)
+        self.salience_gamma = float(salience_gamma)
+        self.spread_kind = (None if spread_kind is None else str(spread_kind).lower())
+        self.spread_sigma = float(spread_sigma)
+        self.spread_kernel = int(spread_kernel)
+
+    @staticmethod
+    def _gaussian_kernel_1d(sigma: float, device, dtype):
+        if sigma <= 0:
+            return torch.ones(1,1,1, device=device, dtype=dtype)
+        k = int(6 * sigma + 1)
+        if k % 2 == 0: k += 1
+        if k < 3: k = 3
+        x = torch.arange(k, device=device, dtype=dtype) - (k // 2)
+        g = torch.exp(-(x**2) / (2 * (sigma**2)))
+        g = g / (g.sum() + 1e-12)
+        return g.view(1,1,-1)
+
+    def _gaussian_smooth1d(self, x: torch.Tensor, sigma: float) -> torch.Tensor:
+        if sigma <= 0: return x
+        g = self._gaussian_kernel_1d(sigma, x.device, x.dtype)
+        pad = g.shape[-1] // 2
+        x_pad = F.pad(x.unsqueeze(1), (pad, pad), mode="reflect")
+        return F.conv1d(x_pad, g).squeeze(1)
+
+    def _central_one_sided_diffs(self, x: torch.Tensor):
+        B, N = x.shape
+        d1 = torch.zeros_like(x)
+        d2 = torch.zeros_like(x)
+        if N >= 2:
+            if N > 2:
+                d1[:,1:-1] = 0.5 * (x[:,2:] - x[:, :-2])
+            d1[:,0]  = (x[:,1] - x[:,0])
+            d1[:, -1]= (x[:, -1] - x[:, -2])
+        if N >= 3:
+            d2[:,1:-1] = x[:,2:] - 2.0 * x[:,1:-1] + x[:, :-2]
+            d2[:,0]    = x[:,0] - 2.0 * x[:,1] + x[:,2]
+            d2[:, -1]  = x[:, -3] - 2.0 * x[:, -2] + x[:, -1]
+        return d1, d2
+
+    @staticmethod
+    def _robust_scale_central(t: torch.Tensor, margin: int) -> torch.Tensor:
+        B, N = t.shape
+        m = max(0, min(margin, (N - 1)//2))
+        tc = t[:, m:N-m] if (N - 2*m >= 3) else t
+        med = torch.median(tc, dim=-1, keepdim=True).values
+        mad = torch.median(torch.abs(tc - med), dim=-1, keepdim=True).values + 1e-12
+        return 1.4826 * mad
+
+    @staticmethod
+    def _border_taper_window(N: int, device, dtype, margin: int):
+        if margin <= 0 or 2*margin >= N:
+            return torch.ones(1,N, device=device, dtype=dtype)
+        t = torch.linspace(0,1, steps=margin, device=device, dtype=dtype)
+        ramp = 0.5 * (1 - torch.cos(torch.pi * t))
+        w = torch.ones(N, device=device, dtype=dtype)
+        w[:margin]  = ramp
+        w[-margin:] = torch.flip(ramp, dims=[0])
+        return w.view(1,-1)
+
+    def _detect(self, spectra: torch.Tensor):
+        B, N = spectra.shape
+        device, dtype = spectra.device, spectra.dtype
+
+        # marge = somme des pads utilisés → évite faux pics aux bords
+        m_pre = int(3 * max(self.pre_smooth_sigma, 0.0))
+        m_sal = int(3 * max(self.salience_smooth_sigma, 0.0))
+        m_spread = int(3 * max(self.spread_sigma if self.spread_kind=="gaussian" else 0.0, 0.0))
+        border_margin = max(2, m_pre + m_sal + m_spread + self.border_extra_margin)
+
+        x = self._gaussian_smooth1d(spectra, self.pre_smooth_sigma)
+        d1, d2 = self._central_one_sided_diffs(x)
+        curv = d2 if self.peak_kind.lower()=="min" else (-d2)
+
+        sigma1 = self._robust_scale_central(d1, border_margin)
+        gate = torch.exp(- (d1/(3.0*sigma1))**2)
+
+        sigma2 = self._robust_scale_central(curv, border_margin)
+        s_raw = F.softplus(curv / (self.curv_scale_k*sigma2)) * gate
+
+        w_border = self._border_taper_window(N, device, dtype, border_margin)
+        if self.border_policy.lower()=="taper":
+            s_raw = s_raw * w_border
+        elif self.border_policy.lower()=="zero":
+            s_raw = s_raw.clone(); s_raw[:, :border_margin]=0; s_raw[:, -border_margin:]=0
+
+        s_raw = s_raw / (s_raw.amax(dim=-1, keepdim=True) + 1e-12)
+        s_smooth = self._gaussian_smooth1d(s_raw, self.salience_smooth_sigma).clamp_(0,1)
+        if self.salience_gamma != 1.0:
+            s_smooth = s_smooth ** self.salience_gamma
+        if self.border_policy.lower()=="taper":
+            s_smooth = s_smooth * w_border
+
+        s_wide = s_smooth
+        if self.spread_kind=="gaussian" and self.spread_sigma>0:
+            s_wide = self._gaussian_smooth1d(s_wide, self.spread_sigma)
+        elif self.spread_kind=="maxpool":
+            k = max(3, self.spread_kernel | 1)
+            pad = k // 2
+            s_wide = F.max_pool1d(s_wide.unsqueeze(1), kernel_size=k, stride=1, padding=pad).squeeze(1)
+
+        if self.border_policy.lower()=="taper":
+            s_wide = s_wide * w_border
+        if self.renorm_after_smoothing:
+            s_wide = s_wide / (s_wide.amax(dim=-1, keepdim=True) + 1e-12)
+
+        weights = self.baseline_weight + s_wide * (self.peak_weight - self.baseline_weight)
+        if self.weight_normalize == "mean":
+            weights = weights / (weights.mean(dim=-1, keepdim=True) + 1e-12)
+        return weights, s_wide, border_margin
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, return_debug: bool=False):
+        assert pred.shape == target.shape and pred.ndim == 2
+        weights, mask_soft, border_margin = self._detect(target)
+        se = (pred - target) ** 2
+        loss = (se * weights).sum() / (weights.sum() + 1e-12)
+        if return_debug:
+            return loss, {"weights": weights, "mask_soft": mask_soft, "border_margin": border_margin}
+        return loss
 
 class PhysicallyInformedAE(pl.LightningModule):
     def __init__(
@@ -1152,12 +1679,9 @@ class PhysicallyInformedAE(pl.LightningModule):
 
         # --- optims & pondérations globales ---
         lr: float = 1e-4,
-        alpha_param: float = 1.0,
-        alpha_phys: float = 1.0,
         # --- têtes de sortie ---
         head_mode: str = "multi",
         predict_params: Optional[List[str]] = None,
-        film_params: Optional[List[str]] = None,
         # --- raffinement ---
         refine_steps: int = 1,
         refine_delta_scale: float = 0.1,
@@ -1169,8 +1693,6 @@ class PhysicallyInformedAE(pl.LightningModule):
         stage3_lr_shrink: float = 0.33,
         stage3_refine_steps: Optional[int] = 2,
         stage3_delta_scale: Optional[float] = 0.08,
-        stage3_alpha_phys: Optional[float] = 0.7,
-        stage3_alpha_param: Optional[float] = 0.3,
         # --- reconstruction / pertes (existantes) ---
         recon_max1: bool = False,
         corr_mode: str = "savgol",
@@ -1195,22 +1717,29 @@ class PhysicallyInformedAE(pl.LightningModule):
         refiner_shared_hidden_scale: float = 0.5,
         # --- PHYSIQUE / TIPS ---
         tipspy: Tips2021QTpy | None = None,
+        use_relobralo_top: bool = True,     # ← NOUVEAU: activer ReLoBRaLo pour losses principales
 
         # --- débruitage ---
         use_denoiser: bool = False,
         denoiser_lr: float = 1e-4,
         denoiser_width: int = 64,
 
-        # --- nouveaux poids de pertes ---
+        # --- POIDS DE PERTES (CONFIGURATION MINIMALE) ---
+    # --- POIDS DE PERTES (CONFIGURATION COMPLÈTE) ---
         w_pw_raw: float = 1.0,
-        w_pw_d1:  float = 0.5,
-        w_pw_d2:  float = 0.25,
-        w_corr_raw: float = 0.10,
-        w_corr_d1:  float = 0.05,
-        w_corr_d2:  float = 0.05,
-        w_js_raw: float = 0.10,
-        w_js_d1:  float = 0.00,
-        w_js_d2:  float = 0.00,
+        w_spectral_angle: float = 0.5,
+        w_peak: float = 0.5,
+        w_params: float = 1.0,              # ← AJOUTÉ
+        pw_cfg: dict | None = None,
+
+        scheduler_T_0: int = 10,
+        scheduler_T_mult: float = 1.2,
+        scheduler_eta_min: float = 1e-9,
+        scheduler_decay_factor: float = 0.75,
+        scheduler_warmup_epochs: int = 5,
+
+
+
     ):
         super().__init__()
 
@@ -1225,8 +1754,6 @@ class PhysicallyInformedAE(pl.LightningModule):
 
         # --- optims / pondérations globales ---
         self.lr = float(lr)
-        self.alpha_param = float(alpha_param)
-        self.alpha_phys  = float(alpha_phys)
         self.huber_beta  = float(huber_beta)
 
         # --- raffinement ---
@@ -1241,8 +1768,6 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.stage3_lr_shrink   = float(stage3_lr_shrink)
         self.stage3_refine_steps= stage3_refine_steps
         self.stage3_delta_scale = stage3_delta_scale
-        self.stage3_alpha_phys  = stage3_alpha_phys
-        self.stage3_alpha_param = stage3_alpha_param
 
         # --- pertes / métriques ---
         self.weight_mf = float(weight_mf)
@@ -1251,16 +1776,31 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.corr_savgol_poly = int(corr_savgol_poly)
         self.recon_max1 = bool(recon_max1)
 
-        # --- poids de pertes ---
-        self.w_pw_raw  = float(w_pw_raw)
-        self.w_pw_d1   = float(w_pw_d1)
-        self.w_pw_d2   = float(w_pw_d2)
-        self.w_corr_raw= float(w_corr_raw)
-        self.w_corr_d1 = float(w_corr_d1)
-        self.w_corr_d2 = float(w_corr_d2)
-        self.w_js_raw  = float(w_js_raw)
-        self.w_js_d1   = float(w_js_d1)
-        self.w_js_d2   = float(w_js_d2)
+        self.w_pw_raw = float(w_pw_raw)
+        self.w_spectral_angle = float(w_spectral_angle)
+        self.w_peak = float(w_peak)
+        self.w_params = float(w_params)              # ← AJOUTÉ
+        self.use_relobralo_top = bool(use_relobralo_top) 
+        
+        # --- instanciation des modules de loss ---
+        self.spectral_angle_loss = SpectralAngleLoss(eps=1e-8)
+  
+
+        # ✅ PeakWeightedMSELoss (torch-only), config par défaut + override via pw_cfg
+        _pw_default = dict(
+            peak_weight=4.0, baseline_weight=1.0,
+            pre_smooth_sigma=1.3, salience_smooth_sigma=1.8,
+            peak_kind="min", curv_scale_k=2.2,
+            border_policy="taper", border_extra_margin=2,
+            weight_normalize="mean", renorm_after_smoothing=True,
+            salience_gamma=0.9,
+            spread_kind="gaussian", spread_sigma=2.5, spread_kernel=11
+        )
+        if pw_cfg is not None:
+            _pw_default.update(pw_cfg)
+        self.peak_weighted_loss = PeakWeightedMSELoss(**_pw_default)
+
+
 
         # --- débruiteur (optionnel) ---
         self.use_denoiser = bool(use_denoiser)
@@ -1276,20 +1816,15 @@ class PhysicallyInformedAE(pl.LightningModule):
         assert not unknown, f"Paramètres inconnus: {unknown}"
         assert len(self.predict_params) >= 1
 
-        if film_params is None:
-            self.film_params = list(self.provided_params)
-        else:
-            self.film_params = list(film_params)
-        bad = set(self.film_params) - set(self.param_names)
-        assert not bad, f"film_params inconnus: {bad}"
-
-        # ✓ Vérifier que film_params existe dans param_names (peut être prédit OU fourni)
-        missing_film = set(self.film_params) - set(self.param_names)
-        assert not missing_film, f"film_params inconnus dans param_names: {missing_film}"
-
         self.name_to_idx = {n: i for i, n in enumerate(self.param_names)}
         self.predict_idx = [self.name_to_idx[p] for p in self.predict_params]
         self.provided_idx = [self.name_to_idx[p] for p in self.provided_params]
+
+        self.scheduler_T_0 = int(scheduler_T_0)
+        self.scheduler_T_mult = float(scheduler_T_mult)
+        self.scheduler_eta_min = float(scheduler_eta_min)
+        self.scheduler_decay_factor = float(scheduler_decay_factor)
+        self.scheduler_warmup_epochs = int(scheduler_warmup_epochs)
 
         # ===== Backbone EfficientNet 1D =====
         self.backbone = EfficientNetEncoder(
@@ -1301,48 +1836,55 @@ class PhysicallyInformedAE(pl.LightningModule):
             drop_path_rate=backbone_drop_path,
             stem_channels=backbone_stem_channels,
         )
-        self.feature_head = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
-        feat_dim = self.backbone.feat_dim; hidden = feat_dim // 2
 
-        self.shared_head = nn.Sequential(
-            nn.Linear(feat_dim, hidden),
-            nn.LayerNorm(hidden), nn.GELU(),
-            nn.Dropout(self.mlp_dropout),
-            nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden), nn.GELU(),
-            nn.Dropout(self.mlp_dropout),
-        )
+        # ===== Backbone déjà construit au-dessus =====
+        self.head_mode = str(head_mode).lower()
+        assert self.head_mode in {"single", "multi"}, f"head_mode invalide: {self.head_mode}"
 
-        self.cond_dim = len(self.film_params)
-        if self.cond_dim > 0:
-            self.film = nn.Sequential(
-                nn.Linear(self.cond_dim, hidden),
-                nn.Tanh(),
-                nn.Dropout(self.mlp_dropout),
-                nn.Linear(hidden, 2 * hidden)
-            )
-        else:
-            self.film = None
+        # AvgMax pooling
+        self.feature_head = nn.ModuleList([nn.AdaptiveAvgPool1d(1), nn.AdaptiveMaxPool1d(1)])
+        feat_dim = 2 * self.backbone.feat_dim
+        hidden   = feat_dim // 2
 
-        self.use_film = True
-        if self.cond_dim > 0:
-            self.register_buffer("film_mask", torch.ones(self.cond_dim))
-        else:
-            self.film_mask = None
+        def _pool_features(z: torch.Tensor) -> torch.Tensor:
+            a = self.feature_head[0](z).flatten(1)
+            m = self.feature_head[1](z).flatten(1)
+            return torch.cat([a, m], dim=1)
+        self._pool_features = _pool_features
 
-        self.head_mode = str(head_mode).lower(); assert self.head_mode in {"single", "multi"}
+        # --- shared head: skip + gating encapsulé dans un nn.Module ---
+        class GatedSharedHead(nn.Module):
+            def __init__(self, feat_dim: int, hidden: int, p_drop: float):
+                super().__init__()
+                self.short_head = nn.Linear(feat_dim, hidden)
+                self.deep_head = nn.Sequential(
+                    nn.Linear(feat_dim, hidden),
+                    nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(p_drop),
+                    nn.Linear(hidden, hidden),
+                    nn.LayerNorm(hidden), nn.GELU(), nn.Dropout(p_drop),
+                )
+                self.gate_head = nn.Sequential(nn.Linear(feat_dim, 1), nn.Sigmoid())
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                g = self.gate_head(x)
+                return g * self.deep_head(x) + (1 - g) * self.short_head(x)
+
+        self.shared_head = GatedSharedHead(feat_dim, hidden, p_drop=self.mlp_dropout)
+
+        # --- têtes de sortie (assure l’existence des deux attributs) ---
         if self.head_mode == "single":
             self.out_head = nn.Linear(hidden, len(self.predict_params))
+            self.out_heads = None
         else:
-            self.out_heads = nn.ModuleDict({p: nn.Linear(hidden, 1) for p in self.predict_params})
+            self.out_heads = nn.ModuleDict({pname: nn.Linear(hidden, 1) for pname in self.predict_params})
+            self.out_head = None
 
+
+            
         # ===== Raffineurs B/C/D =====
+# ===== Raffineurs B/C/D (VERSION SIMPLE) =====
         base_refiner = EfficientNetRefiner(
             m_params=len(self.predict_params),
-            cond_dim=self.cond_dim,
-            backbone_feat_dim=self.backbone.feat_dim,
             delta_scale=refine_delta_scale,
-            max_refine_steps=max(3, self.refine_steps if isinstance(self.refine_steps, int) else 3),
             encoder_variant=refiner_variant,
             encoder_width_mult=refiner_width_mult,
             encoder_depth_mult=refiner_depth_mult,
@@ -1350,18 +1892,15 @@ class PhysicallyInformedAE(pl.LightningModule):
             encoder_drop_path=refiner_drop_path,
             encoder_se_ratio=refiner_se_ratio,
             feature_pool=refiner_feature_pool,
-            shared_hidden_scale=refiner_shared_hidden_scale,
+            hidden_dim=max(64, int(self.backbone.feat_dim * refiner_shared_hidden_scale)),
             mlp_dropout=self.refiner_mlp_dropout
         )
         self.refiner = base_refiner
         self.cascade_stages = 3
-        extra_refiners = [
-            EfficientNetRefiner(
+
+        extra_refiners = [EfficientNetRefiner(
                 m_params=len(self.predict_params),
-                cond_dim=self.cond_dim,
-                backbone_feat_dim=self.backbone.feat_dim,
                 delta_scale=refine_delta_scale,
-                max_refine_steps=max(3, self.refine_steps if isinstance(self.refine_steps, int) else 3),
                 encoder_variant=refiner_variant,
                 encoder_width_mult=refiner_width_mult,
                 encoder_depth_mult=refiner_depth_mult,
@@ -1369,7 +1908,7 @@ class PhysicallyInformedAE(pl.LightningModule):
                 encoder_drop_path=refiner_drop_path,
                 encoder_se_ratio=refiner_se_ratio,
                 feature_pool=refiner_feature_pool,
-                shared_hidden_scale=refiner_shared_hidden_scale,
+                hidden_dim=max(64, int(self.backbone.feat_dim * refiner_shared_hidden_scale)),
                 mlp_dropout=self.refiner_mlp_dropout
             )
             for _ in range(self.cascade_stages - 1)
@@ -1378,9 +1917,17 @@ class PhysicallyInformedAE(pl.LightningModule):
 
         # ===== ReLoBRaLo =====
         self.loss_names_params = [f"param_{p}" for p in self.predict_params]
-        self.relo_params = ReLoBRaLoLoss(self.loss_names_params, alpha=0.9, tau=1.0, history_len=10)
-        self.loss_names_top = ["phys_pointwise", "phys_shape", "param_group"]
-        self.relo_top = ReLoBRaLoLoss(self.loss_names_top, alpha=0.9, tau=1.0, history_len=10)
+        self.relo_params = ReLoBRaLoLoss(num_losses=len(self.predict_params), alpha=0.9, tau=1.0, history_len=10)
+        if self.use_relobralo_top:
+            self.loss_names_top = ["phys_pointwise", "phys_spectral", "phys_peak", "param_group"]
+            self.relo_top = ReLoBRaLoLoss(
+                loss_names=self.loss_names_top, 
+                alpha=0.9,      # Momentum pour EMA
+                tau=1.0,        # Température pour softmax
+                history_len=10  # Historique pour stabilité
+            )
+        else:
+            self.relo_top = None 
 
         # ----- Stage override -----
         self._override_stage: Optional[str] = None
@@ -1428,23 +1975,6 @@ class PhysicallyInformedAE(pl.LightningModule):
         resid_corr = resid - baseline
         return resid_corr, baseline
 
-    # ==== FiLM runtime control ====
-    def set_film_usage(self, use: bool = True):
-        self.use_film = bool(use)
-        for r in self.refiners:
-            r.use_film = self.use_film
-
-    def set_film_subset(self, names=None):
-        if self.cond_dim == 0 or self.film_mask is None: return
-        if names is None or names == "all":
-            mask = torch.ones(self.cond_dim, device=self.film_mask.device, dtype=self.film_mask.dtype)
-        else:
-            allowed = set(names)
-            mask = torch.zeros(self.cond_dim, device=self.film_mask.device, dtype=self.film_mask.dtype)
-            for i, n in enumerate(self.film_params):
-                if n in allowed: mask[i] = 1.0
-        self.film_mask.copy_(mask)
-
     def set_stage_mode(self, mode: Optional[str], refine_steps: Optional[int]=None, delta_scale: Optional[float]=None):
         if mode is not None:
             mode = mode.upper(); assert mode in {'A','B1','B2','DEN'}
@@ -1457,58 +1987,25 @@ class PhysicallyInformedAE(pl.LightningModule):
             self.refine_steps = int(refine_steps)
 
     # ---- utils tête ----
-    def _predict_params_from_features(self, feat: torch.Tensor, cond_norm: Optional[torch.Tensor]=None) -> torch.Tensor:
+    def _predict_params_from_features(self, feat: torch.Tensor) -> torch.Tensor:
         h = self.shared_head(feat)
-        if self.film is not None and cond_norm is not None and self.use_film:
-            if self.film_mask is not None and self.film_mask.numel() == cond_norm.shape[1]:
-                cond_in = cond_norm * self.film_mask.unsqueeze(0)
-            else:
-                cond_in = cond_norm
-            gb = self.film(cond_in); H = h.shape[1]
-            gamma, beta = gb[:, :H], gb[:, H:]
-            h = h * (1 + 0.1*gamma) + 0.1*beta
-        if self.head_mode == "single":
+        if self.head_mode == "multi" and self.out_heads is not None:
+            outs = []
+            for name in self.predict_params:
+                y = self.out_heads[name](h)
+                outs.append(torch.sigmoid(y))
+            return torch.cat(outs, dim=1)
+        elif self.head_mode == "single" and self.out_head is not None:
             y = self.out_head(h)
+            return torch.sigmoid(y)
         else:
-            y = torch.cat([self.out_heads[p](h) for p in self.predict_params], dim=1)
-        return torch.sigmoid(y).clamp(1e-4, 1-1e-4)
+            raise RuntimeError("Configuration des têtes incohérente avec head_mode.")
 
+        
     def encode(self, spectra: torch.Tensor, pooled: bool=True, detach: bool=False):
         latent, _ = self.backbone(spectra.unsqueeze(1))
-        feat = self.feature_head(latent) if pooled else latent
+        feat = self._pool_features(latent) if pooled else latent
         return feat.detach() if detach else feat
-
-    def _make_condition_from_norm(self, params_true_norm: torch.Tensor) -> torch.Tensor | None:
-        if self.cond_dim == 0 or not self.use_film:
-            return None
-        
-        cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.film_params]
-        cond = torch.stack(cols, dim=1)
-        
-        if getattr(self, "film_mask", None) is not None and self.film_mask.numel() == cond.shape[1]:
-            cond = cond * self.film_mask.unsqueeze(0).to(device=cond.device, dtype=cond.dtype)
-        return cond
-
-    @torch.no_grad()
-    def _make_condition_from_phys(self, provided_phys: dict, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> torch.Tensor | None:
-        if self.cond_dim == 0 or not self.use_film:
-            return None
-        dev = device or (self.device if hasattr(self, "device") else next(self.parameters()).device)
-        missing = [n for n in self.film_params if n not in provided_phys]
-        if missing:
-            raise KeyError(f"Il manque des clés dans provided_phys pour FiLM: {missing}")
-        cols = []
-        for name in self.film_params:
-            t = provided_phys[name]
-            t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t)
-            if t.ndim == 0:  t = t.unsqueeze(0)
-            t = t.to(device=dev, dtype=dtype)
-            t_norm = norm_param_torch(name, t)
-            cols.append(t_norm)
-        cond = torch.stack(cols, dim=1)
-        if getattr(self, "film_mask", None) is not None and self.film_mask.numel() == cond.shape[1]:
-            cond = cond * self.film_mask.unsqueeze(0).to(device=cond.device, dtype=cond.dtype)
-        return cond
 
     # ---- (dé)normalisation & physique ----
     def _denorm_params_subset(self, y_norm_subset: torch.Tensor, names: List[str]) -> torch.Tensor:
@@ -1523,25 +2020,60 @@ class PhysicallyInformedAE(pl.LightningModule):
         return full
 
     def _physics_reconstruction(self, y_phys_full: torch.Tensor, device, scale: Optional[torch.Tensor]=None) -> torch.Tensor:
-        p = {k: y_phys_full[:, i] for i, k in enumerate(self.param_names)}
-        v_grid_idx = torch.arange(self.n_points, dtype=torch.float64, device=device)
-        b0_idx = self.name_to_idx['baseline0']
-        baseline_coeffs = y_phys_full[:, b0_idx:b0_idx+3]
-
-        mf_dict = {}
-        for mol in self.transitions_dict.keys():
-            key = f"mf_{mol}"
-            mf_dict[mol] = p[key] if key in p else torch.zeros_like(p['P'])
-
-        spectra, _ = batch_physics_forward_multimol_vgrid(
-            p['sig0'], p['dsig'], self.poly_freq_CH4, v_grid_idx,
-            baseline_coeffs, self.transitions_dict, p['P'], p['T'], mf_dict,
-            tipspy=self.tipspy, device=device
-        )
-        spectra = spectra.to(torch.float32)
-        scale_recon = lowess_value(spectra, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
-        spectra = spectra / scale_recon
-        return spectra
+            """
+            Reconstruit le spectre depuis les paramètres physiques dénormalisés.
+            VERSION CORRIGÉE : Gère baseline0 via LOWESS quand il n'est pas prédit.
+            """
+            B = y_phys_full.shape[0]
+            p = {k: y_phys_full[:, i] for i, k in enumerate(self.param_names)}
+            
+            v_grid_idx = torch.arange(self.n_points, dtype=torch.float64, device=device)
+            
+            # Préparer les fractions molaires
+            mf_dict = {}
+            for mol in self.transitions_dict.keys():
+                key = f"mf_{mol}"
+                mf_dict[mol] = p[key] if key in p else torch.zeros_like(p['P'])
+            
+            # ============================================================
+            # CORRECTION : Gestion de baseline0
+            # ============================================================
+            
+            # Vérifier si baseline0 est dans les paramètres prédits
+            if 'baseline0' in self.predict_params:
+                # CAS 1 : baseline0 est PRÉDIT - on l'utilise directement
+                b0_idx = self.name_to_idx['baseline0']
+                baseline_coeffs = y_phys_full[:, b0_idx:b0_idx+3]
+                
+            else:
+                # CAS 2 : baseline0 est CALCULÉ via LOWESS (c'est le cas actuel)
+                b1_idx = self.name_to_idx['baseline1']
+                b2_idx = self.name_to_idx['baseline2']
+                
+                # Utiliser baseline0 = 1.0 (sera normalisé après)
+                baseline_coeffs = torch.stack([
+                    torch.ones(B, device=device, dtype=torch.float64),  # b0 = 1.0
+                    y_phys_full[:, b1_idx].to(torch.float64),           # b1 prédit
+                    y_phys_full[:, b2_idx].to(torch.float64)            # b2 prédit
+                ], dim=1)
+            
+            # ============================================================
+            # Génération du spectre
+            # ============================================================
+            spectra, _ = batch_physics_forward_multimol_vgrid(
+                p['sig0'], p['dsig'], self.poly_freq_CH4, v_grid_idx,
+                baseline_coeffs, self.transitions_dict, p['P'], p['T'], mf_dict,
+                tipspy=self.tipspy, device=device
+            )
+            spectra = spectra.to(torch.float32)
+            
+            # ============================================================
+            # Normalisation finale par LOWESS
+            # ============================================================
+            scale_recon = lowess_value(spectra, kind="start", win=30).unsqueeze(1).clamp_min(1e-8)
+            spectra = spectra / scale_recon
+            
+            return spectra
 
     # ---------- Savitzky–Golay derivative (torch) ----------
     def _savgol_coeffs(self, window_length: int, polyorder: int, deriv: int = 1, delta: float = 1.0, device=None, dtype=torch.float64) -> torch.Tensor:
@@ -1602,20 +2134,20 @@ class PhysicallyInformedAE(pl.LightningModule):
         m = 0.5 * (p + q)
         return 0.5 * self._kl(p, m, eps) + 0.5 * self._kl(q, m, eps)
 
-    # ---- training/validation step ----
+
     def _common_step(self, batch, step_name: str):
+        """Step commun pour train/val/test."""
         noisy, clean, params_true_norm = batch['noisy_spectra'], batch['clean_spectra'], batch['params']
         scale = batch.get('scale', None)
         if scale is not None:
             scale = scale.to(clean.device)
 
-        cond_norm = self._make_condition_from_norm(params_true_norm)
-
+        # ========== FORWARD PASS BASE MODEL A ==========
         latent, _ = self.backbone(noisy.unsqueeze(1))
-        feat_shared = self.feature_head(latent)
-        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
+        feat_shared = self._pool_features(latent)
+        params_pred_norm = self._predict_params_from_features(feat_shared)
 
-        # Params "fournis"
+        # Paramètres fournis
         if len(self.provided_params) > 0:
             provided_cols = [params_true_norm[:, self.name_to_idx[n]] for n in self.provided_params]
             provided_norm_tensor = torch.stack(provided_cols, dim=1)
@@ -1623,110 +2155,145 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             provided_phys_tensor = params_pred_norm.new_zeros((noisy.shape[0], 0))
 
-        # Planning raffinement
+        # Récupérer les paramètres expérimentaux
+        use_exp_params_in_A = getattr(self, '_use_exp_params_in_A', [])
+
+        # ========== STAGE A: Reconstruction ==========
+        spectra_recon = None
+        
+        if self._override_stage == 'A' and len(use_exp_params_in_A) > 0:
+            params_for_recon_norm = params_pred_norm.clone()
+            for param_name in use_exp_params_in_A:
+                if param_name in self.predict_params:
+                    idx = self.predict_params.index(param_name)
+                    params_for_recon_norm[:, idx] = params_true_norm[:, self.name_to_idx[param_name]]
+            
+            pred_phys_recon = self._denorm_params_subset(params_for_recon_norm, self.predict_params)
+            y_phys_full_recon = self._compose_full_phys(pred_phys_recon, provided_phys_tensor)
+            spectra_recon = self._physics_reconstruction(y_phys_full_recon, clean.device, scale=None)
+
+        # ========== RAFFINEMENT ==========
         e = self.current_epoch
         effective_refine_steps = 0 if e < self.refine_warmup_epochs else self.refine_steps
+        
         if self._override_stage is not None:
-            if self._override_stage == 'A':   effective_refine_steps = 0
-            elif self._override_stage in ('B1', 'B2'): effective_refine_steps = self.refine_steps
+            if self._override_stage == 'A':   
+                effective_refine_steps = 0
+            elif self._override_stage in ('B1', 'B2', 'C', 'D'): 
+                effective_refine_steps = self.refine_steps
 
         target_for_resid = noisy if self.refine_target == "noisy" else clean
-
-        # === CASCADE B→C→D (résidu corrigé baseline, puis éventuellement débruité) ===
         n_stages = min(effective_refine_steps, len(self.refiners))
         mask_now = self.refine_mask_base.to(clean.device, dtype=params_pred_norm.dtype)
 
-        spectra_recon = None
+        use_exp_params_for_resid = getattr(self, '_use_exp_params_for_resid', [])
+        
         for k in range(n_stages):
-            pred_phys  = self._denorm_params_subset(params_pred_norm, self.predict_params)
-            y_phys_full= self._compose_full_phys(pred_phys, provided_phys_tensor)
-            spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
+            if len(use_exp_params_for_resid) > 0:
+                params_for_resid_norm = params_pred_norm.clone()
+                for param_name in use_exp_params_for_resid:
+                    if param_name in self.predict_params:
+                        idx = self.predict_params.index(param_name)
+                        params_for_resid_norm[:, idx] = params_true_norm[:, self.name_to_idx[param_name]]
+                
+                pred_phys_for_resid = self._denorm_params_subset(params_for_resid_norm, self.predict_params)
+                y_phys_full_for_resid = self._compose_full_phys(pred_phys_for_resid, provided_phys_tensor)
+                spectra_recon_for_resid = self._physics_reconstruction(y_phys_full_for_resid, clean.device, scale=None)
+                resid = spectra_recon_for_resid - target_for_resid
+            else:
+                pred_phys = self._denorm_params_subset(params_pred_norm, self.predict_params)
+                y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
+                spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
+                resid = spectra_recon - target_for_resid
 
-            resid = spectra_recon - target_for_resid
             resid_corr, _ = self._baseline_poly3_from_edges(resid, left_frac=0.20, right_start=0.75)
 
-            # résidu pour le raffineur (optionnellement débruité)
             resid_for_refiner = resid_corr
             if self.use_denoiser and self._override_stage in (None, 'B1', 'B2'):
-                with torch.no_grad():  # gel pendant B/C/D
+                with torch.no_grad():
                     resid_for_refiner = self.denoiser(resid_corr)
 
-            delta = self.refiners[k](
-                noisy=noisy,
-                resid=resid_for_refiner,
-                params_pred_norm=params_pred_norm,
-                cond_norm=cond_norm,
-                feat_shared=feat_shared,
-            )
-
+            delta = self.refiners[k](resid_for_refiner)
             params_pred_norm = (params_pred_norm + delta * mask_now).clamp(1e-4, 1-1e-4)
 
-        # Reconstruction finale
-        pred_phys   = self._denorm_params_subset(params_pred_norm, self.predict_params)
-        y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
-        spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
+        # ========== RECONSTRUCTION FINALE ==========
+        if spectra_recon is None:
+            pred_phys   = self._denorm_params_subset(params_pred_norm, self.predict_params)
+            y_phys_full = self._compose_full_phys(pred_phys, provided_phys_tensor)
+            spectra_recon = self._physics_reconstruction(y_phys_full, clean.device, scale=None)
 
-        # ================== PERTES PHYSIQUES ==================
-        yh  = spectra_recon
-        yt  = clean
-        d1h = self._savgol_deriv(yh, self.corr_savgol_win, self.corr_savgol_poly, deriv=1)
-        d1t = self._savgol_deriv(yt, self.corr_savgol_win, self.corr_savgol_poly, deriv=1)
-        d2h = self._savgol_deriv(yh, self.corr_savgol_win, self.corr_savgol_poly, deriv=2)
-        d2t = self._savgol_deriv(yt, self.corr_savgol_win, self.corr_savgol_poly, deriv=2)
+        # ========== CALCUL DES LOSSES BRUTES ==========
+        yh = spectra_recon
+        yt = clean
 
-        loss_pw_raw = self.w_pw_raw * F.mse_loss(yh,  yt)
-        loss_pw_d1  = self.w_pw_d1  * F.mse_loss(d1h, d1t)
-        loss_pw_d2  = self.w_pw_d2  * F.mse_loss(d2h, d2t)
-        loss_phys_pointwise = loss_pw_raw + loss_pw_d1 + loss_pw_d2
+        # Losses spectrales (brutes, sans poids)
+        loss_pointwise_raw = F.mse_loss(yh, yt)
+        loss_spectral_raw = self.spectral_angle_loss(yh, yt)
+        
+        loss_peak_raw = torch.tensor(0.0, device=clean.device)
+        if self.w_peak > 0:
+            loss_peak_raw = self.peak_weighted_loss(yh, yt)
 
-        loss_corr_raw = self.w_corr_raw * self._pearson_corr_basic(yh,  yt)
-        loss_corr_d1  = self.w_corr_d1  * self._pearson_corr_basic(d1h, d1t)
-        loss_corr_d2  = self.w_corr_d2  * self._pearson_corr_basic(d2h, d2t)
-        loss_phys_corr = loss_corr_raw + loss_corr_d1 + loss_corr_d2
-
-        pdf_h  = self._to_pdf(yh)
-        pdf_t  = self._to_pdf(yt)
-        loss_js_raw = self.w_js_raw * self._js(pdf_h, pdf_t).mean()
-        loss_js_d1 = torch.tensor(0.0, device=yh.device)
-        loss_js_d2 = torch.tensor(0.0, device=yh.device)
-        if self.w_js_d1 > 0:
-            pdf_d1h = self._to_pdf(d1h.abs())
-            pdf_d1t = self._to_pdf(d1t.abs())
-            loss_js_d1 = self.w_js_d1 * self._js(pdf_d1h, pdf_d1t).mean()
-        if self.w_js_d2 > 0:
-            pdf_d2h = self._to_pdf(d2h.abs())
-            pdf_d2t = self._to_pdf(d2t.abs())
-            loss_js_d2 = self.w_js_d2 * self._js(pdf_d2h, pdf_d2t).mean()
-
-        loss_phys_js = loss_js_raw + loss_js_d1 + loss_js_d2
-        loss_phys_shape = loss_phys_corr + loss_phys_js
-
-        # ================== PERTES PARAMÈTRES ==================
+        # ✅ Loss params (brute)
         per_param_losses = []
+        per_param_names = []
+        
         for j, name in enumerate(self.predict_params):
+            if len(use_exp_params_in_A) > 0 and name in use_exp_params_in_A:
+                continue
+            
             true_j = params_true_norm[:, self.name_to_idx[name]]
             mult = self.weight_mf if name in ("mf_CH4", "mf_H2O") else 1.0
             lp = mult * F.mse_loss(params_pred_norm[:, j], true_j)
             per_param_losses.append(lp)
+            per_param_names.append(name)
 
-        if len(per_param_losses) > 0:
-            per_param_tensor = torch.stack(per_param_losses)
-            w_params = self.relo_params.compute_weights(per_param_tensor)
-            w_params_norm = w_params / (w_params.sum() + 1e-12)
-            loss_param_group = torch.sum(w_params_norm * per_param_tensor)
+        loss_params_raw = torch.mean(torch.stack(per_param_losses)) if per_param_losses else torch.tensor(0.0, device=clean.device)
+
+        # ========== APPLICATION DES POIDS (avec ou sans ReLoBRaLo) ==========
+        if self.use_relobralo_top and step_name == "train" and self.relo_top is not None:
+            # ✅ ReLoBRaLo équilibre automatiquement
+            # Créer un tenseur avec les losses dans l'ordre des loss_names_top
+            losses_tensor = torch.stack([
+                loss_pointwise_raw,
+                loss_spectral_raw,
+                loss_peak_raw,
+                loss_params_raw,
+            ])  # Shape: [4]
+            
+            # Appeler ReLoBRaLo (retourne loss totale ET poids)
+            loss_main = self.relo_top(losses_tensor)
+            
+            # Récupérer les poids pour logging
+            # ReLoBRaLo stocke les derniers poids dans self.relo_top.last_weights
+            if hasattr(self.relo_top, 'last_weights'):
+                weights = self.relo_top.last_weights
+            else:
+                # Fallback si pas de last_weights
+                weights = torch.ones_like(losses_tensor) / len(losses_tensor)
+            
+            # Pour logging (losses pondérées individuelles)
+            loss_pointwise = weights[0].item() * loss_pointwise_raw
+            loss_spectral = weights[1].item() * loss_spectral_raw
+            loss_peak = weights[2].item() * loss_peak_raw
+            loss_params = weights[3].item() * loss_params_raw
+            
+            # Logger les poids adaptatifs
+            self.log("relo_weight_phys_pointwise", weights[0].item(), on_epoch=True, sync_dist=True)
+            self.log("relo_weight_phys_spectral", weights[1].item(), on_epoch=True, sync_dist=True)
+            self.log("relo_weight_phys_peak", weights[2].item(), on_epoch=True, sync_dist=True)
+            self.log("relo_weight_param_group", weights[3].item(), on_epoch=True, sync_dist=True)
+            
         else:
-            loss_param_group = torch.tensor(0.0, device=clean.device)
+            # ✅ Poids fixes (pour validation ou si ReLoBRaLo désactivé)
+            loss_pointwise = self.w_pw_raw * loss_pointwise_raw
+            loss_spectral = self.w_spectral_angle * loss_spectral_raw
+            loss_peak = self.w_peak * loss_peak_raw
+            loss_params = self.w_params * loss_params_raw
+            
+            loss_main = loss_pointwise + loss_spectral + loss_peak + loss_params
 
-        # ================== AGRÉGATION TOP (ReLoBRaLo) ==================
-        top_vec = torch.stack([loss_phys_pointwise, loss_phys_shape, loss_param_group])
-        w_top = self.relo_top.compute_weights(top_vec)
-        priors_top = torch.tensor([self.alpha_phys, self.alpha_phys, self.alpha_param],
-                                  device=top_vec.device, dtype=top_vec.dtype)
-        w_top = w_top * priors_top
-        w_top = 3.0 * w_top / (w_top.sum() + 1e-12)
-        loss_main = torch.sum(w_top * top_vec)
-
-        # ======== Perte débruiteur (stage DEN uniquement) ========
+        # ========== DENOISER (si applicable) ==========
         if self._override_stage == 'DEN':
             resid_den = spectra_recon - noisy
             resid_den_corr, _ = self._baseline_poly3_from_edges(resid_den, left_frac=0.20, right_start=0.75)
@@ -1739,30 +2306,31 @@ class PhysicallyInformedAE(pl.LightningModule):
         else:
             loss = loss_main
 
-        # ================== LOGS ==================
-        self.log(f"{step_name}_loss", loss, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_phys_pointwise", loss_phys_pointwise, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_pw_raw", loss_pw_raw, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_pw_d1",  loss_pw_d1,  on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_pw_d2",  loss_pw_d2,  on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_phys_corr", loss_phys_corr, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_corr_raw", loss_corr_raw, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_corr_d1",  loss_corr_d1,  on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_corr_d2",  loss_corr_d2,  on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_phys_js", loss_phys_js, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_js_raw", loss_js_raw, on_epoch=True, sync_dist=True)
-        if self.w_js_d1 > 0:
-            self.log(f"{step_name}_loss_js_d1", loss_js_d1, on_epoch=True, sync_dist=True)
-        if self.w_js_d2 > 0:
-            self.log(f"{step_name}_loss_js_d2", loss_js_d2, on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_loss_param_group", loss_param_group, on_epoch=True, sync_dist=True)
+        # ========== LOGGING ==========
+        self.log(f"{step_name}_loss", loss, on_epoch=True, sync_dist=True, prog_bar=True)
+        
+        # Losses pondérées
+        self.log(f"{step_name}_loss_pointwise", loss_pointwise, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_spectral", loss_spectral, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_peak", loss_peak, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_params", loss_params, on_epoch=True, sync_dist=True)
+        
+        # ✅ Losses BRUTES (pour voir les magnitudes réelles)
+        self.log(f"{step_name}_loss_pointwise_raw", loss_pointwise_raw, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_spectral_raw", loss_spectral_raw, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_peak_raw", loss_peak_raw, on_epoch=True, sync_dist=True)
+        self.log(f"{step_name}_loss_params_raw", loss_params_raw, on_epoch=True, sync_dist=True)
+        
+        if len(use_exp_params_in_A) > 0:
+            self.log(f"{step_name}_n_exp_params_A", float(len(use_exp_params_in_A)), on_epoch=True, sync_dist=True)
+        
+        if len(use_exp_params_for_resid) > 0:
+            self.log(f"{step_name}_n_exp_params_resid", float(len(use_exp_params_for_resid)), on_epoch=True, sync_dist=True)
+
+        # Logger les losses individuelles par paramètre
         if len(per_param_losses) > 0:
-            self.log(f"{step_name}_loss_param", torch.stack(per_param_losses).mean(), on_epoch=True, sync_dist=True)
-        for j, name in enumerate(self.predict_params):
-            self.log(f"{step_name}_loss_param_{name}", per_param_losses[j], on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_pointwise", w_top[0], on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_shape",     w_top[1], on_epoch=True, sync_dist=True)
-        self.log(f"{step_name}_w_top_param",     w_top[2], on_epoch=True, sync_dist=True)
+            for name, lp in zip(per_param_names, per_param_losses):
+                self.log(f"{step_name}_param_{name}", lp, on_epoch=True, sync_dist=True)
 
         return loss
 
@@ -1773,81 +2341,82 @@ class PhysicallyInformedAE(pl.LightningModule):
         self._common_step(batch, "val")
 
     def on_train_epoch_start(self):
-        def _freeze(mod, on: bool):
+        def set_trainable(mod, train: bool):
             if mod is None: return
-            if isinstance(mod, nn.ModuleList):
-                mods = list(mod)
-            else:
-                mods = [mod]
+            mods = list(mod) if isinstance(mod, nn.ModuleList) else [mod]
             for m in mods:
                 if m is None: continue
-                for p in m.parameters(): p.requires_grad_(on)
+                for p in m.parameters():
+                    p.requires_grad_(train)
 
+        # --------- Stages explicites ----------
         if self._override_stage is not None:
             st = self._override_stage
 
             if st == 'A':
-                _freeze(self.backbone, True)
-                _freeze(self.shared_head, True)
-                _freeze(getattr(self, "out_head", None), True)
+                set_trainable(self.backbone, True)
+                set_trainable(self.shared_head, True)
+                set_trainable(getattr(self, "out_head", None), True)
                 if hasattr(self, "out_heads"):
-                    for _n, head in self.out_heads.items(): _freeze(head, True)
-                _freeze(self.film, True)
-                _freeze(self.refiners, False)
-                _freeze(self.denoiser, False)     # pas d'entraînement du denoiser pendant A
+                    for _n, head in self.out_heads.items(): set_trainable(head, True)
+                set_trainable(self.refiners, False)
+                set_trainable(self.denoiser, False)   # pas d’entraînement du denoiser pendant A
                 return
 
             if st == 'DEN':
-                _freeze(self.backbone, False)
-                _freeze(self.shared_head, False)
-                _freeze(getattr(self, "out_head", None), False)
+                set_trainable(self.backbone, False)
+                set_trainable(self.shared_head, False)
+                set_trainable(getattr(self, "out_head", None), False)
                 if hasattr(self, "out_heads"):
-                    for _n, head in self.out_heads.items(): _freeze(head, False)
-                _freeze(self.film, False)
-                _freeze(self.refiners, False)
-                _freeze(self.denoiser, True)      # on n’entraîne QUE le denoiser
+                    for _n, head in self.out_heads.items(): set_trainable(head, False)
+                set_trainable(self.refiners, False)
+                set_trainable(self.denoiser, True)    # on n’entraîne QUE le denoiser
                 return
 
             if st == 'B1':
-                _freeze(self.backbone, False)
-                _freeze(self.shared_head, False)
-                _freeze(getattr(self, "out_head", None), False)
+                set_trainable(self.backbone, False)
+                set_trainable(self.shared_head, False)
+                set_trainable(getattr(self, "out_head", None), False)
                 if hasattr(self, "out_heads"):
-                    for _n, head in self.out_heads.items(): _freeze(head, False)
-                _freeze(self.film, False)
-                _freeze(self.refiners, True)      # on entraîne les raffineurs
-                _freeze(self.denoiser, False)     # denoiser gelé (utilisable si use_denoiser=True)
+                    for _n, head in self.out_heads.items(): set_trainable(head, False)
+                set_trainable(self.refiners, True)    # entraîne les raffineurs
+                set_trainable(self.denoiser, False)   # denoiser gelé
                 return
 
             if st == 'B2':
-                _freeze(self.backbone, True)
-                _freeze(self.shared_head, True)
-                _freeze(getattr(self, "out_head", None), True)
+                set_trainable(self.backbone, True)
+                set_trainable(self.shared_head, True)
+                set_trainable(getattr(self, "out_head", None), True)
                 if hasattr(self, "out_heads"):
-                    for _n, head in self.out_heads.items(): _freeze(head, True)
-                _freeze(self.film, True)
-                _freeze(self.refiners, True)
-                _freeze(self.denoiser, True)
+                    for _n, head in self.out_heads.items(): set_trainable(head, True)
+                set_trainable(self.refiners, True)
+                set_trainable(self.denoiser, False)   # (mettez True si vous voulez aussi le FT)
                 return
 
-        # --- fallback: planning en 3 phases (A warmup → B → B2) ---
+        # --------- Fallback 3 phases (A warmup → B → B2) ----------
         e = self.current_epoch
         stage3_start = self.refine_warmup_epochs + self.freeze_base_epochs
 
         if e < self.refine_warmup_epochs:
             self._set_requires_grad(self.refiners, False)
-            self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                     getattr(self, "out_heads", None), self.film], True)
+            self._set_requires_grad(
+                [self.backbone, self.shared_head, getattr(self, "out_head", None), getattr(self, "out_heads", None)],
+                True
+            )
             self._froze_base = False
         elif e < stage3_start:
             if not self._froze_base:
-                self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                         getattr(self, "out_heads", None), self.film], False)
+                self._set_requires_grad(
+                    [self.backbone, self.shared_head, getattr(self, "out_head", None), getattr(self, "out_heads", None)],
+                    False
+                )
                 self._set_requires_grad(self.refiners, True)
                 self._froze_base = True
         else:
-            self._set_requires_grad([self.backbone, self.shared_head, getattr(self, "out_head", None),
-                                     getattr(self, "out_heads", None), self.film, self.refiners], True)
+            self._set_requires_grad(
+                [self.backbone, self.shared_head, getattr(self, "out_head", None), getattr(self, "out_heads", None), self.refiners],
+                True
+            )
             if e == stage3_start:
                 if hasattr(self.trainer, "optimizers") and len(self.trainer.optimizers) > 0:
                     opt = self.trainer.optimizers[0]
@@ -1855,8 +2424,7 @@ class PhysicallyInformedAE(pl.LightningModule):
                 if self.stage3_refine_steps is not None: self.refine_steps = int(self.stage3_refine_steps)
                 if self.stage3_delta_scale is not None:
                     for r in self.refiners: r.delta_scale = float(self.stage3_delta_scale)
-                if self.stage3_alpha_phys is not None:  self.alpha_phys = float(self.stage3_alpha_phys)
-                if self.stage3_alpha_param is not None: self.alpha_param = float(self.stage3_alpha_param)
+
 
     def _set_requires_grad(self, modules, flag: bool):
         if modules is None: return
@@ -1868,42 +2436,65 @@ class PhysicallyInformedAE(pl.LightningModule):
             for p in m.parameters(): p.requires_grad_(flag)
 
     def configure_optimizers(self):
+        """Configure optimizer et scheduler personnalisé"""
+        
+        # ========== Paramètres à optimiser ==========
+        # === BASE PARAMS (backbone + shared head + heads) ===
         base_params = list(self.backbone.parameters()) + list(self.shared_head.parameters())
-        if hasattr(self, "out_head"):  base_params += list(self.out_head.parameters())
-        if hasattr(self, "out_heads"): base_params += list(self.out_heads.parameters())
-        if self.film is not None:      base_params += list(self.film.parameters())
+
+        if getattr(self, "out_head", None) is not None:   # ← au lieu de hasattr(...)
+            base_params += list(self.out_head.parameters())
+
+        if getattr(self, "out_heads", None) is not None:  # ← au lieu de hasattr(...)
+            base_params += list(self.out_heads.parameters())
+
+        
         refiner_params = list(self.refiners.parameters())
 
         param_groups = [
             {"params": base_params,    "lr": float(getattr(self, "base_lr", self.lr))},
             {"params": refiner_params, "lr": float(getattr(self, "refiner_lr", self.lr))},
         ]
+        
         if getattr(self, "use_denoiser", False):
-            param_groups.append({"params": self.denoiser.parameters(), "lr": float(self.denoiser_lr)})
+            param_groups.append({
+                "params": self.denoiser.parameters(), 
+                "lr": float(self.denoiser_lr)
+            })
 
+        # ========== Optimizer ==========
         opt_name = getattr(self.hparams, "optimizer", "adamw").lower()
         weight_decay = getattr(self, "weight_decay", 1e-4)
 
         if opt_name == "adamw":
             optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
         elif opt_name == "lion":
+            from lion_pytorch import Lion
             betas = getattr(self.hparams, "betas", (0.9, 0.99))
             optimizer = Lion(param_groups, betas=betas, weight_decay=weight_decay)
-        elif opt_name == "radam":
-            import torch_optimizer as optim_plus
-            optimizer = optim_plus.RAdam(param_groups, weight_decay=weight_decay)
-        elif opt_name == "adabelief":
-            import torch_optimizer as optim_plus
-            optimizer = optim_plus.AdaBelief(param_groups, weight_decay=weight_decay)
         else:
             raise ValueError(f"Unknown optimizer: {opt_name}")
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=1e-7
+        # ========== Scheduler personnalisé ==========
+        scheduler = CosineAnnealingWarmRestartsWithDecayAndLinearWarmup(
+            optimizer,
+            T_0=self.scheduler_T_0,
+            T_mult=self.scheduler_T_mult,
+            eta_min=self.scheduler_eta_min,
+            decay_factor=self.scheduler_decay_factor,
+            warmup_epochs=self.scheduler_warmup_epochs,
+            verbose=True  # ← Afficher les restarts dans les logs
         )
-    
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",  # ← Important : step à chaque epoch
+                "frequency": 1,
+            }
+        }
+    
     @torch.no_grad()
     def infer(
         self,
@@ -1933,11 +2524,9 @@ class PhysicallyInformedAE(pl.LightningModule):
         missing = [n for n in self.provided_params if n not in provided_phys]
         assert not missing, f"Manque des paramètres fournis: {missing}"
 
-        cond_norm = self._make_condition_from_phys(provided_phys, device, dtype=torch.float32)
-
         latent, _ = self.backbone(spectra.unsqueeze(1))
-        feat_shared = self.feature_head(latent)
-        params_pred_norm = self._predict_params_from_features(feat_shared, cond_norm=cond_norm)
+        feat_shared = self._pool_features(latent)        
+        params_pred_norm = self._predict_params_from_features(feat_shared)
 
         if len(self.provided_params) > 0:
             provided_list = [provided_phys[n].to(device) for n in self.provided_params]
@@ -1966,7 +2555,7 @@ class PhysicallyInformedAE(pl.LightningModule):
 
         # cascade
         n_stages = cascade_stages_override if cascade_stages_override is not None else self.cascade_stages
-        n_stages = max(1, min(int(n_stages), len(self.refiners)))
+        n_stages = max(0, min(int(n_stages), len(self.refiners)))
 
         if refine and n_stages > 0:
             for k in range(n_stages):
@@ -1980,16 +2569,10 @@ class PhysicallyInformedAE(pl.LightningModule):
                 resid_for_refiner = resid_corr
                 if self.use_denoiser:
                     resid_for_refiner = self.denoiser(resid_corr)
+                    
+                delta_k = self.refiners[k](resid_for_refiner)
 
-                delta_k = self.refiners[k](
-                    noisy=spectra,
-                    resid=resid_for_refiner,
-                    params_pred_norm=params_pred_norm,
-                    cond_norm=cond_norm,
-                    feat_shared=feat_shared,
-                )
-
-                params_pred_norm = params_pred_norm.add(delta_k * mask_now).clamp(1e-4, 1-1e-4)
+                params_pred_norm = params_pred_norm.add(delta_k * mask_now)
 
         y_full_final = _compose_full_with_PT_override(params_pred_norm)
         recon_final  = self._physics_reconstruction(y_full_final, device, scale=None)
@@ -2004,12 +2587,322 @@ class PhysicallyInformedAE(pl.LightningModule):
 # ============================================================
 # 8) Callbacks visu & epoch sync dataset
 # ============================================================
+
+@torch.no_grad()
+def preview_peak_weights_on_val(model: PhysicallyInformedAE, val_loader, save_dir="./figs_local/weights_preview"):
+    import numpy as np, os, matplotlib.pyplot as plt
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    device = model.device
+
+    # sample 5 clean spectra du val_loader
+    specs = []
+    for batch in val_loader:
+        c = batch["clean_spectra"].to(device)
+        for i in range(c.shape[0]):
+            specs.append(c[i])
+            if len(specs) == 5:
+                break
+        if len(specs) == 5:
+            break
+    if len(specs) == 0:
+        print("⚠️ pas d'échantillon dans val_loader"); return
+    Y = torch.stack(specs, dim=0)  # [5,N]
+    X = Y.clone()
+
+    # récupère les poids (en mode debug)
+    try:
+        _, dbg = model.peak_weighted_loss(X, Y, return_debug=True)
+    except TypeError:
+        # ancienne signature: forward(pred, target) sans debug
+        W = model.peak_weighted_loss._detect(Y)[0]
+        dbg = {"weights": W, "border_margin": 0}
+    W = dbg["weights"].detach().cpu().numpy()   # [5,N]
+    N = W.shape[1]
+    x = np.arange(N)
+
+    fig, axes = plt.subplots(5, 1, figsize=(16, 10), sharex=True)
+    if not isinstance(axes, (list, np.ndarray)): axes = [axes]
+    for i, ax in enumerate(axes):
+        ax.fill_between(x, W[i], alpha=0.55, label=f'weights spec {i}')
+        ax.axhline(model.peak_weighted_loss.peak_weight, color='red', ls='--', lw=1.5, label='peak_weight')
+        ax.axhline(model.peak_weighted_loss.baseline_weight, color='blue', ls='--', lw=1.2, label='baseline_weight')
+        # inverser l’axe (style spectro) si croissant
+        ax.set_xlim(x.min(), x.max())
+        if x[0] < x[-1]:
+            ax.invert_xaxis()
+        if i == 0:
+            ax.legend(loc='upper right', ncols=3, fontsize=9)
+        ax.grid(alpha=0.3, ls='--')
+        ax.set_ylabel("weight")
+    axes[-1].set_xlabel("Wavenumber index (descending)")
+    fig.suptitle("Peak weights (derivative-based) on 5 validation spectra", fontweight='bold')
+    out = os.path.join(save_dir, "peak_weights_5spectra.png")
+    fig.savefig(out, dpi=150, bbox_inches='tight')
+    print(f"✅ Figure sauvegardée : {out}")
+    plt.show()
+
+
+# ============================================================
+# FONCTION DE VISUALISATION DU SCHEDULER
+# ============================================================
+
+def plot_lr_scheduler_preview(
+    scheduler,
+    max_epochs: int,
+    save_dir: str,
+    filename: str = "lr_schedule_preview.png"
+):
+    """
+    Génère et sauvegarde la visualisation du scheduler
+    
+    Args:
+        scheduler: Instance du scheduler
+        max_epochs: Nombre d'epochs à visualiser
+        save_dir: Dossier de sauvegarde (ex: "./figs_local/stageA_P_T")
+        filename: Nom du fichier
+    """
+    # Créer le dossier si nécessaire
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Obtenir les infos du schedule
+    info = scheduler.get_schedule_info(max_epochs)
+    
+    epochs = np.array(info['epochs'])
+    lrs = np.array(info['lrs'])
+    restart_epochs = info['restart_epochs']
+    warmup_end = info['warmup_end']
+    
+    # Figure principale
+    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
+    
+    # ========== Subplot 1: Schedule complet (log scale) ==========
+    ax1 = axes[0, 0]
+    ax1.plot(epochs, lrs, linewidth=2.5, color='tab:blue', label='Learning Rate')
+    
+    if warmup_end is not None and warmup_end >= 0:
+        ax1.axvspan(0, warmup_end, alpha=0.2, color='green', label='Warmup')
+        ax1.axvline(warmup_end, color='green', linestyle='--', alpha=0.7, linewidth=2)
+    
+    for i, restart_epoch in enumerate(restart_epochs):
+        ax1.axvline(restart_epoch, color='red', linestyle='--', alpha=0.6, linewidth=1.5)
+        if i < 8:
+            ax1.text(restart_epoch, lrs[restart_epoch], f' R{i+1}', 
+                    rotation=0, va='bottom', ha='left', fontsize=9, color='red', fontweight='bold')
+    
+    ax1.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
+    ax1.set_title('Learning Rate Schedule (Log Scale)', fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3, linestyle='--')
+    ax1.set_yscale('log')
+    ax1.legend(fontsize=10)
+    
+    info_text = f"T₀={scheduler.T_0}, T_mult={scheduler.T_mult}, decay={scheduler.decay_factor:.2f}, warmup={scheduler.warmup_epochs}"
+    ax1.text(0.02, 0.10, info_text, transform=ax1.transAxes,
+            fontsize=10, ha='left', va='top',
+            bbox=dict(boxstyle='round,pad=0.7', facecolor='wheat', alpha=0.7))
+    
+    # ========== Subplot 2: Vue linéaire complète ==========
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, lrs, linewidth=2, color='tab:orange', marker='o', markersize=3)
+    
+    if warmup_end is not None:
+        ax2.axvline(warmup_end, color='green', linestyle='--', alpha=0.7, linewidth=2, label='End Warmup')
+    
+    for restart_epoch in restart_epochs:
+        ax2.axvline(restart_epoch, color='red', linestyle='--', alpha=0.6, linewidth=1.5)
+    
+    ax2.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
+    ax2.set_title(f'{max_epochs} Epochs (Linear Scale)', fontsize=13, fontweight='bold')
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    ax2.legend(fontsize=9)
+    
+    # ========== Subplot 3: Distribution des LR ==========
+    ax3 = axes[1, 0]
+    ax3.hist(lrs, bins=50, color='tab:purple', alpha=0.7, edgecolor='black', linewidth=0.5)
+    ax3.axvline(np.mean(lrs), color='red', linestyle='--', linewidth=2.5, label=f'Mean: {np.mean(lrs):.2e}')
+    ax3.axvline(np.median(lrs), color='green', linestyle='--', linewidth=2.5, label=f'Median: {np.median(lrs):.2e}')
+    
+    ax3.set_xlabel('Learning Rate', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Frequency', fontsize=12, fontweight='bold')
+    ax3.set_title('LR Distribution', fontsize=13, fontweight='bold')
+    ax3.set_xscale('log')
+    ax3.legend(fontsize=10)
+    ax3.grid(True, alpha=0.3, linestyle='--', axis='y')
+    
+    # ========== Subplot 4: Stats par cycle ==========
+    ax4 = axes[1, 1]
+    
+    cycle_starts = [warmup_end + 1 if warmup_end is not None else 0] + restart_epochs
+    cycle_ends = restart_epochs + [max_epochs - 1]
+    
+    cycle_stats = []
+    for i, (start, end) in enumerate(zip(cycle_starts, cycle_ends)):
+        cycle_lrs = lrs[start:end+1]
+        if len(cycle_lrs) > 0:
+            cycle_stats.append({
+                'cycle': i + 1,
+                'duration': end - start + 1,
+                'mean_lr': np.mean(cycle_lrs),
+                'max_lr': np.max(cycle_lrs),
+                'min_lr': np.min(cycle_lrs),
+            })
+    
+    if len(cycle_stats) > 0:
+        cycles = [s['cycle'] for s in cycle_stats]
+        mean_lrs = [s['mean_lr'] for s in cycle_stats]
+        max_lrs = [s['max_lr'] for s in cycle_stats]
+        durations = [s['duration'] for s in cycle_stats]
+        
+        x = np.arange(len(cycles))
+        width = 0.35
+        
+        ax4.bar(x - width/2, max_lrs, width, label='Max LR', color='tab:red', alpha=0.8, edgecolor='black')
+        ax4.bar(x + width/2, mean_lrs, width, label='Mean LR', color='tab:blue', alpha=0.8, edgecolor='black')
+        
+        ax4.set_xlabel('Cycle', fontsize=12, fontweight='bold')
+        ax4.set_ylabel('Learning Rate', fontsize=12, fontweight='bold')
+        ax4.set_title('Max & Mean LR per Cycle', fontsize=13, fontweight='bold')
+        ax4.set_xticks(x)
+        ax4.set_xticklabels([f'C{c}\n({d}ep)' for c, d in zip(cycles, durations)], fontsize=9)
+        ax4.set_yscale('log')
+        ax4.legend(fontsize=10)
+        ax4.grid(True, alpha=0.3, linestyle='--', axis='y')
+    
+    # Stats globales
+    stats_text = [
+        f"📊 STATISTIQUES ({max_epochs} epochs)",
+        f"",
+        f"Restarts      : {len(restart_epochs)}",
+        f"LR initial    : {scheduler.base_lrs[0]:.2e}",
+        f"LR moyen      : {np.mean(lrs):.2e}",
+        f"LR final      : {lrs[-1]:.2e}",
+        f"",
+        f"Decay cumulé  : {scheduler.decay_factor ** len(restart_epochs):.3f}",
+    ]
+    
+    fig.text(0.99, 0.01, '\n'.join(stats_text),
+            fontsize=10, ha='right', va='bottom',
+            family='monospace',
+            bbox=dict(boxstyle='round,pad=0.8', facecolor='lightblue', alpha=0.5, edgecolor='navy'))
+    
+    plt.suptitle(f'Learning Rate Schedule Preview - {max_epochs} Epochs', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.99])
+    
+    # Sauvegarder
+    save_path = os.path.join(save_dir, filename)
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"\n✅ LR Schedule preview sauvegardé: {save_path}")
+    print(f"   - {len(restart_epochs)} restarts")
+    if len(cycle_stats) > 0:
+        print(f"   - LR max final: {max_lrs[-1]:.2e}")
+        print(f"   - Decay cumulatif: {scheduler.decay_factor ** len(restart_epochs):.3f}")
+    
+    return cycle_stats
+
+class LossCurvePlotCallback(pl.Callback):
+    def __init__(self, save_path: str = "./figs_loss/loss_curves.png"):
+        super().__init__()
+        self.save_path = save_path
+        self._history: dict[int, dict] = {}
+
+    def _record(self, epoch: int, metrics: dict):
+        if epoch not in self._history:
+            self._history[epoch] = {}
+        for key in [
+            'train_loss','val_loss',
+            'train_loss_pointwise','val_loss_pointwise',
+            'train_loss_spectral','val_loss_spectral',
+            'train_loss_peak','val_loss_peak',
+            'train_loss_params','val_loss_params'
+        ]:
+            if key in metrics:
+                v = metrics[key]
+                if hasattr(v, 'detach'): v = v.detach().cpu()
+                try: self._history[epoch][key] = float(v)
+                except: pass
+        self._plot()
+
+    def _plot(self):
+        if not self._history: return
+        import numpy as np, matplotlib.pyplot as plt
+
+        epochs_sorted = sorted(self._history.keys())
+        E = [e+1 for e in epochs_sorted]
+        get = lambda k,e: self._history[e].get(k, None)
+
+        series = {name: [get(name,e) for e in epochs_sorted] for name in [
+            'train_loss','val_loss',
+            'train_loss_pointwise','val_loss_pointwise',
+            'train_loss_spectral','val_loss_spectral',
+            'train_loss_peak','val_loss_peak',
+            'train_loss_params','val_loss_params'
+        ]}
+
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        fig.suptitle("Courbes d'entraînement", fontsize=14, fontweight='bold')
+        ax = axes.flatten()
+
+        # Totale
+        if any(x is not None for x in series['train_loss']): ax[0].plot(E, series['train_loss'], marker='o', label='Train')
+        if any(x is not None for x in series['val_loss']):   ax[0].plot(E, series['val_loss'], marker='s', label='Val')
+        ax[0].set_title("Loss Totale"); ax[0].legend(); ax[0].grid(alpha=.3, ls='--')
+
+        # Pointwise
+        if any(x is not None for x in series['train_loss_pointwise']): ax[1].plot(E, series['train_loss_pointwise'], marker='o', label='Train')
+        if any(x is not None for x in series['val_loss_pointwise']):   ax[1].plot(E, series['val_loss_pointwise'], marker='s', label='Val')
+        ax[1].set_title("Pointwise (MSE)"); ax[1].legend(); ax[1].grid(alpha=.3, ls='--')
+
+        # Spectral
+        if any(x is not None for x in series['train_loss_spectral']): ax[2].plot(E, series['train_loss_spectral'], marker='o', label='Train')
+        if any(x is not None for x in series['val_loss_spectral']):   ax[2].plot(E, series['val_loss_spectral'], marker='s', label='Val')
+        ax[2].set_title("Spectral (Angle)"); ax[2].legend(); ax[2].grid(alpha=.3, ls='--')
+
+        # Peak
+        if any(x is not None for x in series['train_loss_peak']): ax[3].plot(E, series['train_loss_peak'], marker='o', label='Train')
+        if any(x is not None for x in series['val_loss_peak']):   ax[3].plot(E, series['val_loss_peak'], marker='s', label='Val')
+        ax[3].set_title("Peak (Weighted)"); ax[3].legend(); ax[3].grid(alpha=.3, ls='--')
+
+        # Params
+        if any(x is not None for x in series['train_loss_params']): ax[4].plot(E, series['train_loss_params'], marker='o', label='Train')
+        if any(x is not None for x in series['val_loss_params']):   ax[4].plot(E, series['val_loss_params'], marker='s', label='Val')
+        ax[4].set_title("Params (phys.)"); ax[4].legend(); ax[4].grid(alpha=.3, ls='--')
+
+        # Résumé
+        ax[5].axis('off')
+        last = epochs_sorted[-1]
+        h = self._history[last]
+        txt = [
+            f"Epoch {last+1}",
+            f"Loss Totale     | T: {h.get('train_loss', float('nan')):.6g} | V: {h.get('val_loss', float('nan')):.6g}",
+            f"Pointwise (MSE) | T: {h.get('train_loss_pointwise', float('nan')):.6g} | V: {h.get('val_loss_pointwise', float('nan')):.6g}",
+            f"Spectral Angle  | T: {h.get('train_loss_spectral', float('nan')):.6g} | V: {h.get('val_loss_spectral', float('nan')):.6g}",
+            f"Peak (weighted) | T: {h.get('train_loss_peak', float('nan')):.6g} | V: {h.get('val_loss_peak', float('nan')):.6g}",
+            f"Params (phys.)  | T: {h.get('train_loss_params', float('nan')):.6g} | V: {h.get('val_loss_params', float('nan')):.6g}",
+        ]
+        ax[5].text(0.05, 0.95, "\n".join(txt), va='top', ha='left', family='monospace',
+                   bbox=dict(boxstyle='round,pad=0.8', facecolor='lightblue', alpha=0.3))
+        plt.tight_layout()
+        save_fig(fig, self.save_path, dpi=150)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self._record(trainer.current_epoch, trainer.callback_metrics)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        self._record(trainer.current_epoch, trainer.callback_metrics)
+
+
 class StageAwarePlotCallback(pl.Callback):
     """
-    Callback de visualisation conscient de l'étape:
-      - A  : refine=False
-      - B1 : refine=True, cascade_stages_override=k+1
-      - B2 : refine=True, cascade_stages_override=3 (par défaut)
+    Callback de visualisation avec métriques MINIMALES:
+    - loss_pointwise (MSE pixel-wise)
+    - loss_spectral (Spectral Angle)
+    - loss_params (paramètres physiques)
+    + poids adaptatifs si activés
     """
     def __init__(self, val_loader, param_names, *,
                  num_examples: int = 1,
@@ -2018,10 +2911,10 @@ class StageAwarePlotCallback(pl.Callback):
                  refine: bool = True,
                  cascade_stages_override: int | None = None,
                  use_gt_for_provided: bool = True,
-                 recon_PT: str = "pred",           # "pred" | "exp"
+                 recon_PT: str = "pred",
                  Pexp: torch.Tensor | None = None,
                  Texp: torch.Tensor | None = None,
-                 max_val_batches: int | None = None  # NEW: limite optionnelle
+                 max_val_batches: int | None = None
                  ):
         super().__init__()
         self.val_loader = val_loader
@@ -2037,24 +2930,33 @@ class StageAwarePlotCallback(pl.Callback):
         self.use_gt_for_provided = bool(use_gt_for_provided)
         self.recon_PT = recon_PT
         self.Pexp, self.Texp = Pexp, Texp
-        self.max_val_batches = None if max_val_batches is None else int(max_val_batches)  # NEW
+        self.max_val_batches = None if max_val_batches is None else int(max_val_batches)
 
-    # NEW: petit utilitaire pour denormaliser un sous-ensemble dans l'ordre donné
     def _denorm_subset(self, pl_module, y_norm: torch.Tensor, names: list[str]) -> torch.Tensor:
         return pl_module._denorm_params_subset(y_norm, names)
 
-    # NEW: calcule MSE global et erreur moyenne (%) par paramètre sur tout le val_loader
     @torch.no_grad()
     def _compute_val_stats(self, pl_module) -> tuple[float, dict]:
+        """Calcule MSE global et erreur % par paramètre sur tout le val_loader"""
         device = pl_module.device
         pred_names = list(getattr(pl_module, "predict_params", []))
         if len(pred_names) == 0:
             return float("nan"), {}
 
-        # Accumulateurs
+        # ✅ AJOUT : Récupérer les paramètres expérimentaux à exclure
+        exp_params_A = getattr(pl_module, '_use_exp_params_in_A', [])
+        exp_params_resid = getattr(pl_module, '_use_exp_params_for_resid', [])
+        exp_params = set(exp_params_A) | set(exp_params_resid)
+        
+        # ✅ Filtrer les paramètres à évaluer
+        eval_params = [p for p in pred_names if p not in exp_params]
+        
+        if len(eval_params) == 0:
+            return float("nan"), {}
+
         mse_sum = 0.0
         n_points_total = 0
-        err_sum = {p: 0.0 for p in pred_names}
+        err_sum = {p: 0.0 for p in eval_params}  # ← Seulement les params à évaluer
         err_cnt = 0
         eps = 1e-12
 
@@ -2064,7 +2966,6 @@ class StageAwarePlotCallback(pl.Callback):
             p_norm = batch['params'].to(device)
             B, N = noisy.shape
 
-            # provided_phys (GT) si demandé
             provided_phys = {}
             if self.use_gt_for_provided:
                 for name in getattr(pl_module, "provided_params", []):
@@ -2072,7 +2973,6 @@ class StageAwarePlotCallback(pl.Callback):
                     v_phys = self._denorm_subset(pl_module, p_norm[:, idx].unsqueeze(1), [name])[:, 0]
                     provided_phys[name] = v_phys
 
-            # infer avec les mêmes options que le panneau de visu
             out = pl_module.infer(
                 noisy,
                 provided_phys=provided_phys,
@@ -2082,31 +2982,30 @@ class StageAwarePlotCallback(pl.Callback):
                 Pexp=self.Pexp, Texp=self.Texp,
                 cascade_stages_override=self.cascade_stages_override,
             )
-            recon = out["spectra_recon"]               # [B, N]
-            y_full_pred = out["y_phys_full"]           # [B, M]
+            recon = out["spectra_recon"]
+            y_full_pred = out["y_phys_full"]
 
-            # --- MSE global (sur tout le batch)
+            # MSE global
             diff = (recon - clean).float()
             mse_sum += float((diff * diff).sum().item())
             n_points_total += B * N
 
-            # --- Erreurs % par paramètre
-            # GT (dénorm) pour les paramètres prédits
-            true_cols = [p_norm[:, pl_module.name_to_idx[n]] for n in pred_names]
-            true_norm_subset = torch.stack(true_cols, dim=1)                   # [B, P]
-            true_phys = self._denorm_subset(pl_module, true_norm_subset, pred_names)  # [B, P]
+            # ✅ Erreurs % UNIQUEMENT pour les paramètres évalués (non-exp)
+            true_cols = [p_norm[:, pl_module.name_to_idx[n]] for n in eval_params]
+            if len(true_cols) == 0:
+                continue
+            true_norm_subset = torch.stack(true_cols, dim=1)
+            true_phys = self._denorm_subset(pl_module, true_norm_subset, eval_params)
 
-            # Pred (dénorm) extraits de y_full_pred
-            pred_phys = torch.stack([y_full_pred[:, pl_module.name_to_idx[n]] for n in pred_names], dim=1)  # [B, P]
+            pred_phys = torch.stack([y_full_pred[:, pl_module.name_to_idx[n]] for n in eval_params], dim=1)
 
             denom = torch.clamp(true_phys.abs(), min=eps)
-            err_pct = 100.0 * (pred_phys - true_phys).abs() / denom           # [B, P]
+            err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
 
-            for j, name in enumerate(pred_names):
+            for j, name in enumerate(eval_params):
                 err_sum[name] += float(err_pct[:, j].sum().item())
             err_cnt += B
 
-            # Option: limiter le coût si max_val_batches est fixé
             if self.max_val_batches is not None and (b_idx + 1) >= self.max_val_batches:
                 break
 
@@ -2121,7 +3020,7 @@ class StageAwarePlotCallback(pl.Callback):
         pl_module.eval()
         device = pl_module.device
 
-        # ---------- (A) Un exemple pour la figure principale ----------
+        # Exemple pour visualisation
         try:
             batch = next(iter(self.val_loader))
         except StopIteration:
@@ -2152,71 +3051,138 @@ class StageAwarePlotCallback(pl.Callback):
         noisy_cpu, clean_cpu = noisy.detach().cpu(), clean.detach().cpu()
         x = np.arange(clean_cpu.shape[1])
 
-        # ---------- (B) Statistiques globales sur tout le val_loader ----------
-        val_mse, mean_pct = self._compute_val_stats(pl_module)   # NEW
+        # Statistiques globales
+        val_mse, mean_pct = self._compute_val_stats(pl_module)
 
-        # --- métriques Lightning (déjà loggées)
+        # Métriques Lightning
         m = trainer.callback_metrics
         def get_metric(name, default="-"):
             v = m.get(name, None)
             try: return f"{float(v):.6g}"
             except Exception: return default
 
-        # ---------- (C) Figure ----------
-        fig = plt.figure(figsize=(11, 6), constrained_layout=True)
-        gs = fig.add_gridspec(2, 2, width_ratios=[3.2, 1.8], height_ratios=[3, 1], hspace=0.25, wspace=0.3)
+        # ========== FIGURE ==========
+        fig = plt.figure(figsize=(12, 7), constrained_layout=True)
+        gs = fig.add_gridspec(2, 2, width_ratios=[3.5, 1.5], height_ratios=[3, 1], hspace=0.30, wspace=0.35)
         ax_spec = fig.add_subplot(gs[0, 0])
         ax_res  = fig.add_subplot(gs[1, 0], sharex=ax_spec)
         ax_tbl  = fig.add_subplot(gs[:, 1]); ax_tbl.axis("off")
 
         i = 0
-        ax_spec.plot(x, noisy_cpu[i],     label="Noisy",       lw=1,   alpha=0.7)
-        ax_spec.plot(x, clean_cpu[i],     label="Clean (réel)",lw=1.5)
-        ax_spec.plot(x, spectra_recon[i], label="Reconstruit", lw=1.2, ls="--")
-        ax_spec.set_ylabel("Transmission")
-        ax_spec.set_title(f"{self.stage_tag} — Epoch {trainer.current_epoch}")
-        ax_spec.legend(frameon=False, fontsize=9)
+        ax_spec.plot(x, noisy_cpu[i],     label="Noisy",       lw=1,   alpha=0.7, color='gray')
+        ax_spec.plot(x, clean_cpu[i],     label="Clean (GT)",  lw=1.5, color='tab:blue')
+        ax_spec.plot(x, spectra_recon[i], label="Reconstruit", lw=1.2, ls="--", color='tab:orange')
+        ax_spec.set_ylabel("Transmission", fontsize=10)
+        ax_spec.set_title(f"{self.stage_tag} — Epoch {trainer.current_epoch}", fontsize=11, fontweight='bold')
+        ax_spec.legend(frameon=False, fontsize=9, loc='upper right')
+        ax_spec.grid(alpha=0.25, ls='--', lw=0.5)
 
         resid_clean = spectra_recon[i] - clean_cpu[i]
         resid_noisy = spectra_recon[i] - noisy_cpu[i]
-        ax_res.plot(x, resid_noisy, lw=1,   label="Reconstruit - Noisy")
-        ax_res.plot(x, resid_clean, lw=1.2, label="Reconstruit - Clean")
-        ax_res.axhline(0, ls=":", lw=0.8)
-        ax_res.set_xlabel("Points spectraux"); ax_res.set_ylabel("Résidu")
+        ax_res.plot(x, resid_noisy, lw=1,   label="Recon - Noisy", color='tab:gray')
+        ax_res.plot(x, resid_clean, lw=1.2, label="Recon - Clean", color='tab:red')
+        ax_res.axhline(0, ls=":", lw=0.8, color='black')
+        ax_res.set_xlabel("Index spectral", fontsize=10)
+        ax_res.set_ylabel("Résidu", fontsize=10)
         ax_res.legend(frameon=False, fontsize=9)
+        ax_res.grid(alpha=0.25, ls='--', lw=0.5)
 
-        # ---------- (D) Panneau texte: logs + stats val ----------
-        # Ligne MSE + erreurs % moyennes par param
-        stats_lines = [f"VAL  MSE(clean,recon) : {val_mse:.6g}"]  # NEW
-        if len(mean_pct) > 0:
-            # tri par nom de param pour stabilité
-            for k in sorted(mean_pct.keys()):
-                stats_lines.append(f"VAL  err%({k})       : {mean_pct[k]:.3f} %")
+        # ✅ Identifier les paramètres expérimentaux
+        exp_params_A = getattr(pl_module, '_use_exp_params_in_A', [])
+        exp_params_resid = getattr(pl_module, '_use_exp_params_for_resid', [])
+        exp_params_set = set(exp_params_A) | set(exp_params_resid)
 
+        # ========== PANNEAU TEXTE (MÉTRIQUES MINIMALES) ==========
+        # Ligne 1: Métriques principales
         lines = [
-            f"train_loss : {get_metric('train_loss')}",
-            f"val_loss   : {get_metric('val_loss')}",
-            f"val_point  : {get_metric('val_loss_phys_pointwise')}",
-            f"val_corr   : {get_metric('val_loss_phys_corr')}",
-            f"val_param_group : {get_metric('val_loss_param_group')}",
+            "╔═══════════════════════════════════╗",
+            "║   MÉTRIQUES PRINCIPALES           ║",
+            "╚═══════════════════════════════════╝",
             "",
-            *stats_lines,  # NEW
+            f"train_loss       : {get_metric('train_loss')}",
+            f"val_loss         : {get_metric('val_loss')}",
             "",
-            f"refine={self.refine}, cascade={self.cascade_stages_override if self.cascade_stages_override else 'auto'}",
-            f"provided={'GT' if self.use_gt_for_provided else 'pred-only'}",
-            f"recon_PT={self.recon_PT}",
+            "─────────────────────────────────────",
+            "  Losses Individuelles (val)",
+            "─────────────────────────────────────",
+            f"pointwise (MSE)  : {get_metric('val_loss_pointwise')}",
+            f"spectral (angle) : {get_metric('val_loss_spectral')}",
+            f"peak (weighted)  : {get_metric('val_loss_peak')}",      # ← AJOUTÉ
+            f"params (physique): {get_metric('val_loss_params')}",
+            "",
         ]
-        ax_tbl.text(0.02, 0.98, f"Métriques (epoch {trainer.current_epoch})",
-                    va="top", ha="left", fontsize=12, fontweight="bold")
-        ax_tbl.text(0.02, 0.90, "\n".join(lines), va="top", ha="left",
-                    fontsize=10, family="monospace")
+                # ✅ Afficher les poids ReLoBRaLo si actifs
+        if getattr(pl_module, 'use_relobralo_top', False):
+            lines.extend([
+                "─────────────────────────────────────",
+                "  Poids ReLoBRaLo (adaptatifs)",
+                "─────────────────────────────────────",
+                f"w_pointwise : {get_metric('relo_weight_phys_pointwise')}",
+                f"w_spectral  : {get_metric('relo_weight_phys_spectral')}",
+                f"w_peak      : {get_metric('relo_weight_phys_peak')}",
+                f"w_params    : {get_metric('relo_weight_param_group')}",
+                "",
+            ])
 
-        for ax in (ax_spec, ax_res): ax.grid(alpha=0.25)
 
+        # Ligne 3: Statistiques validation globales
+        lines.extend([
+            "─────────────────────────────────────",
+            "  Statistiques Val Globales",
+            "─────────────────────────────────────",
+            f"MSE(clean,recon) : {val_mse:.6g}",
+        ])
+
+        # ✅ MODIFICATION : Afficher les erreurs + indiquer les params exp
+        if len(mean_pct) > 0:
+            lines.append("")
+            lines.append("Erreur % moyenne par paramètre:")
+            for k in sorted(mean_pct.keys()):
+                lines.append(f"  {k:12s} : {mean_pct[k]:6.3f} %")
+            
+            # ✅ AJOUT : Indiquer les paramètres expérimentaux (non évalués)
+            if len(exp_params_set) > 0:
+                lines.append("")
+                lines.append("Paramètres expérimentaux (0%):")
+                for k in sorted(exp_params_set):
+                    if k in pl_module.predict_params:
+                        lines.append(f"  {k:12s} : EXP (GT utilisé)")
+
+        # Ligne 4: Config
+        lines.extend([
+            "",
+            "─────────────────────────────────────",
+            "  Configuration",
+            "─────────────────────────────────────",
+            f"refine={self.refine}",
+            f"cascade={self.cascade_stages_override if self.cascade_stages_override else 'auto'}",
+            f"provided={'GT' if self.use_gt_for_provided else 'pred'}",
+            f"recon_PT={self.recon_PT}",
+        ])
+
+        # ✅ AJOUT : Afficher les paramètres exp actifs
+        if len(exp_params_A) > 0:
+            lines.append(f"exp_in_A={','.join(exp_params_A)}")
+        if len(exp_params_resid) > 0:
+            lines.append(f"exp_in_resid={','.join(exp_params_resid)}")
+
+        # Affichage du texte
+        ax_tbl.text(
+            0.05, 0.98, "\n".join(lines),
+            va="top", ha="left",
+            fontsize=8.5,
+            family="monospace",
+            transform=ax_tbl.transAxes,
+            bbox=dict(boxstyle='round,pad=0.8', facecolor='wheat', alpha=0.3, edgecolor='gray', linewidth=1)
+        )
+
+        # Sauvegarde
         os.makedirs(self.save_dir, exist_ok=True)
         out_png = os.path.join(self.save_dir, f"{self.stage_tag}_val_epoch{trainer.current_epoch:04d}.png")
-        save_fig(fig, out_png)
-
+        save_fig(fig, out_png, dpi=150)
+        
+        if trainer.is_global_zero:
+            print(f"✅ Figure sauvegardée: {out_png}")
 
 
 import pytorch_lightning as pl
@@ -2344,28 +3310,89 @@ def freeze_all_refiners_except(model: PhysicallyInformedAE, keep_idx: int):
 def train_refiner_idx(
     model: PhysicallyInformedAE,
     train_loader, val_loader,
-    k: int,                      # 0 -> B, 1 -> C, 2 -> D
+    k: int,                      
     *,
     epochs: int = 40,
     refiner_lr: float = 1e-4,
     delta_scale: float = 0.10,
     callbacks=None,
     enable_progress_bar: bool = False,
-    ckpt_in: str | None = None,          # <— explicite ici
-    ckpt_out: str | None = None,         # <— explicite ici
-    use_denoiser_during_B: bool = False, # <— *** AJOUT ***
+    ckpt_in: str | None = None,
+    ckpt_out: str | None = None,
+    use_denoiser_during_B: bool = False,
+    use_exp_params_for_resid: list[str] | None = None,  # ✅ NOUVEAU
+    w_pw_raw: float | None = None,
+    w_spectral_angle: float | None = None,
+    w_peak: float | None = None,
+    w_params: float | None = None,
+    use_relobralo_top: bool | None = None,
+    pw_cfg: dict | None = None,
     **trainer_kwargs
 ):
+    """
+    Entraînement du raffineur B.
+    
+    Args:
+        use_exp_params_for_resid: Liste des paramètres à utiliser en mode GT pour les résidus.
+                                   Ex: ["P", "T"] ou ["P", "T", "mf_CH4"]
+                                   Si None ou [], mode normal (tout prédit).
+    """
     import pytorch_lightning as pl
 
     _load_weights_if_any(model, ckpt_in)
 
-    # activer/ désactiver le denoiser pendant B/C/D (il est déjà gelé côté A)
-    model.use_denoiser = bool(use_denoiser_during_B)
+        # ✅ Mise à jour des poids de loss si fournis
+    if w_pw_raw is not None:
+        model.w_pw_raw = float(w_pw_raw)
+    if w_spectral_angle is not None:
+        model.w_spectral_angle = float(w_spectral_angle)
+    if w_peak is not None:
+        model.w_peak = float(w_peak)
+    if w_params is not None:
+        model.w_params = float(w_params)
+    if use_relobralo_top is not None:
+        model.use_relobralo_top = bool(use_relobralo_top)
+    
+    # ✅ Mise à jour de peak_weighted_loss si fournie
+    if pw_cfg is not None and hasattr(model, 'peak_weighted_loss'):
+        _pw_default = dict(
+            peak_weight=4.0, baseline_weight=1.0,
+            pre_smooth_sigma=1.3, salience_smooth_sigma=1.8,
+            peak_kind="min", curv_scale_k=2.2,
+            border_policy="taper", border_extra_margin=2,
+            weight_normalize="mean", renorm_after_smoothing=True,
+            salience_gamma=0.9,
+            spread_kind="gaussian", spread_sigma=2.5, spread_kernel=11
+        )
+        _pw_default.update(pw_cfg)
+        model.peak_weighted_loss = PeakWeightedMSELoss(**_pw_default)
 
+    model.use_denoiser = bool(use_denoiser_during_B)
     model.base_lr = 1e-8
     model.refiner_lr = float(refiner_lr)
     model.set_stage_mode('B1', refine_steps=int(k+1), delta_scale=float(delta_scale))
+    
+    # ✅ NOUVEAU: Stocker les paramètres exp
+    model._use_exp_params_for_resid = list(use_exp_params_for_resid) if use_exp_params_for_resid else []
+    
+    if len(model._use_exp_params_for_resid) > 0:
+        print(f"✅ Mode raffineur avec paramètres expérimentaux:")
+        print(f"   → Résidus calculés avec {model._use_exp_params_for_resid} GT")
+        print(f"   → Raffineur ne corrige PAS {model._use_exp_params_for_resid}")
+        
+        # ✅ Adapter le masque de raffinement
+        mask = torch.ones(len(model.predict_params), dtype=torch.float32)
+        for i, name in enumerate(model.predict_params):
+            if name in model._use_exp_params_for_resid:
+                mask[i] = 0.0  # Bloquer la correction
+        model.refine_mask_base = mask.to(model.device)
+        
+        correctable = [name for name in model.predict_params if name not in model._use_exp_params_for_resid]
+        print(f"   → Paramètres corrigeables: {correctable}")
+    else:
+        print(f"✅ Mode raffineur standard:")
+        print(f"   → Résidus avec tous les paramètres prédits")
+        print(f"   → Raffineur corrige tous les paramètres")
 
     def freeze_module(m, trainable: bool):
         if m is None: return
@@ -2375,18 +3402,17 @@ def train_refiner_idx(
         for i, r in enumerate(model.refiners):
             freeze_module(r, i == keep_idx)
 
-    # geler A + heads + FiLM
+    # Geler A
     freeze_module(model.backbone, False)
     freeze_module(model.shared_head, False)
     if hasattr(model, "out_head"):  freeze_module(model.out_head, False)
     if hasattr(model, "out_heads"):
         for _n, head in model.out_heads.items(): freeze_module(head, False)
-    if getattr(model, "film", None) is not None: freeze_module(model.film, False)
 
-    # ne laisser entraînable que le raffineur k
+    # Ne laisser entraînable que le raffineur k
     freeze_all_refiners_except(model, keep_idx=int(k))
 
-    # --- sanitization kwargs (évite doublons/ conflits)
+    # Sanitization
     try:
         from pytorch_lightning.callbacks.progress import TQDMProgressBar
         if callbacks is not None and enable_progress_bar is False:
@@ -2408,12 +3434,17 @@ def train_refiner_idx(
 
     trainer.fit(model, train_loader, val_loader)
     _save_checkpoint(trainer, ckpt_out)
+    
+    # ✅ Nettoyer
+    if hasattr(model, '_use_exp_params_for_resid'):
+        delattr(model, '_use_exp_params_for_resid')
+    
     return model
 
 
 
 def _apply_stage_freeze(model: PhysicallyInformedAE,
-                        train_base: bool, train_heads: bool, train_film: bool, train_refiner: bool,
+                        train_base: bool, train_heads: bool, train_refiner: bool,
                         heads_subset: Optional[List[str]]):
     _freeze_all(model)
     if train_base:
@@ -2424,8 +3455,6 @@ def _apply_stage_freeze(model: PhysicallyInformedAE,
             for p in model.out_head.parameters(): p.requires_grad_(True)
     else:
         _set_trainable_heads(model, heads_subset if train_heads else [])
-    if model.film is not None and train_film:
-        for p in model.film.parameters(): p.requires_grad_(True)
     if train_refiner:
         for p in model.refiners.parameters():
             p.requires_grad_(True)
@@ -2453,12 +3482,9 @@ def train_stage_custom(
     refiner_lr: float,
     train_base: bool,
     train_heads: bool,
-    train_film: bool,
     train_refiner: bool,
     refine_steps: int,
     delta_scale: float,
-    use_film: Optional[bool] = None,
-    film_subset: Optional[List[str]] = None,
     heads_subset: Optional[List[str]] = None,
     callbacks: Optional[list] = None,
     enable_progress_bar: bool = False,
@@ -2493,12 +3519,10 @@ def train_stage_custom(
     model.base_lr = float(base_lr)
     model.refiner_lr = float(refiner_lr)
     model.set_stage_mode(stage_name, refine_steps=refine_steps, delta_scale=delta_scale)
-    if use_film is not None: model.set_film_usage(bool(use_film))
-    if film_subset is not None: model.set_film_subset(film_subset)
 
     _apply_stage_freeze(
         model,
-        train_base=train_base, train_heads=train_heads, train_film=train_film, train_refiner=train_refiner,
+        train_base=train_base, train_heads=train_heads, train_refiner=train_refiner,
         heads_subset=heads_subset,
     )
 
@@ -2580,27 +3604,117 @@ def train_stage_DENOISER(
     return model
 
 
-# Facades conviviales
-def train_stage_A(model, train_loader, val_loader, **kw):
-    # A = base + heads (+/- FiLM), pas de raffineur
-    defaults = dict(
-        stage_name="A", epochs=20,
-        base_lr=2e-4, refiner_lr=1e-6,
-        train_base=True, train_heads=True, train_film=False, train_refiner=False,
-        refine_steps=0, delta_scale=0.1,
-        use_film=False, film_subset=None, heads_subset=None,
-        enable_progress_bar=False
-    ); defaults.update(kw)
-    return train_stage_custom(model, train_loader, val_loader, **defaults)
+def train_stage_A(
+    model: PhysicallyInformedAE,
+    train_loader, val_loader,
+    *,
+    epochs: int = 70,
+    base_lr: float = 1e-4,
+    heads_subset=None,
+    callbacks=None,
+    enable_progress_bar: bool = False,
+    ckpt_in: str | None = None,
+    ckpt_out: str | None = None,
+    use_exp_params: list[str] | None = None,
+    **trainer_kwargs
+):
+    """
+    Entraînement Stage A.
+    
+    Args:
+        use_exp_params: Liste des paramètres à utiliser en mode GT.
+                        Ces paramètres ne seront PAS entraînés (pas de loss).
+    """
+    import pytorch_lightning as pl
+    
+    _load_weights_if_any(model, ckpt_in)
+    
+    model.base_lr = float(base_lr)
+    model.refiner_lr = 0.0
+    model.set_stage_mode('A', refine_steps=0, delta_scale=None)
+    
+    # ✅ Stocker les paramètres exp
+    model._use_exp_params_in_A = list(use_exp_params) if use_exp_params else []
+    
+    # ✅ SIMPLIFIÉ: Pas de réinitialisation ici, elle se fait automatiquement dans _common_step()
+    n_active_params = len([p for p in model.predict_params if p not in model._use_exp_params_in_A])
+    
+    if len(model._use_exp_params_in_A) > 0:
+        print(f"✅ Mode A avec paramètres expérimentaux:")
+        print(f"   → Physique utilise {model._use_exp_params_in_A} GT")
+        print(f"   → Têtes {model._use_exp_params_in_A}: PAS de loss (pas entraînées)")
+        print(f"   → Focus sur {n_active_params} autres paramètres")
+        print(f"   → ReLoBRaLo sera réinitialisé automatiquement au premier batch")
+    else:
+        print(f"✅ Mode A standard:")
+        print(f"   → Tous les {len(model.predict_params)} paramètres prédits et entraînés")
+
+    def freeze_module(m, trainable: bool):
+        if m is None: return
+        for p in m.parameters():
+            p.requires_grad_(trainable)
+
+    # Entraîner backbone et têtes
+    freeze_module(model.backbone, True)
+    freeze_module(model.shared_head, True)
+
+    if heads_subset is None or len(heads_subset) == 0:
+        if hasattr(model, "out_head"):
+            freeze_module(model.out_head, True)
+        if hasattr(model, "out_heads"):
+            for _n, head in model.out_heads.items():
+                freeze_module(head, True)
+    else:
+        if hasattr(model, "out_head"):
+            freeze_module(model.out_head, False)
+        if hasattr(model, "out_heads"):
+            for name, head in model.out_heads.items():
+                freeze_module(head, name in heads_subset)
+
+    # Geler les raffineurs et denoiser
+    for r in model.refiners:
+        freeze_module(r, False)
+    if getattr(model, "denoiser", None) is not None:
+        freeze_module(model.denoiser, False)
+
+    # Sanitization
+    try:
+        from pytorch_lightning.callbacks.progress import TQDMProgressBar
+        if callbacks is not None and enable_progress_bar is False:
+            callbacks = [cb for cb in callbacks if not isinstance(cb, TQDMProgressBar)]
+    except Exception:
+        pass
+
+    trainer_kwargs.setdefault("log_every_n_steps", 1)
+    from pytorch_lightning.strategies import Strategy
+    if isinstance(trainer_kwargs.get("strategy", None), Strategy):
+        trainer_kwargs.pop("accelerator", None)
+
+    trainer = pl.Trainer(
+        max_epochs=int(epochs),
+        enable_progress_bar=enable_progress_bar,
+        callbacks=callbacks or [],
+        **trainer_kwargs,
+    )
+
+    trainer.fit(model, train_loader, val_loader)
+    _save_checkpoint(trainer, ckpt_out)
+    
+    # Nettoyer
+    if hasattr(model, '_use_exp_params_in_A'):
+        delattr(model, '_use_exp_params_in_A')
+    
+    return model
+
 
 def train_stage_B1(model, train_loader, val_loader, **kw):
     # B1 = raffineur seul
     defaults = dict(
         stage_name="B1", epochs=12,
         base_lr=1e-6, refiner_lr=1e-5,
-        train_base=False, train_heads=False, train_film=False, train_refiner=True,
+        train_base=False, train_heads=False, train_refiner=True,
         refine_steps=2, delta_scale=0.12,
-        use_film=True, film_subset=["T"], heads_subset=None,
+        heads_subset=None,
         enable_progress_bar=False
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
@@ -2610,9 +3724,9 @@ def train_stage_B2(model, train_loader, val_loader, **kw):
     defaults = dict(
         stage_name="B2", epochs=15,
         base_lr=3e-5, refiner_lr=3e-6,
-        train_base=True, train_heads=True, train_film=True, train_refiner=True,
+        train_base=True, train_heads=True,  train_refiner=True,
         refine_steps=2, delta_scale=0.08,
-        use_film=True, film_subset=["P","T"], heads_subset=None,
+        heads_subset=None,
         enable_progress_bar=False
     ); defaults.update(kw)
     return train_stage_custom(model, train_loader, val_loader, **defaults)
@@ -2631,7 +3745,17 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
     if not pred_names:
         raise RuntimeError("Aucun paramètre à évaluer.")
 
-    per_param_err = {p: [] for p in pred_names}
+    # ✅ AJOUT : Exclure les paramètres expérimentaux
+    exp_params_A = getattr(model, '_use_exp_params_in_A', [])
+    exp_params_resid = getattr(model, '_use_exp_params_for_resid', [])
+    exp_params_set = set(exp_params_A) | set(exp_params_resid)
+    eval_params = [p for p in pred_names if p not in exp_params_set]
+    
+    if len(eval_params) == 0:
+        print("⚠️  Tous les paramètres sont expérimentaux, rien à évaluer.")
+        return pd.DataFrame()
+
+    per_param_err = {p: [] for p in eval_params}  # ← Seulement les params à évaluer
     show_examples = []
 
     for batch in loader:
@@ -2652,10 +3776,11 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
         recon = out["spectra_recon"]
         y_full_pred = out["y_phys_full"].clone()
 
-        true_cols = [p_norm[:, model.name_to_idx[n]] for n in pred_names]
+        # ✅ Calculer les erreurs UNIQUEMENT pour les paramètres non-exp
+        true_cols = [p_norm[:, model.name_to_idx[n]] for n in eval_params]
         true_norm_tensor = torch.stack(true_cols, dim=1)
-        true_phys = model._denorm_params_subset(true_norm_tensor, pred_names)
-        pred_phys = torch.stack([y_full_pred[:, model.name_to_idx[n]] for n in pred_names], dim=1)
+        true_phys = model._denorm_params_subset(true_norm_tensor, eval_params)
+        pred_phys = torch.stack([y_full_pred[:, model.name_to_idx[n]] for n in eval_params], dim=1)
 
         if robust_smape:
             denom = pred_phys.abs() + true_phys.abs() + eps
@@ -2664,7 +3789,7 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
             denom = torch.clamp(true_phys.abs(), min=eps)
             err_pct = 100.0 * (pred_phys - true_phys).abs() / denom
 
-        for j, name in enumerate(pred_names):
+        for j, name in enumerate(eval_params):
             per_param_err[name].append(err_pct[:, j].detach().cpu())
 
         for i in range(B):
@@ -2673,14 +3798,15 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
                     "noisy":  noisy[i].detach().cpu(),
                     "clean":  clean[i].detach().cpu(),
                     "recon":  recon[i].detach().cpu(),
-                    "pred":   {name: float(pred_phys[i, j]) for j, name in enumerate(pred_names)},
-                    "true":   {name: float(true_phys[i, j]) for j, name in enumerate(pred_names)},
-                    "errpct": {name: float(err_pct[i, j])   for j, name in enumerate(pred_names)},
+                    "pred":   {name: float(pred_phys[i, j]) for j, name in enumerate(eval_params)},
+                    "true":   {name: float(true_phys[i, j]) for j, name in enumerate(eval_params)},
+                    "errpct": {name: float(err_pct[i, j])   for j, name in enumerate(eval_params)},
                 })
         if len(show_examples) >= n_show: break
 
+    # ✅ Rapport des statistiques
     rows = []
-    for name in pred_names:
+    for name in eval_params:
         if len(per_param_err[name]) == 0: continue
         v = torch.cat(per_param_err[name])
         mean = v.mean().item(); med  = v.median().item()
@@ -2692,7 +3818,13 @@ def evaluate_and_plot(model: PhysicallyInformedAE, loader: DataLoader, n_show: i
         rows.append({"param": name, "mean_%": mean, "median_%": med, "p90_%": p90, "p95_%": p95})
 
     df = pd.DataFrame(rows).set_index("param").sort_index()
-    print("\n=== Erreurs en % (globales, sur le loader) ==="); print(df.round(4))
+    print("\n=== Erreurs en % (paramètres prédits uniquement) ===")
+    print(df.round(4))
+    
+    # ✅ Afficher les paramètres exp
+    if len(exp_params_set) > 0:
+        print(f"\n⚠️  Paramètres expérimentaux (GT utilisé, non évalués): {sorted(exp_params_set)}")
+
 
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
@@ -2780,20 +3912,7 @@ class PT_PredVsExp_VisuCallback(pl.Callback):
             v_norm = p_norm[:, idx]
             v_phys = pl_module._denorm_params_subset(v_norm.unsqueeze(1), [name])[:, 0]
             provided_phys[name] = v_phys
-        
-        # ✓ IMPORTANT : Ajouter P et T pour FiLM (même s'ils sont prédits)
-        if "P" in pl_module.film_params:
-            idx_P = pl_module.name_to_idx["P"]
-            P_norm = p_norm[:, idx_P]
-            P_phys = pl_module._denorm_params_subset(P_norm.unsqueeze(1), ["P"])[:, 0]
-            provided_phys["P"] = P_phys
-        
-        if "T" in pl_module.film_params:
-            idx_T = pl_module.name_to_idx["T"]
-            T_norm = p_norm[:, idx_T]
-            T_phys = pl_module._denorm_params_subset(T_norm.unsqueeze(1), ["T"])[:, 0]
-            provided_phys["T"] = T_phys
-
+    
         # --- Pexp/Texp : soit forcés, soit pris des GT du batch
         def _gt_phys(name: str):
             idx = pl_module.name_to_idx[name]
@@ -2833,36 +3952,60 @@ class PT_PredVsExp_VisuCallback(pl.Callback):
             gs = fig.add_gridspec(2, 2, height_ratios=[3, 1], width_ratios=[1, 1], hspace=0.25, wspace=0.25)
 
             ax0 = fig.add_subplot(gs[0, :])
-            ax0.plot(x, noisy[i].detach().cpu(),  lw=0.9, alpha=0.7, label="Noisy")
-            ax0.plot(x, clean[i].detach().cpu(),  lw=1.2,           label="Clean")
-            ax0.plot(x, recon_pred[i].detach().cpu(), lw=1.0, ls="--", label="Recon (PT=pred)")
-            ax0.plot(x, recon_exp[i].detach().cpu(),  lw=1.0, ls="-.", label="Recon (PT=exp)")
-            ax0.set_title(f"{self.tag} — epoch {trainer.current_epoch} — ex {i+1}")
-            ax0.set_ylabel("Transmission"); ax0.legend(frameon=False, fontsize=9); ax0.grid(alpha=0.3)
+            ax0.plot(x, noisy[i].detach().cpu(),  lw=0.9, alpha=0.7, label="Noisy", color='gray')
+            ax0.plot(x, clean[i].detach().cpu(),  lw=1.2, label="Clean", color='tab:blue')
+            ax0.plot(x, recon_pred[i].detach().cpu(), lw=1.0, ls="--", label="Recon (PT=pred)", color='tab:orange')
+            ax0.plot(x, recon_exp[i].detach().cpu(),  lw=1.0, ls="-.", label="Recon (PT=exp)", color='tab:green')
+            ax0.set_title(f"{self.tag} — epoch {trainer.current_epoch} — ex {i+1}", fontweight='bold')
+            ax0.set_ylabel("Transmission")
+            ax0.legend(frameon=False, fontsize=9)
+            ax0.grid(alpha=0.3)
 
             ax1 = fig.add_subplot(gs[1, 0], sharex=ax0)
-            ax1.plot(x, (recon_pred[i]-noisy[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Noisy")
-            ax1.plot(x, (recon_exp[i]-noisy[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Noisy")
+            ax1.plot(x, (recon_pred[i]-noisy[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Noisy", color='tab:orange')
+            ax1.plot(x, (recon_exp[i]-noisy[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Noisy", color='tab:green')
             ax1.axhline(0, ls=":", lw=0.8, color="k")
-            ax1.set_xlabel("Index spectral"); ax1.set_ylabel("Résidu"); ax1.legend(frameon=False, fontsize=8); ax1.grid(alpha=0.3)
+            ax1.set_xlabel("Index spectral")
+            ax1.set_ylabel("Résidu")
+            ax1.legend(frameon=False, fontsize=8)
+            ax1.grid(alpha=0.3)
 
             ax2 = fig.add_subplot(gs[1, 1], sharex=ax0)
-            ax2.plot(x, (recon_pred[i]-clean[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Clean")
-            ax2.plot(x, (recon_exp[i]-clean[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Clean")
+            ax2.plot(x, (recon_pred[i]-clean[i]).detach().cpu(), lw=0.9, label="(PT=pred) - Clean", color='tab:orange')
+            ax2.plot(x, (recon_exp[i]-clean[i]).detach().cpu(),  lw=0.9, label="(PT=exp) - Clean", color='tab:green')
             ax2.axhline(0, ls=":", lw=0.8, color="k")
-            ax2.set_xlabel("Index spectral"); ax2.set_ylabel("Résidu"); ax2.legend(frameon=False, fontsize=8); ax2.grid(alpha=0.3)
+            ax2.set_xlabel("Index spectral")
+            ax2.set_ylabel("Résidu")
+            ax2.legend(frameon=False, fontsize=8)
+            ax2.grid(alpha=0.3)
 
+            # ⭐ TEXTE INFORMATIF (SIMPLIFIÉ)
             try:
                 Pp = float(out_pred["y_phys_full"][i, pl_module.name_to_idx["P"]])
                 Tp = float(out_pred["y_phys_full"][i, pl_module.name_to_idx["T"]])
             except Exception:
                 Pp = Tp = float("nan")
-            ax0.text(0.01, 0.02, f"PT_pred≈({Pp:.2f} mbar, {Tp:.2f} K) | PT_exp=({float(Pexp[i]):.2f} mbar, {float(Texp[i]):.2f} K)",
-                     transform=ax0.transAxes, fontsize=9, ha="left", va="bottom")
+            
+            info_text = (
+                f"PT_pred ≈ ({Pp:.2f} mbar, {Tp:.2f} K)\n"
+                f"PT_exp  = ({float(Pexp[i]):.2f} mbar, {float(Texp[i]):.2f} K)"
+            )
+            
+            ax0.text(
+                0.02, 0.02, info_text,
+                transform=ax0.transAxes,
+                fontsize=9,
+                ha="left", va="bottom",
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='wheat', alpha=0.4)
+            )
 
+            # Sauvegarde
             fname = os.path.join(self.save_dir, f"{self.tag}_epoch{trainer.current_epoch:04d}_ex{i+1}.png")
-            fig.savefig(fname, dpi=160, bbox_inches="tight"); plt.close(fig)
-            print(f"✓ Figure sauvegardée : {fname}")
+            fig.savefig(fname, dpi=160, bbox_inches="tight")
+            plt.close(fig)
+            
+            if trainer.is_global_zero:
+                print(f"✅ Figure PT sauvegardée : {fname}")
 
 # ============================================================
 # 11) Build data & modèle (exemple par défaut)
@@ -2904,7 +4047,7 @@ def build_data_and_model(
     *,
     seed=42, n_points=800, n_train=500000, n_val=5000, batch_size=32,
     train_ranges=None, val_ranges=None, noise_train=None, noise_val=None,
-    predict_list=None, film_list=None, lrs=(1e-4, 1e-5),
+    predict_list=None, lrs=(1e-4, 1e-5),
     backbone_variant="s", refiner_variant="s",
     backbone_width_mult=1, backbone_depth_mult=0.4,
     refiner_width_mult=1.0,  refiner_depth_mult=1.0,
@@ -2912,9 +4055,21 @@ def build_data_and_model(
     backbone_drop_path=0.0, refiner_drop_path=0.0,
     backbone_se_ratio=0.25,  refiner_se_ratio=0.25,
     refiner_feature_pool="avg", refiner_shared_hidden_scale=0.5,
-    refiner_time_embed_dim=None,
     huber_beta=0.002,
-    qtpy_dir: str | None = None,  
+    scheduler_T_0: int = 10,
+    scheduler_T_mult: float = 1.2,
+    scheduler_eta_min: float = 1e-9,
+    scheduler_decay_factor: float = 0.75,
+    scheduler_warmup_epochs: int = 5,
+
+    qtpy_dir: str | None = None,
+    # --- LOSSES 
+    w_pw_raw: float = 1.0,
+    w_spectral_angle: float = 0.5,
+    w_peak: float = 0.0,
+    w_params: float = 1.0,              # ← AJOUTÉ
+    use_relobralo_top: bool = True,     # ← AJOUTÉ
+    pw_cfg: dict | None = None,
 ):
     pl.seed_everything(seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -2943,24 +4098,22 @@ def build_data_and_model(
 1;1;3086.133208;2.369e-25;0.0457;0.272;2414.7234;0.44;-0.00591
 1;1;3087.192118;2.070e-22;0.0768;0.413;648.9787;0.60;-0.00803"""
 
-    transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str),
-                        'H2O': parse_csv_transitions(transitions_h2o_str)}
+    transitions_dict = {'CH4': parse_csv_transitions(transitions_ch4_str)}
 
     # ---- Ranges par défaut (val puis train étendu) ----
     default_val = {
         'sig0': (3085.43, 3085.46),
         'dsig': (0.001521, 0.00154),
         'mf_CH4': (2e-6, 20e-6),
-        'mf_H2O': (0.004, 0.006),
         'baseline0': (0.999999, 1.00001),
         'baseline1': (-0.0004, -0.0003),
         'baseline2': (-4.0565E-08, -3.07117E-08),
-        'P': (450, 550),
-        'T': (273.15 + 32, 273.15 + 37),
+        'P': (450, 550), 
+        'T': (273.15 + 32, 273.15 + 37), #
     }
 
-    expand_factors = {"_default": 1.0, 'sig0': 4.0, 'dsig': 2.0, 'mf_CH4': 1.5, 'mf_H2O': 2,
-                      "baseline0": 1, "baseline1": 4, "baseline2": 8.0, "P": 1.5, "T":1.5}
+    expand_factors = {"_default": 1.0, 'sig0': 5.0, 'dsig': 3.0, 'mf_CH4': 2,
+                      "baseline0": 1, "baseline1": 3, "baseline2": 8.0, "P": 2, "T":2}
     
     default_train = map_ranges(default_val, expand_interval, per_param=expand_factors)
 
@@ -2977,18 +4130,18 @@ def build_data_and_model(
 
     # ---- Profils de bruit ----
     NOISE_TRAIN = noise_train or dict(
-        std_add_range=(0, 1e-3), std_mult_range=(0, 1e-3),
-        p_drift=0.2, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.001, 0.05),
-        p_fringes=0.2, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
+        std_add_range=(0, 5e-3), std_mult_range=(0, 5e-3),
+        p_drift=0.2, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.00001, 0.005),
+        p_fringes=0.2, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.0015),
         p_spikes=0.2, spikes_count_range=(1, 2), spike_amp_range=(0.001, 1), spike_width_range=(1.0, 200.0),
         clip=(0.0, 1.5),
     )
 
     NOISE_VAL = noise_val or dict(
         std_add_range=(0, 1e-3), std_mult_range=(0, 1e-3),
-        p_drift=0.2, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.001, 0.05),
-        p_fringes=0.2, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.001, 0.015),
-        p_spikes=0.2, spikes_count_range=(1, 2), spike_amp_range=(0.001, 1), spike_width_range=(1.0, 200.0),
+        p_drift=0, drift_sigma_range=(1.0, 100.0), drift_amp_range=(0.00001, 0.005),
+        p_fringes=0, n_fringes_range=(1, 2), fringe_freq_range=(0.3, 50.0), fringe_amp_range=(0.00001, 0.0015),
+        p_spikes=0, spikes_count_range=(1, 2), spike_amp_range=(0.0001, 1), spike_width_range=(1.0, 200.0),
         clip=(0.0, 1.5),
     )
 
@@ -3008,61 +4161,79 @@ def build_data_and_model(
                             num_workers=num_workers, pin_memory=(device == 'cuda'))
 
     # baseline0 n'est PAS prédit (normalisation via max LOWESS)
-    predict_list = predict_list or ["sig0", "dsig","P", "T", "mf_CH4", "mf_H2O", "baseline1", "baseline2"]
-    
-    film_list = []
+    predict_list = predict_list or ["sig0", "dsig","P", "T", "mf_CH4", "baseline1", "baseline2"]
 
     model = PhysicallyInformedAE(
-        n_points=n_points, param_names=PARAMS,
-        poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
+            n_points=n_points, param_names=PARAMS,
+            poly_freq_CH4=poly_freq_CH4, transitions_dict=transitions_dict,
 
-        # --- optims & pondérations globales ---
-        lr=lrs[0], alpha_param=0.3, alpha_phys=0.7, head_mode="multi",
+            # --- optims & pondérations globales ---
+            lr=lrs[0], head_mode="multi",
 
-        # --- params à prédire / FiLM ---
-        predict_params=predict_list, film_params=film_list,
+            # --- params à prédire 
+            predict_params=predict_list,
 
-        # --- raffinement ---
-        refine_steps=1, refine_delta_scale=0.1, refine_target="noisy",
-        refine_warmup_epochs=30, freeze_base_epochs=20,
-        base_lr=lrs[0], refiner_lr=lrs[1],
+            # --- raffinement ---
+            refine_steps=1, refine_delta_scale=0.1, refine_target="noisy",
+            base_lr=lrs[0], refiner_lr=lrs[1],
 
-        # --- dérivées (Savitzky–Golay pour d1/d2) ---
-        corr_savgol_win=15, corr_savgol_poly=3, huber_beta=huber_beta,
+            # --- ⭐ POIDS DE PERTES (avec ReLoBRaLo) ⭐ ---
+            w_pw_raw=w_pw_raw,
+            w_spectral_angle=w_spectral_angle,
+            w_peak=w_peak,
+            w_params=w_params,                    # ← AJOUTÉ
+            use_relobralo_top=use_relobralo_top,  # ← AJOUTÉ
+            pw_cfg=pw_cfg,
 
-        # --- pondérations des pertes ---
-        w_pw_raw=1.0, w_pw_d1=0.3, w_pw_d2=0.3,
-        w_corr_raw=1.0, w_corr_d1=0.3, w_corr_d2=0.3,
-        w_js_raw=0, w_js_d1=0.0, w_js_d2=0.0,
+            huber_beta=huber_beta,
+            weight_mf=2.0,
 
-        mlp_dropout=0.20,           # A : backbone/têtes/FiLM
-        refiner_mlp_dropout=0.20,   # B/C/D : raffineurs
+            mlp_dropout=0.30,
+            refiner_mlp_dropout=0.20,
 
-        # --- backbones ---
-        backbone_variant=backbone_variant,
-        refiner_variant=refiner_variant,
-        backbone_width_mult=backbone_width_mult,
-        backbone_depth_mult=backbone_depth_mult,
-        refiner_width_mult=refiner_width_mult,
-        refiner_depth_mult=refiner_depth_mult,
-        backbone_stem_channels=backbone_stem_channels,
-        refiner_stem_channels=refiner_stem_channels,
-        backbone_drop_path=backbone_drop_path,
-        refiner_drop_path=refiner_drop_path,
-        backbone_se_ratio=backbone_se_ratio,
-        refiner_se_ratio=refiner_se_ratio,
-        refiner_feature_pool=refiner_feature_pool,
-        refiner_shared_hidden_scale=refiner_shared_hidden_scale,
+            # --- backbones ---
+            backbone_variant=backbone_variant,
+            refiner_variant=refiner_variant,
+            backbone_width_mult=backbone_width_mult,
+            backbone_depth_mult=backbone_depth_mult,
+            refiner_width_mult=refiner_width_mult,
+            refiner_depth_mult=refiner_depth_mult,
+            backbone_stem_channels=backbone_stem_channels,
+            refiner_stem_channels=refiner_stem_channels,
+            backbone_drop_path=backbone_drop_path,
+            refiner_drop_path=refiner_drop_path,
+            backbone_se_ratio=backbone_se_ratio,
+            refiner_se_ratio=refiner_se_ratio,
+            refiner_feature_pool=refiner_feature_pool,
+            refiner_shared_hidden_scale=refiner_shared_hidden_scale,
 
-        # --- data & TIPS ---
-        tipspy=tipspy,
-    )
-
+            # --- data & TIPS ---
+            tipspy=tipspy,
+            # SCHEDULER PARAMETERS
+            scheduler_T_0=scheduler_T_0,
+            scheduler_T_mult=scheduler_T_mult,
+            scheduler_eta_min=scheduler_eta_min,
+            scheduler_decay_factor=scheduler_decay_factor,
+            scheduler_warmup_epochs=scheduler_warmup_epochs,
+        )
 
     model.hparams.optimizer = "lion"
     model.hparams.betas = (0.9, 0.99)
     model.weight_decay = 1e-4
-
+    
+    # ✅ VÉRIFICATION
+    print("\n" + "="*70)
+    print("🔍 VÉRIFICATION DES POIDS DE LOSS APRÈS CRÉATION")
+    print("="*70)
+    print(f"w_pw_raw          = {model.w_pw_raw}")
+    print(f"w_spectral_angle  = {model.w_spectral_angle}")
+    print(f"w_peak            = {model.w_peak}")
+    print(f"w_params          = {model.w_params}")
+    print(f"use_relobralo_top = {model.use_relobralo_top}")
+    print(f"peak_weighted_loss = {type(model.peak_weighted_loss).__name__}")
+    if model.use_relobralo_top:
+        print(f"relo_top          = {type(model.relo_top).__name__} (actif)")
+    print("="*70 + "\n")
 
     def _serializable_ranges(d):
         return {k: [float(d[k][0]), float(d[k][1])] for k in d}
@@ -3137,50 +4308,6 @@ def ensure_distributed_samplers(train_loader, val_loader):
     return _with_sampler(train_loader, True), _with_sampler(val_loader, False)
 
 
-def trainer_common_kwargs():
-    try:
-        from lightning_fabric.plugins.environments import SLURMEnvironment
-        slurm_env = SLURMEnvironment(auto_requeue=True)
-    except Exception:
-        slurm_env = None
-
-    num_nodes = int(os.environ.get("SLURM_JOB_NUM_NODES", os.environ.get("NUM_NODES", "1")))
-    raw = os.environ.get("SLURM_NTASKS_PER_NODE", os.environ.get("SLURM_TASKS_PER_NODE", "1"))
-    tasks_per_node = int(str(raw).split('(')[0])
-
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices = tasks_per_node if accelerator == "gpu" else 1
-    precision = "32-true"
-
-    default_dir = os.environ.get("SLURM_JOB_ID", "runs_local")
-    default_root_dir = f"./lightning_logs/{default_dir}"
-
-    strategy = pl.strategies.DDPStrategy(
-        cluster_environment=slurm_env,
-        find_unused_parameters=False,
-        gradient_as_bucket_view=True,
-        static_graph=False,
-        process_group_backend="nccl" if accelerator == "gpu" else "gloo",
-    )
-
-    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
-
-    return dict(
-        accelerator=accelerator,
-        devices=devices,
-        num_nodes=num_nodes,
-        precision=precision,
-        default_root_dir=default_root_dir,
-        log_every_n_steps=50,
-        enable_progress_bar=False,
-        deterministic=False,
-        gradient_clip_val=1.0,
-        gradient_clip_algorithm="norm",
-        strategy=strategy,
-    )
-
-
 def on_rank_zero():
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return True
@@ -3196,20 +4323,12 @@ def make_run_dir(base="runs"):
 
 import torch
 
-def choose_precision():
-    if torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
-            return "bf16-mixed"
-        if torch.cuda.get_device_capability(0)[0] >= 7:
-            return "16-mixed"
-    return "32-true"
-
 def trainer_common_kwargs():
     return dict(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,                     # 1 seul GPU local
         # PAS de 'strategy' ici
-        precision=choose_precision(),
+        precision="32-true",
         default_root_dir="./lightning_logs_notebook",
         enable_progress_bar=True,
         log_every_n_steps=5,
@@ -3218,70 +4337,179 @@ def trainer_common_kwargs():
         gradient_clip_algorithm="norm",
     )
 
-
-
-
 tkw = trainer_common_kwargs()
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# 1) Build avec P,T prédits ET dans FiLM
+# ✅ Paramètres expérimentaux (pas prédits, pas de loss)
+USE_EXP_PARAMS_IN_A = ["P", "T"]           # ou [] pour mode pred
+USE_EXP_PARAMS_FOR_RESID = ["P", "T"]      # ou [] pour mode pred
+
+print("\n" + "="*70)
+print("🎯 CONFIGURATION SIMPLIFIÉE")
+print("="*70)
+if len(USE_EXP_PARAMS_IN_A) > 0:
+    print(f"Stage A:")
+    print(f"  → Utilise {USE_EXP_PARAMS_IN_A} expérimentaux pour physique")
+    print(f"  → PAS de loss sur {USE_EXP_PARAMS_IN_A} (pas entraînés)")
+    print(f"  → Entraînement uniquement sur autres paramètres")
+else:
+    print(f"Stage A: Mode PRED (tous paramètres prédits et entraînés)")
+
+if len(USE_EXP_PARAMS_FOR_RESID) > 0:
+    print(f"\nStage B:")
+    print(f"  → Résidus calculés avec {USE_EXP_PARAMS_FOR_RESID} expérimentaux")
+    print(f"  → Raffineur ne corrige PAS {USE_EXP_PARAMS_FOR_RESID}")
+else:
+    print(f"\nStage B: Mode PRED (résidus avec tous params prédits)")
+print("="*70 + "\n")
+
+
+# ============================================================
+# BUILD
+# ============================================================
+
 model, train_loader, val_loader = build_data_and_model(
     seed=42,
     n_points=800,
-    n_train=5000,       
-    n_val=500,          
+    n_train=50000,
+    n_val=5000,
     batch_size=32,
     backbone_variant="s",
-    backbone_width_mult=1.2,
-    backbone_depth_mult=0.8,
+    backbone_width_mult=1,
+    backbone_depth_mult=1,
     refiner_variant="s",
-    refiner_width_mult=1.2,
-    refiner_depth_mult=0.8,
+    refiner_width_mult=1,
+    refiner_depth_mult=1,
+    w_pw_raw=0.10,
+    w_spectral_angle=0.70,
+    w_peak=0.20,              
+    w_params=0.0,
+    use_relobralo_top=True, 
+
+    
+    # ✅ Configuration de la peak loss
+    pw_cfg=dict(
+        peak_weight=4.0,
+        baseline_weight=1.0,
+        pre_smooth_sigma=1.3,
+        salience_smooth_sigma=2.0,
+        spread_kind="gaussian",
+        spread_sigma=2.8,
+        weight_normalize="mean",
+        border_policy="taper",
+        salience_gamma=0.9
+    ),
+
     qtpy_dir="C:/Users/goff0007/Documents/Aerolab/Python_code/PINN/QTpy",
-    predict_list=["sig0", "dsig", "mf_CH4", "mf_H2O", "baseline1", "baseline2", "P", "T"],  # ✓
-    film_list=[],  # ✓
+    predict_list=["sig0", "dsig", "mf_CH4", "baseline1", "baseline2", "P", "T"],
+    
+    # ✅ Configuration du scheduler
+    scheduler_T_0=10,
+    scheduler_T_mult=1.2,
+    scheduler_eta_min=1e-6,
+    scheduler_decay_factor=0.8,
+    scheduler_warmup_epochs=5,
 )
 
-# 1) Crée les callbacks de visu/epoch
-cb_visu_stage = StageAwarePlotCallback(
-    val_loader=val_loader,
-    param_names=model.param_names,     # <- important
-    num_examples=1,
-    save_dir="./figs_local/stageA",    # où sauvegarder les PNG
-    stage_tag="StageA",                # titre sur la figure
-    refine=False,                      # Stage A = pas de raffinement
-    cascade_stages_override=None,      # auto
-    use_gt_for_provided=True,          # mêmes conventions que ton code
-    recon_PT="pred",                   # PT issus du modèle
-    max_val_batches=None               # optionnel (ex: 10 pour accélérer)
+# ============================================================
+# ✅ VISUALISER LE SCHEDULER AVANT L'ENTRAÎNEMENT
+# ============================================================
+
+suffix_A = "_".join(USE_EXP_PARAMS_IN_A) if USE_EXP_PARAMS_IN_A else "pred"
+
+print("\n" + "="*70)
+print("📊 GÉNÉRATION DU PREVIEW DU LEARNING RATE SCHEDULE")
+print("="*70)
+
+# Créer un optimizer temporaire pour preview
+temp_opt_config = model.configure_optimizers()
+temp_scheduler = temp_opt_config['lr_scheduler']['scheduler']
+
+# Générer et sauvegarder la figure dans le même dossier que les loss curves
+save_dir_scheduler = f"./figs_local/stageA_{suffix_A}"
+os.makedirs(save_dir_scheduler, exist_ok=True)
+
+cycle_stats = plot_lr_scheduler_preview(
+    temp_scheduler,
+    max_epochs=166,  # Nombre d'epochs prévus pour les stages A+B
+    save_dir=save_dir_scheduler,
+    filename="lr_schedule_preview.png"
 )
 
-cb_pt_compare = PT_PredVsExp_VisuCallback(
-    val_loader,
-    save_dir="./figs_local/PT",
-    num_examples=1,
-    tag="PT_pred_vs_exp",
-    use_gt_for_provided=True
-)
-cb_pt_compare.refine = False      # <- clé : désactiver le refine pour ce callback en Stage A
+# Afficher les détails des cycles
+print(f"\n📋 DÉTAIL DES CYCLES PRÉVUS:")
+print(f"{'Cycle':<8} {'Durée':<8} {'Max LR':<12} {'Période théorique':<20}")
+print("-"*60)
+
+for i, stat in enumerate(cycle_stats):
+    expected_period = temp_scheduler.T_0 * (temp_scheduler.T_mult ** i)
+    print(f"{stat['cycle']:<8} {stat['duration']:<8} {stat['max_lr']:<12.2e} {expected_period:.1f} epochs")
+
+print("="*70 + "\n")
+
+
+# ============================================================
+# STAGE A
+# ============================================================
 
 callbacks = [
-    cb_visu_stage,            # <- affiche MSE global + erreurs % par param sur la figure
-    cb_pt_compare,            # comparaison PT=pred vs PT=exp
-    UpdateEpochInDataset(),   # keep
-    UpdateEpochInValDataset() # keep
+    StageAwarePlotCallback(
+        val_loader=val_loader,
+        param_names=model.param_names,
+        num_examples=1,
+        save_dir=f"./figs_local/stageA_{suffix_A}",
+        stage_tag=f"StageA_{suffix_A.upper()}",
+        refine=False,
+        use_gt_for_provided=True,
+        recon_PT="pred",
+        max_val_batches=10
+    ),
+    PT_PredVsExp_VisuCallback(
+        val_loader,
+        save_dir=f"./figs_local/PT_A_{suffix_A}",
+        num_examples=1,
+        tag=f"PT_A_{suffix_A}",
+        use_gt_for_provided=True
+    ),
+    LossCurvePlotCallback(
+        save_path=f"./figs_local/stageA_{suffix_A}/loss_curves.png"
+    ),
+    UpdateEpochInDataset(),
+    UpdateEpochInValDataset()
 ]
 
-# 2) Entraînement Stage A
+print("\n" + "="*70)
+print("🚀 ENTRAÎNEMENT STAGE A")
+print("="*70)
+
 model = train_stage_A(
     model, train_loader, val_loader,
-    epochs=100,
+    epochs=10,
     base_lr=1e-4,
-    train_film=False,     # on entraîne FiLM en A (comme tu voulais)
-    use_film=False,       # on l’active
-    film_subset=[],
-    heads_subset=["sig0","dsig","P","T","mf_CH4","mf_H2O","baseline1","baseline2"],
-    callbacks=callbacks,  # <- utilise la liste corrigée
+    heads_subset=["sig0","dsig","P","T","mf_CH4", "baseline1","baseline2"],
+    use_exp_params=USE_EXP_PARAMS_IN_A,
+    callbacks=callbacks,
     **tkw,
 )
+
+preview_peak_weights_on_val(
+    model, 
+    val_loader, 
+    save_dir="./figs_local/weights_preview"
+)
+
+# Sauvegarde
+os.makedirs("./checkpoints", exist_ok=True)
+checkpoint_A = {
+    'epoch': 170,
+    'stage': f'A_{suffix_A}',
+    'model_state_dict': model.state_dict(),
+    'use_exp_params': USE_EXP_PARAMS_IN_A,
+}
+checkpoint_path_A = f"./checkpoints/stageA_{suffix_A}.ckpt"
+torch.save(checkpoint_A, checkpoint_path_A)
+print(f"✅ Stage A sauvegardé: {checkpoint_path_A}\n")
 
