@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 # Import from new modular structure
-from physics.tips import Tips2021QTpy
+from physics.tips import Tips2021QTpy, resolve_tipspy
 from physics.forward import batch_physics_forward_multimol_vgrid
 from utils.lowess import lowess_value
 from data.normalization import unnorm_param_torch
@@ -132,7 +132,12 @@ class PhysicallyInformedAE(pl.LightningModule):
         self.n_points = n_points
         self.poly_freq_CH4 = poly_freq_CH4
         self.transitions_dict = transitions_dict
-        self.tipspy = tipspy
+        needs_tipspy = any(len(v) for v in transitions_dict.values())
+        self.tipspy = resolve_tipspy(
+            tipspy,
+            required=needs_tipspy,
+            device="cpu",
+        )
         self.save_hyperparameters(ignore=["transitions_dict", "poly_freq_CH4", "tipspy"])
         self.mlp_dropout = float(mlp_dropout)
         self.refiner_mlp_dropout = float(refiner_mlp_dropout)

@@ -8,7 +8,7 @@ from config.params import PARAMS, NORM_PARAMS
 from data.normalization import norm_param_value
 from data.noise import add_noise_variety
 from physics.forward import batch_physics_forward_multimol_vgrid
-from physics.tips import Tips2021QTpy
+from physics.tips import Tips2021QTpy, resolve_tipspy
 from utils.lowess import lowess_value
 
 
@@ -28,6 +28,8 @@ class SpectraDataset(Dataset):
         noise_profile: Noise configuration parameters (default: None).
         freeze_noise: Use fixed noise seed per sample (default: False).
         tipspy: Tips2021QTpy object for partition functions (default: None).
+            When ``None``, the dataset attempts to locate a QTpy directory
+            alongside the repository.
     """
 
     def __init__(
@@ -51,7 +53,12 @@ class SpectraDataset(Dataset):
         self.with_noise = bool(with_noise)
         self.noise_profile = dict(noise_profile or {})
         self.freeze_noise = bool(freeze_noise)
-        self.tipspy = tipspy
+        needs_tipspy = any(len(v) for v in transitions_dict.values())
+        self.tipspy = resolve_tipspy(
+            tipspy,
+            required=needs_tipspy,
+            device="cpu",
+        )
         self.epoch = 0
 
         if strict_check:
