@@ -84,10 +84,7 @@ PhysicallyInformedAE uses a multi-stage training protocol:
 **This directory currently provides:**
 
 - Stage A training script (`train_stage_a.py`)
-- Stage-specific Jupyter notebooks in `notebooks/`:
-  - `stage_a_training.ipynb`
-  - `stage_b1_training.ipynb`
-  - `stage_b2_finetuning.ipynb`
+- A YAML-driven Stage A walkthrough notebook (`notebooks/stage_a_from_yaml.ipynb`) showing how to load the bundled configuration files and kick off a short training run.
 
 **Coming soon:** DEN example notebook.
 
@@ -267,7 +264,7 @@ model = PhysicallyInformedAE.load_from_checkpoint('checkpoints/stage_a/best.ckpt
 model.training_stage = 'B1'
 
 # Train with lower learning rate
-# See notebooks/stage_b1_training.ipynb for a complete walk-through
+# Stage B walkthroughs will be added alongside the YAML examples
 ```
 
 ## Jupyter Notebook Tutorials
@@ -276,16 +273,14 @@ Interactive tutorials are available under `project/examples/notebooks/`:
 
 | Notebook | Focus |
 |----------|-------|
-| `stage_a_training.ipynb` | Stage A backbone training (from scratch) |
-| `stage_b1_training.ipynb` | Stage B1 refiner training using a Stage A checkpoint |
-| `stage_b2_finetuning.ipynb` | Stage B2 full-model fine-tuning starting from Stage B1 |
+| `stage_a_from_yaml.ipynb` | Stage A backbone training driven entirely by the bundled YAML configs |
 
-Each notebook includes:
+The notebook includes:
 
-- Dependency installation cell for quick setup
-- Reusable configuration blocks with suggested hyper-parameters
+- Dependency checks and project-path bootstrapping
+- YAML loading blocks that feed directly into `TrainingConfig`
 - Dataset preparation using the modular `SpectraDataset`
-- Model initialisation with `PhysicallyInformedAE.set_stage_mode(...)`
+- Model initialisation with `PhysicallyInformedAE`
 - PyTorch Lightning trainer configuration, callbacks, and execution commands
 
 > **Tip:** When customising the transitions file to include additional molecules (e.g. H₂O), make sure the corresponding mole fraction parameters are added to `config/params.py` so the dataset sampler can generate consistent examples.
