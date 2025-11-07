@@ -87,6 +87,7 @@ NORM_PARAMS = {
     'sig0': (3085.37, 3085.52),
     'dsig': (0.001502, 0.001559),
     'mf_CH4': (1e-7, 2.9e-5),
+    'mf_H2O': (1e-7, 5e-4),
     'baseline0': (0.999999, 1.00001),
     'baseline1': (-5.0e-4, -2.0e-4),
     'baseline2': (-7.505155e-8, 3.77485e-9),
@@ -95,8 +96,10 @@ NORM_PARAMS = {
 }
 ```
 
-These values are bundled in `project/config/data/parameters_default.yaml` and
-match the `build_data_and_model` helper shipped with the monolithic script.
+These values—augmented with a log-scaled H₂O mole-fraction range to support the
+sample HITRAN catalogue—are bundled in
+`project/config/data/parameters_default.yaml` and match the
+`build_data_and_model` helper shipped with the monolithic script.
 
 ### Alternative Configuration Examples
 

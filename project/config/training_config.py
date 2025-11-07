@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, MutableMapping, Tuple
 
-from .params import LOG_FLOOR, PARAMS
+from .params import LOG_FLOOR, LOG_SCALE_PARAMS, PARAMS
 
 DEFAULT_PREDICT_PARAMS = ["sig0", "dsig", "P", "T", "mf_CH4", "baseline1", "baseline2"]
 
@@ -15,6 +15,7 @@ def _default_val_ranges() -> dict[str, tuple[float, float]]:
         "sig0": (3085.43, 3085.46),
         "dsig": (0.001521, 0.00154),
         "mf_CH4": (2e-6, 20e-6),
+        "mf_H2O": (5e-5, 3e-4),
         "baseline0": (0.999999, 1.00001),
         "baseline1": (-4.0e-4, -3.0e-4),
         "baseline2": (-4.0565e-8, -3.07117e-8),
@@ -45,9 +46,10 @@ def _map_ranges(
 
 
 def _apply_log_floor(ranges: MutableMapping[str, tuple[float, float]]) -> MutableMapping[str, tuple[float, float]]:
-    if "mf_CH4" in ranges:
-        lo, hi = ranges["mf_CH4"]
-        ranges["mf_CH4"] = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR * 10))
+    for name in LOG_SCALE_PARAMS:
+        if name in ranges:
+            lo, hi = ranges[name]
+            ranges[name] = (max(lo, LOG_FLOOR), max(hi, LOG_FLOOR * 10))
     return ranges
 
 
@@ -147,6 +149,7 @@ class TrainingConfig:
             "sig0": 5.0,
             "dsig": 3.0,
             "mf_CH4": 2.0,
+            "mf_H2O": 2.0,
             "baseline0": 1.0,
             "baseline1": 3.0,
             "baseline2": 8.0,
