@@ -8,24 +8,24 @@ from utils.io import load_config
 from config.params import PARAMS, NORM_PARAMS, LOG_SCALE_PARAMS
 
 
-_TRANSITION_REQUIRED_FIELDS: frozenset[str] = frozenset(
-    {
-        "mid",
-        "lid",
-        "center",
-        "amplitude",
-        "gamma_air",
-        "gamma_self",
-        "e0",
-        "n_air",
-        "shift_air",
-        "abundance",
-        "gDicke",
-        "nDicke",
-        "lmf",
-        "nlmf",
-    }
+_TRANSITION_FIELD_ORDER: tuple[str, ...] = (
+    "mid",
+    "lid",
+    "center",
+    "amplitude",
+    "gamma_air",
+    "gamma_self",
+    "e0",
+    "n_air",
+    "shift_air",
+    "abundance",
+    "gDicke",
+    "nDicke",
+    "lmf",
+    "nlmf",
 )
+
+_TRANSITION_MANDATORY_FIELDS: frozenset[str] = frozenset(_TRANSITION_FIELD_ORDER[:9])
 
 
 def _as_path(path: str | Path) -> Path:
@@ -142,32 +142,56 @@ def load_transitions(
             raise ValueError(f"Transitions for molecule '{mol}' must be a list")
         parsed_entries: list[dict] = []
         for idx, entry in enumerate(entries):
-            if not isinstance(entry, Mapping):
-                raise ValueError(
-                    f"Transition #{idx} for molecule '{mol}' must be a mapping, got {type(entry).__name__}"
+            if isinstance(entry, Mapping):
+                missing = _TRANSITION_MANDATORY_FIELDS - set(entry)
+                if missing:
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' is missing fields: {sorted(missing)}"
+                    )
+                parsed_entries.append(
+                    {
+                        "mid": int(entry["mid"]),
+                        "lid": int(entry["lid"]),
+                        **{
+                            name: float(entry.get(name, 0.0))
+                            for name in _TRANSITION_FIELD_ORDER[2:]
+                        },
+                    }
                 )
-            missing = _TRANSITION_REQUIRED_FIELDS - set(entry)
-            if missing:
-                raise ValueError(
-                    f"Transition #{idx} for molecule '{mol}' is missing fields: {sorted(missing)}"
+                continue
+
+            if isinstance(entry, str):
+                raw_values = [token.strip() for token in entry.split(";") if token.strip()]
+                if len(raw_values) < len(_TRANSITION_FIELD_ORDER):
+                    raw_values.extend(["0"] * (len(_TRANSITION_FIELD_ORDER) - len(raw_values)))
+                elif len(raw_values) > len(_TRANSITION_FIELD_ORDER):
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' defines too many fields ({len(raw_values)})"
+                    )
+
+                try:
+                    mid = int(float(raw_values[0]))
+                    lid = int(float(raw_values[1]))
+                    numeric_tail = [float(val) for val in raw_values[2:]]
+                except ValueError as exc:  # pragma: no cover - defensive programming
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' contains non-numeric data"
+                    ) from exc
+
+                parsed_entries.append(
+                    {
+                        "mid": mid,
+                        "lid": lid,
+                        **{
+                            name: numeric_tail[i]
+                            for i, name in enumerate(_TRANSITION_FIELD_ORDER[2:])
+                        },
+                    }
                 )
-            parsed_entries.append(
-                {
-                    "mid": int(entry["mid"]),
-                    "lid": int(entry["lid"]),
-                    "center": float(entry["center"]),
-                    "amplitude": float(entry["amplitude"]),
-                    "gamma_air": float(entry["gamma_air"]),
-                    "gamma_self": float(entry["gamma_self"]),
-                    "e0": float(entry["e0"]),
-                    "n_air": float(entry["n_air"]),
-                    "shift_air": float(entry["shift_air"]),
-                    "abundance": float(entry["abundance"]),
-                    "gDicke": float(entry["gDicke"]),
-                    "nDicke": float(entry["nDicke"]),
-                    "lmf": float(entry["lmf"]),
-                    "nlmf": float(entry["nlmf"]),
-                }
+                continue
+
+            raise ValueError(
+                f"Transition #{idx} for molecule '{mol}' must be a mapping or a ';'-separated string"
             )
         transitions_dict[mol] = parsed_entries
 
