@@ -1,0 +1,47 @@
+# Exemple de transitions spectroscopiques réduites pour CH4 et H2O.
+# Les valeurs sont synthétiques et servent de gabarit pour préparer vos propres fichiers.
+transitions:
+  CH4:
+    - mid: 6
+      lid: 1
+      center: 5998.1234
+      amplitude: 1.20e-20
+      gamma_air: 0.070
+      gamma_self: 0.090
+      e0: 120.5
+      n_air: 0.75
+      shift_air: -0.005
+      abundance: 0.999
+      gDicke: 0.015
+      nDicke: 0.25
+      lmf: 0.010
+      nlmf: 0.70
+    - mid: 6
+      lid: 2
+      center: 6001.8765
+      amplitude: 8.50e-21
+      gamma_air: 0.066
+      gamma_self: 0.085
+      e0: 98.1
+      n_air: 0.74
+      shift_air: -0.004
+      abundance: 0.999
+      gDicke: 0.012
+      nDicke: 0.22
+      lmf: -0.008
+      nlmf: 0.65
+  H2O:
+    - mid: 1
+      lid: 1
+      center: 6000.4321
+      amplitude: 4.10e-21
+      gamma_air: 0.080
+      gamma_self: 0.095
+      e0: 156.2
+      n_air: 0.76
+      shift_air: -0.006
+      abundance: 0.997
+      gDicke: 0.018
+      nDicke: 0.27
+      lmf: 0.005
+      nlmf: 0.60
