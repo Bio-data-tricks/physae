@@ -1,0 +1,36 @@
+# Default parameter ranges for synthetic spectra generation.
+# Each entry defines the minimum and maximum value sampled during dataset creation.
+parameters:
+  sig0:
+    min: 5995.0
+    max: 6005.0
+    description: Centre de la grille spectrale (cm^-1)
+  dsig:
+    min: 8.0
+    max: 12.0
+    description: Largeur spectrale balayée (cm^-1)
+  mf_CH4:
+    min: 1.0e-6
+    max: 5.0e-3
+    log_scale: true
+    description: Fraction molaire de CH4
+  baseline0:
+    min: 0.8
+    max: 1.2
+    description: Terme constant de la ligne de base
+  baseline1:
+    min: -0.02
+    max: 0.02
+    description: Terme linéaire de la ligne de base
+  baseline2:
+    min: -0.001
+    max: 0.001
+    description: Terme quadratique de la ligne de base
+  P:
+    min: 0.5
+    max: 1.2
+    description: Pression totale (atm)
+  T:
+    min: 250.0
+    max: 320.0
+    description: Température (K)

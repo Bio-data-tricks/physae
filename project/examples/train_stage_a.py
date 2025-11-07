@@ -29,85 +29,72 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.params import PARAMS, LOG_SCALE_PARAMS, NORM_PARAMS
+from config.data_config import load_parameter_ranges, load_noise_profile, load_transitions
 from data.dataset import SpectraDataset
 from models.autoencoder import PhysicallyInformedAE
 from physics.tips import Tips2021QTpy, find_qtpy_dir
 from training.callbacks.epoch_sync import UpdateEpochInDataset
 
 
-def setup_parameter_ranges():
-    """
-    Configure parameter ranges for synthetic data generation.
+def setup_parameter_ranges(parameters_config: str | None):
+    """Load parameter ranges from YAML and update global normalisation.
 
-    These ranges are chosen for typical atmospheric spectroscopy measurements:
-    - sig0: Center wavenumber (cm^-1) - range around 6000 cm^-1 (near-IR CH4 band)
-    - dsig: Spectral width (cm^-1) - typical scan width
-    - mf_CH4: CH4 molar fraction - atmospheric to high concentration
-    - baseline0/1/2: Polynomial baseline coefficients
-    - P: Pressure (atm) - sea level to moderate altitude
-    - T: Temperature (K) - typical atmospheric range
+    Args:
+        parameters_config: Optional custom YAML path provided via CLI. When
+            ``None``, the bundled ``parameters_default.yaml`` file is used.
     """
-    NORM_PARAMS.clear()
-    NORM_PARAMS.update({
-        'sig0': (5995.0, 6005.0),       # Center wavenumber: 6000 ± 5 cm^-1
-        'dsig': (8.0, 12.0),             # Spectral width: 8-12 cm^-1
-        'mf_CH4': (1e-6, 5e-3),          # CH4 molar fraction: 1 ppm to 0.5% (log scale)
-        'baseline0': (0.8, 1.2),         # Baseline constant term
-        'baseline1': (-0.02, 0.02),      # Baseline linear term
-        'baseline2': (-0.001, 0.001),    # Baseline quadratic term
-        'P': (0.5, 1.2),                 # Pressure: 0.5-1.2 atm
-        'T': (250.0, 320.0),             # Temperature: 250-320 K
-    })
+
+    default_path = Path(__file__).parent.parent / "config" / "data" / "parameters_default.yaml"
+    config_path = Path(parameters_config) if parameters_config else default_path
+
+    print(f"Loading parameter ranges from: {config_path}")
+    try:
+        ranges = load_parameter_ranges(config_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise RuntimeError(f"Failed to load parameter configuration '{config_path}': {exc}") from exc
+
     print("Parameter ranges configured:")
-    for param, (min_val, max_val) in NORM_PARAMS.items():
+    for param, (min_val, max_val) in ranges.items():
         log_note = " (log scale)" if param in LOG_SCALE_PARAMS else ""
         print(f"  {param:12s}: [{min_val:12.6e}, {max_val:12.6e}]{log_note}")
 
+    return ranges
 
-def load_transitions_data(transitions_dir: str = "./data/hitran"):
-    """
-    Load HITRAN transition data for spectroscopy simulation.
 
-    This is a placeholder showing the expected data structure.
-    In practice, you would load real HITRAN line data from CSV files.
+def load_transitions_data(transitions_config: str | None):
+    """Load spectroscopic transitions from a YAML configuration file.
 
     Args:
-        transitions_dir: Directory containing HITRAN transition CSV files.
+        transitions_config: Optional custom YAML path. When ``None``, a small
+            synthetic example bundled with the repository is used.
 
     Returns:
-        Dictionary mapping molecule names to transition DataFrames.
-        Each DataFrame should contain columns:
-        - nu: transition frequency (cm^-1)
-        - sw: line intensity at 296K (cm^-1/(molecule·cm^-2))
-        - elower: lower state energy (cm^-1)
-        - gamma_air: air-broadened half width at 296K (cm^-1/atm)
-        - gamma_self: self-broadened half width at 296K (cm^-1/atm)
-        - n_air: temperature exponent for gamma_air
-        - delta_air: air pressure shift at 296K (cm^-1/atm)
-        - etc. (additional HITRAN parameters)
-
-    Example data loading (uncomment and adapt for real data):
-
-    import pandas as pd
-
-    transitions_CH4 = pd.read_csv(f"{transitions_dir}/06_hit20_5995_6005.csv")
-    transitions_H2O = pd.read_csv(f"{transitions_dir}/01_hit20_5995_6005.csv")
-
-    return {
-        'CH4': transitions_CH4,
-        'H2O': transitions_H2O,
-    }
+        Dictionary mapping molecule identifiers (e.g. ``"CH4"``) to transition
+        entries compatible with :mod:`physics.forward`.
     """
-    # For demonstration purposes, return empty dict
-    # In real usage, load actual HITRAN data files
-    print(f"\nWARNING: Using empty transitions_dict (placeholder).")
-    print(f"To train with real physics, download HITRAN line data:")
-    print(f"  1. Visit: https://hitran.org/lbl/")
-    print(f"  2. Download CH4 (molecule 06) and H2O (molecule 01) for 5995-6005 cm^-1")
-    print(f"  3. Save as CSV and load here")
-    print()
 
-    return {}
+    default_path = Path(__file__).parent.parent / "config" / "data" / "transitions_sample.yaml"
+    config_path = Path(transitions_config) if transitions_config else default_path
+
+    try:
+        transitions_dict = load_transitions(config_path)
+    except FileNotFoundError:
+        if transitions_config:
+            raise
+        print("\nWARNING: No transitions configuration found; using empty dictionary.")
+        return {}
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid transitions configuration '{config_path}': {exc}") from exc
+
+    if not transitions_dict:
+        print("\nWARNING: Loaded transitions configuration is empty.")
+        print("Provide real HITRAN data for physics-accurate training.")
+    else:
+        print("Transitions loaded:")
+        for mol, entries in transitions_dict.items():
+            print(f"  {mol}: {len(entries)} lines")
+
+    return transitions_dict
 
 
 def setup_frequency_grid():
@@ -149,7 +136,27 @@ def setup_frequency_grid():
     return poly_freq
 
 
-def create_datasets(args, poly_freq_CH4, transitions_dict, tipspy):
+def load_noise_profile_config(noise_config: str | None):
+    """Load the noise profile configuration used for data augmentation."""
+
+    default_path = Path(__file__).parent.parent / "config" / "data" / "noise_default.yaml"
+    config_path = Path(noise_config) if noise_config else default_path
+
+    try:
+        noise_profile = load_noise_profile(config_path)
+    except FileNotFoundError:
+        if noise_config:
+            raise
+        print("\nWARNING: No noise configuration found; disabling noise augmentations.")
+        return {}
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid noise configuration '{config_path}': {exc}") from exc
+
+    print(f"Noise profile loaded from: {config_path}")
+    return noise_profile
+
+
+def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy):
     """
     Create training and validation datasets.
 
@@ -157,6 +164,7 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, tipspy):
         args: Command line arguments.
         poly_freq_CH4: Polynomial frequency grid coefficients.
         transitions_dict: Dictionary of transition data.
+        noise_profile: Noise augmentation configuration dictionary.
         tipspy: TIPS partition function calculator.
 
     Returns:
@@ -174,6 +182,7 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, tipspy):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
+        noise_profile=noise_profile,
         freeze_noise=False,  # Random noise each epoch
         tipspy=tipspy,
     )
@@ -185,6 +194,7 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, tipspy):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
+        noise_profile=noise_profile,
         freeze_noise=True,  # Fixed noise for consistent validation
         tipspy=tipspy,
     )
@@ -318,8 +328,12 @@ def parse_args():
                         help='Checkpoint directory')
     parser.add_argument('--qtpy_dir', type=str, default='./QTpy',
                         help='TIPS QTpy directory')
-    parser.add_argument('--transitions_dir', type=str, default='./data/hitran',
-                        help='HITRAN transitions data directory')
+    parser.add_argument('--parameters_config', type=str, default=None,
+                        help='Chemin vers le YAML des plages de paramètres')
+    parser.add_argument('--noise_config', type=str, default=None,
+                        help='Chemin vers le YAML du profil de bruit')
+    parser.add_argument('--transitions_config', type=str, default=None,
+                        help='Chemin vers le YAML des transitions spectroscopiques')
 
     # Other
     parser.add_argument('--seed', type=int, default=42,
@@ -343,13 +357,16 @@ def main():
     print(f"\nRandom seed: {args.seed}")
 
     # Setup parameter ranges
-    setup_parameter_ranges()
+    setup_parameter_ranges(args.parameters_config)
 
     # Setup frequency grid
     poly_freq_CH4 = setup_frequency_grid()
 
+    # Load noise profile
+    noise_profile = load_noise_profile_config(args.noise_config)
+
     # Load transitions data (or use placeholder)
-    transitions_dict = load_transitions_data(args.transitions_dir)
+    transitions_dict = load_transitions_data(args.transitions_config)
 
     # Initialize TIPS partition functions
     print(f"\nInitializing TIPS partition functions...")
@@ -364,7 +381,7 @@ def main():
 
     # Create datasets
     train_dataset, val_dataset = create_datasets(
-        args, poly_freq_CH4, transitions_dict, tipspy
+        args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
     )
 
     # Create data loaders
