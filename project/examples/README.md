@@ -81,9 +81,15 @@ PhysicallyInformedAE uses a multi-stage training protocol:
 | B2 | Full model fine-tuning | 1e-6 | 20-30 |
 | DEN | Denoiser only | 1e-4 | 50 |
 
-**This directory currently provides:** Stage A training example.
+**This directory currently provides:**
 
-**Coming soon:** Stage B1, B2, and DEN examples.
+- Stage A training script (`train_stage_a.py`)
+- Stage-specific Jupyter notebooks in `notebooks/`:
+  - `stage_a_training.ipynb`
+  - `stage_b1_training.ipynb`
+  - `stage_b2_finetuning.ipynb`
+
+**Coming soon:** DEN example notebook.
 
 ## Requirements
 
@@ -261,8 +267,28 @@ model = PhysicallyInformedAE.load_from_checkpoint('checkpoints/stage_a/best.ckpt
 model.training_stage = 'B1'
 
 # Train with lower learning rate
-# ... (Stage B1 example coming soon)
+# See notebooks/stage_b1_training.ipynb for a complete walk-through
 ```
+
+## Jupyter Notebook Tutorials
+
+Interactive tutorials are available under `project/examples/notebooks/`:
+
+| Notebook | Focus |
+|----------|-------|
+| `stage_a_training.ipynb` | Stage A backbone training (from scratch) |
+| `stage_b1_training.ipynb` | Stage B1 refiner training using a Stage A checkpoint |
+| `stage_b2_finetuning.ipynb` | Stage B2 full-model fine-tuning starting from Stage B1 |
+
+Each notebook includes:
+
+- Dependency installation cell for quick setup
+- Reusable configuration blocks with suggested hyper-parameters
+- Dataset preparation using the modular `SpectraDataset`
+- Model initialisation with `PhysicallyInformedAE.set_stage_mode(...)`
+- PyTorch Lightning trainer configuration, callbacks, and execution commands
+
+> **Tip:** When customising the transitions file to include additional molecules (e.g. H₂O), make sure the corresponding mole fraction parameters are added to `config/params.py` so the dataset sampler can generate consistent examples.
 
 ## Troubleshooting
 
