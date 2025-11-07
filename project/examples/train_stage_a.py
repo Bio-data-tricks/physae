@@ -33,7 +33,7 @@ from config.data_config import load_parameter_ranges, load_noise_profile, load_t
 from data.dataset import SpectraDataset
 from models.autoencoder import PhysicallyInformedAE
 from physics.tips import Tips2021QTpy, find_qtpy_dir
-from training.callbacks.epoch_sync import UpdateEpochInDataset
+from training.callbacks import StageAwarePlotCallback, UpdateEpochInDataset
 
 
 def setup_parameter_ranges(parameters_config: str | None):
@@ -382,7 +382,22 @@ def main():
     model = create_model(args, poly_freq_CH4, transitions_dict)
 
     # Setup callbacks
+    stage_fig_dir = Path(args.log_dir) / "figures"
+
     callbacks = [
+        # Stage-aware visual diagnostics mirroring physae.py
+        StageAwarePlotCallback(
+            val_loader=val_loader,
+            param_names=model.param_names,
+            num_examples=1,
+            save_dir=stage_fig_dir,
+            stage_tag="StageA",
+            refine=False,
+            use_gt_for_provided=True,
+            recon_PT="pred",
+            max_val_batches=10,
+        ),
+
         # Model checkpointing
         ModelCheckpoint(
             dirpath=args.checkpoint_dir,

@@ -295,6 +295,13 @@ class StageAwarePlotCallback(pl.Callback):
             fontsize=8.5,
             family="monospace",
             transform=ax_tbl.transAxes,
+            bbox=dict(
+                boxstyle="round,pad=0.8",
+                facecolor="wheat",
+                alpha=0.3,
+                edgecolor="gray",
+                linewidth=1,
+            ),
         )
 
         self.save_dir.mkdir(parents=True, exist_ok=True)
