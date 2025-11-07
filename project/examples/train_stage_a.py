@@ -144,6 +144,14 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
     print(f"  Training samples: {args.train_samples}")
     print(f"  Validation samples: {args.val_samples}")
     print(f"  Spectral points: {args.num_points}")
+    print(
+        "  Training dataset mode: "
+        + ("statique" if args.static_training_set else "inline (résample chaque epoch)")
+    )
+    print(
+        "  Validation dataset mode: "
+        + ("statique" if args.static_validation_set else "inline (résample chaque epoch)")
+    )
 
     train_dataset = SpectraDataset(
         n_samples=args.train_samples,
@@ -153,6 +161,7 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
         sample_ranges=NORM_PARAMS,
         with_noise=True,
         noise_profile=noise_profile,
+        freeze_parameters=args.static_training_set,
         freeze_noise=False,  # Random noise each epoch
         tipspy=tipspy,
     )
@@ -165,6 +174,7 @@ def create_datasets(args, poly_freq_CH4, transitions_dict, noise_profile, tipspy
         sample_ranges=NORM_PARAMS,
         with_noise=True,
         noise_profile=noise_profile,
+        freeze_parameters=args.static_validation_set,
         freeze_noise=True,  # Fixed noise for consistent validation
         tipspy=tipspy,
     )
@@ -264,6 +274,10 @@ def parse_args():
                         help='Batch size')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='Number of data loader workers')
+    parser.add_argument('--static_training_set', action='store_true',
+                        help="Pré-génère les paramètres une fois pour l'entraînement (dataset fixe)")
+    parser.add_argument('--static_validation_set', action='store_true',
+                        help="Pré-génère les paramètres une fois pour la validation")
 
     # Model configuration
     parser.add_argument('--encoder_variant', type=str, default='s',

@@ -1,7 +1,7 @@
 """
 PyTorch Dataset for synthetic spectral data generation with physics simulation.
 """
-from typing import Optional, Dict, Sequence
+from typing import Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 from config.params import PARAMS, NORM_PARAMS
@@ -26,6 +26,10 @@ class SpectraDataset(Dataset):
         strict_check: Check if sample ranges are within NORM_PARAMS (default: True).
         with_noise: Add noise to spectra (default: True).
         noise_profile: Noise configuration parameters (default: None).
+        freeze_parameters: Pre-sample parameter draws once so each index
+            returns the same physical conditions at every epoch. When
+            ``False`` (default), parameters are resampled on-the-fly like in
+            ``physae.py``.
         freeze_noise: Use fixed noise seed per sample (default: False).
         tipspy: Tips2021QTpy object for partition functions (default: None).
             When ``None``, the dataset attempts to locate a QTpy directory
@@ -42,6 +46,7 @@ class SpectraDataset(Dataset):
         strict_check: bool = True,
         with_noise: bool = True,
         noise_profile: Optional[dict] = None,
+        freeze_parameters: bool = False,
         freeze_noise: bool = False,
         tipspy: Tips2021QTpy | None = None,
     ):
@@ -52,6 +57,7 @@ class SpectraDataset(Dataset):
         self.sample_ranges = sample_ranges if sample_ranges is not None else NORM_PARAMS
         self.with_noise = bool(with_noise)
         self.noise_profile = dict(noise_profile or {})
+        self.freeze_parameters = bool(freeze_parameters)
         self.freeze_noise = bool(freeze_noise)
         needs_tipspy = any(len(v) for v in transitions_dict.values())
         self.tipspy = resolve_tipspy(
@@ -60,6 +66,7 @@ class SpectraDataset(Dataset):
             device="cpu",
         )
         self.epoch = 0
+        self._frozen_params: dict[str, torch.Tensor] | None = None
 
         if strict_check:
             for k in PARAMS:
@@ -69,6 +76,13 @@ class SpectraDataset(Dataset):
                     raise ValueError(
                         f"sample_ranges['{k}']={self.sample_ranges[k]} out of NORM_PARAMS[{k}]={NORM_PARAMS[k]}."
                     )
+
+        if self.freeze_parameters:
+            frozen: dict[str, torch.Tensor] = {}
+            for k in PARAMS:
+                lo, hi = self.sample_ranges[k]
+                frozen[k] = torch.empty(self.n_samples, dtype=torch.float32).uniform_(lo, hi)
+            self._frozen_params = frozen
 
     def set_epoch(self, e: int):
         """Set current epoch for noise generation."""
@@ -92,7 +106,13 @@ class SpectraDataset(Dataset):
         device, dtype = 'cpu', torch.float32
 
         # Sample parameters
-        sampled = {k: torch.empty(1, dtype=dtype).uniform_(*self.sample_ranges[k]) for k in PARAMS}
+        if self.freeze_parameters and self._frozen_params is not None:
+            sampled = {
+                k: self._frozen_params[k][idx].to(dtype).view(1)
+                for k in PARAMS
+            }
+        else:
+            sampled = {k: torch.empty(1, dtype=dtype).uniform_(*self.sample_ranges[k]) for k in PARAMS}
         sig0 = sampled['sig0']
         dsig = sampled['dsig']
         b0 = sampled['baseline0']

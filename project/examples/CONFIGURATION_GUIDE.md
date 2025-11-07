@@ -158,6 +158,32 @@ num_points = 800         # Spectral resolution (pixels)
 - Balanced: 50,000 train / 5,000 val
 - Full reference: 500,000 train / 5,000 val (physae.py default)
 
+### Dataset Generation Mode
+
+The refactored :class:`SpectraDataset` mirrors the original script by
+default: every call to ``__getitem__`` resamples the physical parameters,
+so the training set effectively changes at each epoch.  When you want a
+fixed dataset, pass ``freeze_parameters=True`` when constructing the
+dataset (and optionally ``freeze_noise=True`` for deterministic noise).
+
+```python
+train_dataset = SpectraDataset(
+    ...,  # configuration identique
+    freeze_parameters=False,  # True => échantillon figé
+)
+
+val_dataset = SpectraDataset(
+    ...,  # même configuration
+    freeze_parameters=True,   # Validation figée par défaut
+    freeze_noise=True,
+)
+```
+
+The Stage A example script exposes ``--static-training-set`` and
+``--static-validation-set`` switches to toggle this behaviour from the
+command line, while the YAML-driven notebook highlights the same
+parameters in the dataset construction cell.
+
 ### Frequency Grid
 
 The frequency grid maps pixel indices to wavenumber positions. Provide the

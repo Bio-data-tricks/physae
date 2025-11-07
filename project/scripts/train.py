@@ -29,6 +29,10 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data workers')
+    parser.add_argument('--static_train_set', action='store_true',
+                        help='Freeze parameter draws for the training dataset')
+    parser.add_argument('--static_val_set', action='store_true',
+                        help='Freeze parameter draws for the validation dataset')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Checkpoint directory')
     parser.add_argument('--qtpy_dir', type=str, default='./QTpy', help='QTpy directory')
     return parser.parse_args()
@@ -68,6 +72,7 @@ def create_datasets(args):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
+        freeze_parameters=args.static_train_set,
         tipspy=tipspy,
     )
 
@@ -78,6 +83,7 @@ def create_datasets(args):
         transitions_dict=transitions_dict,
         sample_ranges=NORM_PARAMS,
         with_noise=True,
+        freeze_parameters=args.static_val_set,
         freeze_noise=True,  # Fixed noise for validation
         tipspy=tipspy,
     )
