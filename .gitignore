@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+outputs/
+!.gitignore
+*.ckpt
+.env
+.DS_Store
