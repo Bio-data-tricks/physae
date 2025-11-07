@@ -152,12 +152,12 @@ class Tips2021QTpy:
 
 
 def resolve_tipspy(
-    tipspy: "Tips2021QTpy" | None,
+    tipspy: Tips2021QTpy | None,
     *,
     device: str = "cpu",
     required: bool = True,
     qtpy_hint: str | Path = "QTpy",
-) -> "Tips2021QTpy" | None:
+) -> Tips2021QTpy | None:
     """Return a Tips2021QTpy instance, instantiating it if necessary.
 
     Args:
