@@ -12,8 +12,30 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader
 
-from project.utils.distributed import is_rank0
-from project.utils.plotting import save_fig
+_ROOT_PACKAGE = __name__.partition(".")[0]
+
+
+def _resolve_utils():
+    if _ROOT_PACKAGE == "project":
+        from project.utils.distributed import is_rank0  # type: ignore[import]
+        from project.utils.plotting import save_fig  # type: ignore[import]
+
+        return is_rank0, save_fig
+
+    try:
+        from utils.distributed import is_rank0  # type: ignore[import]
+    except ImportError:
+        from project.utils.distributed import is_rank0  # type: ignore[import]
+
+    try:
+        from utils.plotting import save_fig  # type: ignore[import]
+    except ImportError:
+        from project.utils.plotting import save_fig  # type: ignore[import]
+
+    return is_rank0, save_fig
+
+
+is_rank0, save_fig = _resolve_utils()
 
 __all__ = [
     "StageAwarePlotCallback",
