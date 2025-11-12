@@ -10,6 +10,16 @@ import torch
 import torch.nn.functional as F
 
 
+def _stable_sigmoid(z: np.ndarray | float) -> np.ndarray | float:
+    """Numerically stable logistic function."""
+
+    arr = np.asarray(z, dtype=np.float64)
+    result = 0.5 * (1.0 + np.tanh(arr / 2.0))
+    if arr.shape == ():
+        return float(result)
+    return result
+
+
 def _torch_uniform(a: float, b: float, *, device: torch.device, generator: torch.Generator | None) -> float:
     return (torch.rand((), device=device, generator=generator) * (b - a) + a).item()
 
@@ -122,7 +132,7 @@ def _apply_complex_noise(
                     pos = rng.integers(int(0.1 * L), int(0.9 * L))
                     rise = rng.uniform(1.5, 5.0)
                     jump = rng.choice([-1.0, 1.0]) * rng.uniform(2.0, 8.0)
-                    trans = jump / (1.0 + np.exp(-(x - pos) / rise))
+                    trans = jump * _stable_sigmoid((x - pos) / rise)
                     if rng.random() < 0.6:
                         f = rng.uniform(0.5, 2.0)
                         d = rng.uniform(0.1, 0.3)
@@ -166,13 +176,13 @@ def _apply_complex_noise(
                             break
                         this_amp = rng.choice([-1.0, 1.0]) * base_amp * rng.uniform(0.7, 1.3)
                         rise = rng.uniform(0.5, 2.0)
-                        steps += this_amp / (1.0 + np.exp(-(x - pos) / rise))
+                        steps += this_amp * _stable_sigmoid((x - pos) / rise)
                     tmp += steps
                 else:
                     pos = rng.integers(int(0.2 * L), int(0.7 * L))
                     jump = rng.choice([-1.0, 1.0]) * rng.uniform(2.0, 5.0)
                     rise = rng.uniform(1.0, 3.0)
-                    base = jump / (1.0 + np.exp(-(x - pos) / rise))
+                    base = jump * _stable_sigmoid((x - pos) / rise)
                     if rng.random() < 0.7:
                         f = rng.uniform(1.0, 3.0)
                         amp = jump * rng.uniform(0.2, 0.4)
