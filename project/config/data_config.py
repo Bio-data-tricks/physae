@@ -4,8 +4,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Tuple
 
-from utils.io import load_config
-from config.params import PARAMS, NORM_PARAMS, LOG_SCALE_PARAMS
+_ROOT_PACKAGE = __name__.partition(".")[0]
+
+if _ROOT_PACKAGE == "project":
+    from project.utils.io import load_config
+else:
+    from utils.io import load_config  # type: ignore[import]
+
+from .params import PARAMS, NORM_PARAMS, LOG_SCALE_PARAMS
 
 
 _TRANSITION_FIELD_ORDER: tuple[str, ...] = (

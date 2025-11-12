@@ -10,7 +10,33 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 
-from project.utils.plotting import save_fig
+_ROOT_PACKAGE = __name__.partition(".")[0]
+
+
+def _resolve_plotting_utils():
+    if _ROOT_PACKAGE == "project":
+        from project.utils.plotting import (  # type: ignore[import]
+            ensure_nature_methods_style,
+            save_fig,
+        )
+        return ensure_nature_methods_style, save_fig
+
+    try:
+        from utils.plotting import (  # type: ignore[import]
+            ensure_nature_methods_style,
+            save_fig,
+        )
+        return ensure_nature_methods_style, save_fig
+    except ImportError:
+        from project.utils.plotting import (  # type: ignore[import]
+            ensure_nature_methods_style,
+            save_fig,
+        )
+        return ensure_nature_methods_style, save_fig
+
+
+ensure_nature_methods_style, save_fig = _resolve_plotting_utils()
+ensure_nature_methods_style()
 
 __all__ = ["LossCurvePlotCallback"]
 
