@@ -564,6 +564,12 @@ def batch_physics_forward_multimol_vgrid(
 # 3) Dataset & bruits
 # ============================================================
 def add_noise_variety(spectra, *, generator=None, **cfg):
+    cfg = dict(cfg)
+    legacy_enabled = bool(cfg.pop("legacy_enabled", True))
+
+    if not legacy_enabled:
+        return spectra.clone()
+
     std_add_range     = cfg.get("std_add_range", (0.001, 0.01))
     std_mult_range    = cfg.get("std_mult_range", (0.002, 0.02))
     p_drift           = cfg.get("p_drift", 0.7)
