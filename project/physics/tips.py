@@ -25,13 +25,20 @@ def find_qtpy_dir(pref: str | Path) -> Path:
     if pref_path.exists() and pref_path.is_dir():
         return pref_path.resolve()
 
-    here = Path.cwd()
-    candidates = [
-        here / "QTpy",
-        here.parent / "QTpy",
-        here / "project" / "QTpy",
-        here.parent / "project" / "QTpy",
-    ]
+    module_dir = Path(__file__).resolve().parent
+    cwd = Path.cwd().resolve()
+    search_roots = [cwd, module_dir]
+    search_roots.extend(parent for parent in cwd.parents)
+    search_roots.extend(parent for parent in module_dir.parents)
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots:
+        for candidate in (root / "QTpy", root / "project" / "QTpy"):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
 
     for cand in candidates:
         if cand.exists() and cand.is_dir():
