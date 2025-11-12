@@ -11,10 +11,12 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from project.utils.plotting import save_fig
+from project.utils.plotting import ensure_nature_methods_style, save_fig
 
 __all__ = ["evaluate_and_plot"]
 
+
+ensure_nature_methods_style()
 
 @torch.no_grad()
 def evaluate_and_plot(

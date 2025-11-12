@@ -13,12 +13,15 @@ import torch
 from torch.utils.data import DataLoader
 
 from project.utils.distributed import is_rank0
-from project.utils.plotting import save_fig
+from project.utils.plotting import ensure_nature_methods_style, save_fig
 
 __all__ = [
     "StageAwarePlotCallback",
     "PT_PredVsExp_VisuCallback",
 ]
+
+
+ensure_nature_methods_style()
 
 
 class StageAwarePlotCallback(pl.Callback):
