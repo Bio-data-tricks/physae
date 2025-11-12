@@ -301,12 +301,18 @@ def add_noise_variety(
     baseline_norm: torch.Tensor | None = None,
     **cfg,
 ) -> torch.Tensor:
-    """Add configurable noise (legacy and complex profiles) to spectra."""
+    """Add configurable noise (legacy and complex profiles) to spectra.
+
+    The optional ``legacy_enabled`` flag disables the legacy noise pipeline
+    when set to ``False`` so that only complex profiles are considered.
+    """
 
     cfg_local = dict(cfg)
+    legacy_enabled = bool(cfg_local.pop("legacy_enabled", True))
     complex_cfg = cfg_local.pop("complex", None)
 
-    base_required = bool(cfg_local)
+    legacy_cfg = cfg_local if legacy_enabled else None
+    base_required = bool(cfg_local) and legacy_enabled
     mode = None
     prob = 1.0
     if complex_cfg is not None:
@@ -317,11 +323,16 @@ def add_noise_variety(
         if not (0.0 <= prob <= 1.0):
             raise ValueError("complex probability must be between 0 and 1")
         if mode != "replace" or prob < 1.0:
-            base_required = True
+            base_required = legacy_enabled
+
+    if mode != "replace" and legacy_cfg is None:
+        mode = "replace"
+        base_required = False
 
     out = None
     if base_required:
-        out = _apply_legacy_noise(spectra, generator=generator, cfg=cfg_local)
+        cfg_args = legacy_cfg if legacy_cfg is not None else {}
+        out = _apply_legacy_noise(spectra, generator=generator, cfg=cfg_args)
 
     if complex_cfg is None:
         return out if out is not None else spectra.clone()
