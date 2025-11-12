@@ -2912,6 +2912,7 @@ class StageAwarePlotCallback(pl.Callback):
     """
     def __init__(self, val_loader, param_names, *,
                  num_examples: int = 1,
+                 example_mode: str = "cycle",
                  save_dir: str | None = None,
                  stage_tag: str = "stage",
                  refine: bool = True,
@@ -2926,6 +2927,7 @@ class StageAwarePlotCallback(pl.Callback):
         self.val_loader = val_loader
         self.param_names = list(param_names)
         self.num_examples = int(num_examples)
+        self.example_mode = example_mode.lower().strip()
         job = os.environ.get("SLURM_JOB_ID", "local")
         root = f"./figs_{job}" if save_dir is None else save_dir
         self.stage_tag = stage_tag
@@ -2937,6 +2939,31 @@ class StageAwarePlotCallback(pl.Callback):
         self.recon_PT = recon_PT
         self.Pexp, self.Texp = Pexp, Texp
         self.max_val_batches = None if max_val_batches is None else int(max_val_batches)
+
+        valid_modes = {"first", "cycle"}
+        if self.example_mode not in valid_modes:
+            raise ValueError(
+                f"example_mode must be one of {sorted(valid_modes)}, got {example_mode!r}"
+            )
+
+        self._preview_iterator = None
+
+    def _next_preview_batch(self):
+        """Retourne un batch pour la visualisation qualitative."""
+
+        if self.example_mode == "first":
+            return next(iter(self.val_loader))
+
+        if self._preview_iterator is None:
+            self._preview_iterator = iter(self.val_loader)
+
+        try:
+            batch = next(self._preview_iterator)
+        except StopIteration:
+            self._preview_iterator = iter(self.val_loader)
+            batch = next(self._preview_iterator)
+
+        return batch
 
     def _denorm_subset(self, pl_module, y_norm: torch.Tensor, names: list[str]) -> torch.Tensor:
         return pl_module._denorm_params_subset(y_norm, names)
@@ -3028,7 +3055,7 @@ class StageAwarePlotCallback(pl.Callback):
 
         # Exemple pour visualisation
         try:
-            batch = next(iter(self.val_loader))
+            batch = self._next_preview_batch()
         except StopIteration:
             return
 
