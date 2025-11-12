@@ -274,6 +274,7 @@ Interactive tutorials are available under `project/examples/notebooks/`:
 | Notebook | Focus |
 |----------|-------|
 | `stage_a_from_yaml.ipynb` | Stage A backbone training driven entirely by the bundled YAML configs |
+| `noise_levels_sweep.ipynb` | Visualisation des spectres synthétiques avec balayage des profils de bruit (20 niveaux × 5 spectres) |
 
 The notebook includes:
 
