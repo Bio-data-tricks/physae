@@ -10,7 +10,12 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 
-from project.utils.plotting import save_fig
+_ROOT_PACKAGE = __name__.partition(".")[0]
+
+if _ROOT_PACKAGE == "project":
+    from project.utils.plotting import save_fig
+else:
+    from utils.plotting import save_fig  # type: ignore[import]
 
 __all__ = ["LossCurvePlotCallback"]
 
