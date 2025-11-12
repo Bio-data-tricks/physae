@@ -136,8 +136,19 @@ def ST_hitran_with_qtpy(
 
 
 def batch_physics_forward_multimol_vgrid(
-    sig0, dsig, poly_freq, v_grid_idx, baseline_coeffs,
-    transitions_dict, P, T, mf_dict, *, tipspy: Tips2021QTpy, device='cpu', USE_LM: bool = True
+    sig0,
+    dsig,
+    poly_freq,
+    v_grid_idx,
+    baseline_coeffs,
+    transitions_dict,
+    P,
+    T,
+    mf_dict,
+    *,
+    tipspy: Tips2021QTpy,
+    device="cpu",
+    USE_LM: bool = True,
 ):
     """
     Complete spectral forward model with HITRAN line-by-line calculations.
@@ -180,9 +191,26 @@ def batch_physics_forward_multimol_vgrid(
         baseline_coeffs = baseline_coeffs.unsqueeze(0)
     baseline_coeffs = baseline_coeffs.to(dtype=torch.float64, device=device)
 
-    poly_freq_torch = torch.tensor(poly_freq, dtype=torch.float64, device=device).unsqueeze(0).expand(B, -1)
-    coeffs = torch.cat([sig0, dsig, poly_freq_torch], dim=1)
-    v_grid_batch = polyval_torch(coeffs, v_grid_idx)  # (B,N)
+    extra_coeffs: list[torch.Tensor] = []
+    if poly_freq is not None and len(poly_freq) > 0:
+        poly_freq_t = torch.as_tensor(poly_freq, dtype=torch.float64, device=device)
+        if poly_freq_t.ndim == 1:
+            poly_freq_t = poly_freq_t.unsqueeze(0)
+        if poly_freq_t.shape[0] not in (1, B):
+            raise ValueError(
+                "poly_freq must broadcast to batch size; expected 1 or B rows, "
+                f"got {poly_freq_t.shape[0]}"
+            )
+        if poly_freq_t.shape[0] == 1 and B > 1:
+            poly_freq_t = poly_freq_t.expand(B, -1)
+        extra_coeffs.append(poly_freq_t)
+
+    coeffs = torch.cat([sig0, dsig, *extra_coeffs], dim=1)
+    if coeffs.shape[1] == 2:
+        # Purely linear grid: evaluate manually to avoid pow(0,0) corner cases.
+        v_grid_batch = sig0 + dsig * v_grid_idx.unsqueeze(0)
+    else:
+        v_grid_batch = polyval_torch(coeffs, v_grid_idx)  # (B,N)
 
     total_profile = torch.zeros((B, N), device=device, dtype=torch.float64)
 

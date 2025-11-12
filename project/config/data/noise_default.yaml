@@ -1,16 +1,25 @@
-# Configuration du profil de bruit utilisé pendant la génération des spectres synthétiques.
+# Profil de bruit repris de build_data_and_model dans physae.py.
 noise:
-  std_add_range: [0.001, 0.01]
-  std_mult_range: [0.002, 0.02]
-  p_drift: 0.7
-  drift_sigma_range: [8.0, 90.0]
-  drift_amp_range: [0.002, 0.03]
-  p_fringes: 0.6
-  n_fringes_range: [1, 3]
-  fringe_freq_range: [0.2, 12.0]
-  fringe_amp_range: [0.001, 0.01]
-  p_spikes: 0.4
-  spikes_count_range: [1, 4]
-  spike_amp_range: [0.002, 0.03]
-  spike_width_range: [1.0, 4.0]
-  clip: [0.0, 1.3]
+  std_add_range: [0.0, 0.005]
+  std_mult_range: [0.0, 0.005]
+  p_drift: 0.2
+  drift_sigma_range: [1.0, 100.0]
+  drift_amp_range: [1.0e-5, 0.005]
+  p_fringes: 0.2
+  n_fringes_range: [1, 2]
+  fringe_freq_range: [0.3, 50.0]
+  fringe_amp_range: [0.001, 0.0015]
+  p_spikes: 0.2
+  spikes_count_range: [1, 2]
+  spike_amp_range: [0.001, 1.0]
+  spike_width_range: [1.0, 200.0]
+  clip: [0.0, 1.5]
+  complex:
+    probability: 0.75
+    noise_types: [gaussian, shot, flicker, etaloning, glitches]
+    noise_type_weights: [0.25, 0.15, 0.2, 0.15, 0.25]
+    noise_level_range: [0.4, 1.6]
+    max_rel_to_line: 0.10
+    mode: blend
+    blend_alpha: 0.35
+    clip: [0.0, 1.5]

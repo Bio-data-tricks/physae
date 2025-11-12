@@ -1,36 +1,41 @@
-# Default parameter ranges for synthetic spectra generation.
-# Each entry defines the minimum and maximum value sampled during dataset creation.
+# Ranges issus directement de la configuration build_data_and_model de physae.py.
+# Ils correspondent aux valeurs utilisées pour entraîner l'autoencodeur CH4/H2O.
 parameters:
   sig0:
-    min: 5995.0
-    max: 6005.0
+    min: 3085.37
+    max: 3085.52
     description: Centre de la grille spectrale (cm^-1)
   dsig:
-    min: 8.0
-    max: 12.0
-    description: Largeur spectrale balayée (cm^-1)
+    min: 0.001502
+    max: 0.001559
+    description: Pas spectral entre deux pixels (cm^-1)
   mf_CH4:
-    min: 1.0e-6
-    max: 5.0e-3
+    min: 1.0e-7
+    max: 2.9e-5
     log_scale: true
     description: Fraction molaire de CH4
+  mf_H2O:
+    min: 1.0e-7
+    max: 5.0e-4
+    log_scale: true
+    description: Fraction molaire de H2O
   baseline0:
-    min: 0.8
-    max: 1.2
+    min: 0.999999
+    max: 1.00001
     description: Terme constant de la ligne de base
   baseline1:
-    min: -0.02
-    max: 0.02
+    min: -5.0e-4
+    max: -2.0e-4
     description: Terme linéaire de la ligne de base
   baseline2:
-    min: -0.001
-    max: 0.001
+    min: -7.505155e-8
+    max: 3.77485e-9
     description: Terme quadratique de la ligne de base
   P:
-    min: 0.5
-    max: 1.2
-    description: Pression totale (atm)
+    min: 400.0
+    max: 600.0
+    description: Pression totale (mbar)
   T:
-    min: 250.0
-    max: 320.0
+    min: 302.65
+    max: 312.65
     description: Température (K)

@@ -29,6 +29,10 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of data workers')
+    parser.add_argument('--static_train_set', action='store_true',
+                        help='Freeze parameter draws for the training dataset')
+    parser.add_argument('--static_val_set', action='store_true',
+                        help='Freeze parameter draws for the validation dataset')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints', help='Checkpoint directory')
     parser.add_argument('--qtpy_dir', type=str, default='./QTpy', help='QTpy directory')
     return parser.parse_args()
@@ -55,8 +59,10 @@ def create_datasets(args):
         # 'H2O': transitions_H2O,
     }
 
-    # TODO: Define polynomial frequency coefficients
-    poly_freq_CH4 = []  # Your coefficients here
+    # TODO: Define polynomial frequency coefficients. Provide the exact values
+    # from your spectrometer calibration; pass ``None`` to rely on a linear grid
+    # when no correction is available.
+    poly_freq_CH4 = None
 
     # Create datasets
     train_dataset = SpectraDataset(
@@ -69,6 +75,8 @@ def create_datasets(args):
         tipspy=tipspy,
     )
 
+    train_dataset.freeze_parameter_draws(args.static_train_set)
+
     val_dataset = SpectraDataset(
         n_samples=1000,
         num_points=1024,
@@ -79,6 +87,8 @@ def create_datasets(args):
         freeze_noise=True,  # Fixed noise for validation
         tipspy=tipspy,
     )
+
+    val_dataset.freeze_parameter_draws(args.static_val_set)
 
     return train_dataset, val_dataset
 
@@ -113,7 +123,7 @@ def main():
 
     # TODO: Load transitions data
     transitions_dict = {}
-    poly_freq_CH4 = []
+    poly_freq_CH4 = None
 
     # Create model
     print("Creating model...")

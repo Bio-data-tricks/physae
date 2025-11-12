@@ -77,6 +77,30 @@ NORM_PARAMS = {
      - Industrial: 273-373 K (0-100°C)
    - Notes: Affects line intensities via partition functions and Boltzmann distribution
 
+### Reference Ranges from physae.py
+
+The original `physae.py` script trains the autoencoder on the following
+parameter intervals:
+
+```python
+NORM_PARAMS = {
+    'sig0': (3085.37, 3085.52),
+    'dsig': (0.001502, 0.001559),
+    'mf_CH4': (1e-7, 2.9e-5),
+    'mf_H2O': (1e-7, 5e-4),
+    'baseline0': (0.999999, 1.00001),
+    'baseline1': (-5.0e-4, -2.0e-4),
+    'baseline2': (-7.505155e-8, 3.77485e-9),
+    'P': (400.0, 600.0),
+    'T': (302.65, 312.65),
+}
+```
+
+These values—augmented with a log-scaled H₂O mole-fraction range to support the
+sample HITRAN catalogue—are bundled in
+`project/config/data/parameters_default.yaml` and match the
+`build_data_and_model` helper shipped with the monolithic script.
+
 ### Alternative Configuration Examples
 
 #### Example 1: Atmospheric Monitoring
@@ -124,34 +148,106 @@ NORM_PARAMS = {
 ### Dataset Size
 
 ```python
-train_samples = 10000  # Number of synthetic training spectra
-val_samples = 1000     # Number of validation spectra
-num_points = 1024      # Spectral resolution (pixels)
+train_samples = 500_000  # Training spectra (Stage A reference setup)
+val_samples = 5_000      # Validation spectra
+num_points = 800         # Spectral resolution (pixels)
 ```
 
 **Recommendations:**
-- Small dataset (fast iteration): 5,000 train / 500 val
-- Medium dataset (default): 10,000 train / 1,000 val
-- Large dataset (best performance): 50,000+ train / 5,000+ val
+- Fast iteration: 10,000 train / 1,000 val
+- Balanced: 50,000 train / 5,000 val
+- Full reference: 500,000 train / 5,000 val (physae.py default)
+
+### Dataset Generation Mode
+
+The refactored :class:`SpectraDataset` mirrors the original script by
+default: every call to ``__getitem__`` resamples the physical parameters,
+so the training set effectively changes at each epoch.  When you want a
+fixed dataset, call :meth:`freeze_parameter_draws(True) <data.dataset.SpectraDataset.freeze_parameter_draws>`
+after instantiation (and optionally ``freeze_noise=True`` for deterministic
+noise).  For older scripts you can still pass ``freeze_parameters=True``
+to the constructor; the keyword remains supported for compatibility.
+
+```python
+train_dataset = SpectraDataset(
+    ...,  # configuration identique
+)
+train_dataset.freeze_parameter_draws(False)  # True => échantillon figé
+
+val_dataset = SpectraDataset(
+    ...,  # même configuration
+    freeze_noise=True,
+)
+val_dataset.freeze_parameter_draws(True)   # Validation figée par défaut
+```
+
+The Stage A example script exposes ``--static-training-set`` and
+``--static-validation-set`` switches to toggle this behaviour from the
+command line, while the YAML-driven notebook highlights the same
+parameters in the dataset construction cell.
+
+### Noise Profiles
+
+Noise augmentation follows the ``add_noise_variety`` helper ported from
+``physae.py`` and now supports richer artefacts.  The baseline keys
+(``std_add_range``, ``p_drift``, ``p_fringes``, etc.) drive the legacy
+additive/multiplicative model.  To reproduce the advanced perturbations
+from the monolithic script, add a ``complex`` block:
+
+```yaml
+noise:
+  std_add_range: [0.0, 0.005]
+  std_mult_range: [0.0, 0.005]
+  p_drift: 0.2
+  # ... paramètres historiques ...
+  complex:
+    probability: 0.75        # mélange aléatoire par lot
+    noise_types: [gaussian, shot, flicker, etaloning, glitches]
+    noise_type_weights: [0.25, 0.15, 0.20, 0.15, 0.25]
+    noise_level_range: [0.4, 1.6]
+    max_rel_to_line: 0.10    # profondeur relative visée (10 %)
+    mode: blend              # replace | add | blend
+    blend_alpha: 0.35        # mélange 35 % complexe / 65 % hérité
+    clip: [0.0, 1.5]
+```
+
+Key options:
+
+- ``probability``: fréquence d’application du bruit complexe (0 → jamais,
+  1 → toujours).
+- ``noise_types`` / ``noise_type_weights``: distribution des profils
+  (gaussien, bruit de tir, flicker 1/f, franges d’etalonnage,
+  glitches quasi-transitoires).
+- ``noise_level`` ou ``noise_level_range``: échelle RMS relative,
+  convertie automatiquement en amplitude via la profondeur de raie (98ᵉ
+  centile).
+- ``mode``: ``replace`` (par défaut) remplace complètement le bruit
+  hérité, ``add`` ajoute les artefacts complexes en plus du bruit
+  historique, ``blend`` interpole entre les deux.
+- ``blend_alpha``: poids de l’artefact complexe lorsqu’on est en mode
+  ``blend``.
+- ``clip``: plage finale autorisée, identique au comportement du profil
+  historique.
+
+Les notebooks et scripts d’exemple utilisent cette structure pour
+illustrer comment activer ou doser les artefacts, tout en conservant la
+compatibilité avec les anciens fichiers YAML dépourvus du bloc
+``complex``.
 
 ### Frequency Grid
 
-The frequency grid maps pixel indices to wavenumber positions:
+The frequency grid maps pixel indices to wavenumber positions. Provide the
+calibration polynomial alongside your transitions YAML using the
+``poly_frequency`` section:
 
-```python
-poly_freq_CH4 = [
-    5995.0,              # Starting wavenumber [cm^-1]
-    10.0 / 1024,         # Wavenumber per pixel [cm^-1/pixel]
-    0.0                  # Curvature (0 for linear)
-]
+```yaml
+poly_frequency:
+  CH4: [-2.3614803e-07, 1.2103413e-10, -3.1617856e-14]
 ```
 
-This defines: wavenumber(pixel) = 5995.0 + (10.0/1024) × pixel
-
-For non-linear grids (e.g., from calibration), add higher-order terms:
-```python
-poly_freq_CH4 = [c0, c1, c2, c3, ...]  # Higher order polynomial
-```
+When omitted, the training pipeline falls back to the linear grid defined by
+the predicted ``sig0`` and ``dsig`` parameters, matching the original
+``physae.py`` behaviour when no calibration polynomial is available.
 
 ## Model Configuration
 

@@ -2,30 +2,30 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Tuple
 
 from utils.io import load_config
 from config.params import PARAMS, NORM_PARAMS, LOG_SCALE_PARAMS
 
 
-_TRANSITION_REQUIRED_FIELDS: frozenset[str] = frozenset(
-    {
-        "mid",
-        "lid",
-        "center",
-        "amplitude",
-        "gamma_air",
-        "gamma_self",
-        "e0",
-        "n_air",
-        "shift_air",
-        "abundance",
-        "gDicke",
-        "nDicke",
-        "lmf",
-        "nlmf",
-    }
+_TRANSITION_FIELD_ORDER: tuple[str, ...] = (
+    "mid",
+    "lid",
+    "center",
+    "amplitude",
+    "gamma_air",
+    "gamma_self",
+    "e0",
+    "n_air",
+    "shift_air",
+    "abundance",
+    "gDicke",
+    "nDicke",
+    "lmf",
+    "nlmf",
 )
+
+_TRANSITION_MANDATORY_FIELDS: frozenset[str] = frozenset(_TRANSITION_FIELD_ORDER[:9])
 
 
 def _as_path(path: str | Path) -> Path:
@@ -108,16 +108,24 @@ def load_noise_profile(path: str | Path) -> Dict[str, float | Iterable[float] | 
     return dict(noise)
 
 
-def load_transitions(path: str | Path) -> Dict[str, list[dict]]:
+def load_transitions(
+    path: str | Path,
+    *,
+    include_poly_freq: bool = False,
+) -> Dict[str, list[dict]] | Tuple[Dict[str, list[dict]], Dict[str, list[float]]]:
     """Load molecular transitions from YAML configuration.
 
     Args:
         path: Path to the YAML file describing molecular transitions.
+        include_poly_freq: When ``True``, also return polynomial frequency
+            coefficients parsed from the optional ``poly_frequency`` mapping in
+            the YAML file.
 
     Returns:
-        Dictionary mapping molecule identifiers (e.g. ``"CH4"``) to a list of
-        transition dictionaries compatible with
-        :func:`physics.transitions.transitions_to_tensors`.
+        If ``include_poly_freq`` is ``False`` (default), only the transitions
+        dictionary is returned.  When ``True``, a tuple ``(transitions,
+        poly_frequency)`` is produced where ``poly_frequency`` maps molecule
+        names to lists of polynomial coefficients.
     """
 
     cfg = load_config(str(_as_path(path)))
@@ -134,34 +142,78 @@ def load_transitions(path: str | Path) -> Dict[str, list[dict]]:
             raise ValueError(f"Transitions for molecule '{mol}' must be a list")
         parsed_entries: list[dict] = []
         for idx, entry in enumerate(entries):
-            if not isinstance(entry, Mapping):
-                raise ValueError(
-                    f"Transition #{idx} for molecule '{mol}' must be a mapping, got {type(entry).__name__}"
+            if isinstance(entry, Mapping):
+                missing = _TRANSITION_MANDATORY_FIELDS - set(entry)
+                if missing:
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' is missing fields: {sorted(missing)}"
+                    )
+                parsed_entries.append(
+                    {
+                        "mid": int(entry["mid"]),
+                        "lid": int(entry["lid"]),
+                        **{
+                            name: float(entry.get(name, 0.0))
+                            for name in _TRANSITION_FIELD_ORDER[2:]
+                        },
+                    }
                 )
-            missing = _TRANSITION_REQUIRED_FIELDS - set(entry)
-            if missing:
-                raise ValueError(
-                    f"Transition #{idx} for molecule '{mol}' is missing fields: {sorted(missing)}"
+                continue
+
+            if isinstance(entry, str):
+                raw_values = [token.strip() for token in entry.split(";") if token.strip()]
+                if len(raw_values) < len(_TRANSITION_FIELD_ORDER):
+                    raw_values.extend(["0"] * (len(_TRANSITION_FIELD_ORDER) - len(raw_values)))
+                elif len(raw_values) > len(_TRANSITION_FIELD_ORDER):
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' defines too many fields ({len(raw_values)})"
+                    )
+
+                try:
+                    mid = int(float(raw_values[0]))
+                    lid = int(float(raw_values[1]))
+                    numeric_tail = [float(val) for val in raw_values[2:]]
+                except ValueError as exc:  # pragma: no cover - defensive programming
+                    raise ValueError(
+                        f"Transition #{idx} for molecule '{mol}' contains non-numeric data"
+                    ) from exc
+
+                parsed_entries.append(
+                    {
+                        "mid": mid,
+                        "lid": lid,
+                        **{
+                            name: numeric_tail[i]
+                            for i, name in enumerate(_TRANSITION_FIELD_ORDER[2:])
+                        },
+                    }
                 )
-            parsed_entries.append(
-                {
-                    "mid": int(entry["mid"]),
-                    "lid": int(entry["lid"]),
-                    "center": float(entry["center"]),
-                    "amplitude": float(entry["amplitude"]),
-                    "gamma_air": float(entry["gamma_air"]),
-                    "gamma_self": float(entry["gamma_self"]),
-                    "e0": float(entry["e0"]),
-                    "n_air": float(entry["n_air"]),
-                    "shift_air": float(entry["shift_air"]),
-                    "abundance": float(entry["abundance"]),
-                    "gDicke": float(entry["gDicke"]),
-                    "nDicke": float(entry["nDicke"]),
-                    "lmf": float(entry["lmf"]),
-                    "nlmf": float(entry["nlmf"]),
-                }
+                continue
+
+            raise ValueError(
+                f"Transition #{idx} for molecule '{mol}' must be a mapping or a ';'-separated string"
             )
         transitions_dict[mol] = parsed_entries
+
+    raw_poly = cfg.get("poly_frequency", {})
+    if raw_poly is None:
+        raw_poly = {}
+    if not isinstance(raw_poly, Mapping):
+        raise ValueError("'poly_frequency' must be a mapping of molecule -> coefficients")
+
+    poly_freq: Dict[str, list[float]] = {}
+    for mol, coeffs in raw_poly.items():
+        if coeffs is None:
+            continue
+        if not isinstance(coeffs, Iterable) or isinstance(coeffs, (str, bytes)):
+            raise ValueError(
+                f"Polynomial frequency coefficients for molecule '{mol}' must be an iterable of numbers"
+            )
+        parsed = [float(c) for c in coeffs]
+        poly_freq[mol] = parsed
+
+    if include_poly_freq:
+        return transitions_dict, poly_freq
     return transitions_dict
 
 

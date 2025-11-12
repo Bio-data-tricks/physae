@@ -9,25 +9,38 @@ import torch
 
 def find_qtpy_dir(pref: str | Path) -> Path:
     """
-    Find QTpy directory.
+    Locate a QTpy directory by trying common repository layouts.
 
     Args:
-        pref: Preferred path to QTpy directory.
+        pref: Preferred path to the QTpy directory (absolute or relative).
 
     Returns:
-        Resolved path to QTpy directory.
+        Resolved path to the QTpy directory.
 
     Raises:
-        FileNotFoundError: If QTpy directory not found.
+        FileNotFoundError: If no directory is found in the probed locations.
     """
-    p = Path(pref)
-    if p.exists() and p.is_dir():
-        return p.resolve()
+
+    pref_path = Path(pref)
+    if pref_path.exists() and pref_path.is_dir():
+        return pref_path.resolve()
+
     here = Path.cwd()
-    for cand in (here / "QTpy", here.parent / "QTpy"):
-        if cand.exists():
+    candidates = [
+        here / "QTpy",
+        here.parent / "QTpy",
+        here / "project" / "QTpy",
+        here.parent / "project" / "QTpy",
+    ]
+
+    for cand in candidates:
+        if cand.exists() and cand.is_dir():
             return cand.resolve()
-    raise FileNotFoundError(f"QTpy directory not found (tried: {pref}, ./QTpy, ../QTpy).")
+
+    tried = [str(pref_path)] + [str(c) for c in candidates]
+    raise FileNotFoundError(
+        "QTpy directory not found (tried: " + ", ".join(tried) + ")."
+    )
 
 
 class Tips2021QTpy:
@@ -136,3 +149,40 @@ class Tips2021QTpy:
         q1 = tab[i0]
         q2 = tab[i1]
         return q1 + f * (q2 - q1)
+
+
+def resolve_tipspy(
+    tipspy: Tips2021QTpy | None,
+    *,
+    device: str = "cpu",
+    required: bool = True,
+    qtpy_hint: str | Path = "QTpy",
+) -> Tips2021QTpy | None:
+    """Return a Tips2021QTpy instance, instantiating it if necessary.
+
+    Args:
+        tipspy: Existing Tips2021QTpy instance provided by the caller.
+        device: Device where interpolated tensors should be allocated.
+        required: Whether to raise when the QTpy directory cannot be located.
+        qtpy_hint: Preferred location of the QTpy directory.
+
+    Returns:
+        A Tips2021QTpy instance, or ``None`` when ``required`` is False and no
+        QTpy directory is found.
+    """
+
+    if tipspy is not None:
+        return tipspy
+
+    try:
+        qtpy_dir = find_qtpy_dir(qtpy_hint)
+    except FileNotFoundError:
+        if not required:
+            return None
+        raise RuntimeError(
+            "QTpy partition functions are required but no QTpy directory was "
+            "found. Pass an explicit Tips2021QTpy instance or place the QTpy "
+            "folder alongside the repository or inside project/QTpy."
+        ) from None
+
+    return Tips2021QTpy(qtpy_dir, device=device)
